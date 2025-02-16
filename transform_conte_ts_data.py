@@ -18,6 +18,15 @@ import requests
 from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 
+import os
+import threading
+from queue import Queue
+import time
+from typing import List, Dict
+import requests
+from urllib.parse import urljoin
+from bs4 import BeautifulSoup
+
 
 class ThreadedDownloader:
     def __init__(self, num_threads: int = 4, max_retries: int = 3, timeout: int = 300):
@@ -27,6 +36,9 @@ class ThreadedDownloader:
         self.download_queue = Queue()
         self.results = {}
         self.lock = threading.Lock()
+        self.completed_downloads = 0
+        self.total_downloads = 0
+        self.print_lock = threading.Lock()
 
     def download_worker(self, headers: dict):
         """Worker thread function to process download queue"""
@@ -59,9 +71,19 @@ class ThreadedDownloader:
                         else:
                             time.sleep(2 ** attempt)  # Exponential backoff
 
-                # Update results
+                # Update results and progress
                 with self.lock:
                     self.results[url] = success
+                    self.completed_downloads += 1
+
+                    # Print progress
+                    with self.print_lock:
+                        print_progress(
+                            self.completed_downloads,
+                            self.total_downloads,
+                            prefix='Current Folder:',
+                            suffix=f'({self.completed_downloads}/{self.total_downloads} files)'
+                        )
 
             except Exception as e:
                 print(f"Worker error: {str(e)}")
@@ -79,8 +101,12 @@ class ThreadedDownloader:
         Returns:
             Dictionary mapping URLs to download success status
         """
-        # Reset results
+        # Reset tracking variables
         self.results = {}
+        self.completed_downloads = 0
+        self.total_downloads = len(file_list)
+
+        print(f"\nStarting download of {self.total_downloads} files")
 
         # Start worker threads
         threads = []
@@ -432,6 +458,17 @@ def manage_storage(monthly_data: Dict, base_dir: str, version_manager: DataVersi
     return False
 
 
+def print_progress(current: int, total: int, prefix: str = '', suffix: str = ''):
+    """Print progress as a percentage with a progress bar"""
+    percent = (current / total) * 100
+    bar_length = 50
+    filled_length = int(bar_length * current // total)
+    bar = '█' * filled_length + '-' * (bar_length - filled_length)
+    print(f'\r{prefix} |{bar}| {percent:.1f}% {suffix}', end='', flush=True)
+    if current == total:
+        print()
+
+
 def main():
     base_dir = os.getcwd()
     base_url = "https://www.datadepot.rcac.purdue.edu/sbagchi/fresco/repository/Conte/TACC_Stats/"
@@ -459,8 +496,15 @@ def main():
         print(f"Found {len(folder_urls)} folders to process")
         start_idx = tracker.get_next_index()
 
+        # Calculate total folders to process
+        total_folders = len(folder_urls) - start_idx
+        print(f"\nStarting processing of {total_folders} folders")
+
         # Process one folder at a time
         for i in range(start_idx, len(folder_urls)):
+            # Update overall progress
+            current_folder = i - start_idx + 1
+            print_progress(current_folder, total_folders, prefix='Overall Progress:', suffix='Complete')
             folder_name, folder_url = folder_urls[i]
             print(f"\nProcessing folder {i + 1}/{len(folder_urls)}: {folder_name}")
 
