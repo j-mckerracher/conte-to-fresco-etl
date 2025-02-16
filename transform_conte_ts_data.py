@@ -1,15 +1,302 @@
 import os
 import glob
 import json
+import re
 from pathlib import Path
 import gc
 import psutil
-from typing import Dict
+from typing import Dict, List
 import pandas as pd
 import boto3
 from botocore.exceptions import ClientError
 import shutil
 import time
+import requests
+from urllib.parse import urljoin
+from bs4 import BeautifulSoup
+import threading
+from queue import Queue
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import subprocess
+
+
+class DownloadWorker:
+    def __init__(self, max_workers=3):
+        """
+        Initialize download worker with thread pool
+        Using 3 workers by default to avoid overloading the system
+        """
+        self.max_workers = max_workers
+        self.executor = ThreadPoolExecutor(max_workers=max_workers)
+        self.active_downloads = Queue()
+        self.results = []
+
+    def download_file(self, url, local_path, headers, max_retries=3, retry_delay=5):
+        """Download file with retry mechanism"""
+        for attempt in range(max_retries):
+            try:
+                response = requests.get(url, headers=headers, timeout=300)
+                response.raise_for_status()
+
+                with open(local_path, 'wb') as f:
+                    f.write(response.content)
+                return True, local_path
+
+            except Exception as e:
+                print(f"Attempt {attempt + 1}/{max_retries} failed for {url}: {str(e)}")
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay * (attempt + 1))
+
+        return False, local_path
+
+    def download_folder_files(self, folder_url: str, local_folder: str, required_files: List[str], headers: dict):
+        """Download all required files from a folder"""
+        if not os.path.exists(local_folder):
+            os.makedirs(local_folder)
+
+        try:
+            response = requests.get(folder_url, headers=headers, timeout=30)
+            response.raise_for_status()
+            soup = BeautifulSoup(response.text, 'html.parser')
+
+            futures = []
+            files_found = []
+
+            for csv_link in soup.find_all('a'):
+                if csv_link.text in required_files:
+                    files_found.append(csv_link.text)
+                    csv_url = urljoin(folder_url, csv_link['href'])
+                    csv_path = os.path.join(local_folder, csv_link.text)
+
+                    print(f"Queuing download for {csv_link.text} from {csv_url}")
+                    future = self.executor.submit(
+                        self.download_file,
+                        csv_url,
+                        csv_path,
+                        headers
+                    )
+                    futures.append(future)
+
+            # Wait for all downloads to complete
+            success = True
+            for future in as_completed(futures):
+                result, path = future.result()
+                if not result:
+                    success = False
+                    print(f"Failed to download {path}")
+                    break
+
+            # Check if all required files were found and downloaded
+            missing_files = set(required_files) - set(files_found)
+            if missing_files:
+                print(f"Warning: Could not find the following required files: {missing_files}")
+                success = False
+
+            return success
+
+        except Exception as e:
+            print(f"Error downloading folder {folder_url}: {str(e)}")
+            return False
+
+    def shutdown(self):
+        """Shutdown the thread pool executor"""
+        self.executor.shutdown(wait=True)
+
+
+def get_base_dir():
+    """Get the current working directory using pwd"""
+    try:
+        result = subprocess.run(['pwd'], capture_output=True, text=True)
+        base_dir = result.stdout.strip()
+        return base_dir
+    except Exception as e:
+        print(f"Error getting base directory: {str(e)}")
+        return os.getcwd()  # Fallback to os.getcwd()
+
+
+def download_file(url, local_path, max_retries=3, retry_delay=5):
+    """Download file with retry mechanism"""
+    for attempt in range(max_retries):
+        try:
+            response = requests.get(url, timeout=300)
+            response.raise_for_status()
+
+            with open(local_path, 'wb') as f:
+                f.write(response.content)
+            return True
+
+        except Exception as e:
+            print(f"Attempt {attempt + 1}/{max_retries} failed for {url}: {str(e)}")
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay * (attempt + 1))  # Exponential backoff
+
+    return False
+
+
+def download_date_folder(folder_url, local_folder, required_files):
+    """
+    Downloads all required CSV files for a single date folder.
+
+    Args:
+        folder_url: URL of the date folder
+        local_folder: Local path to save files
+        required_files: List of required CSV files (e.g., ['block.csv', 'cpu.csv'])
+
+    Returns:
+        bool: True if all files were downloaded successfully, False otherwise
+    """
+    try:
+        if not os.path.exists(local_folder):
+            os.makedirs(local_folder)
+
+        # Add headers to avoid potential 403 errors
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+
+        # Get the CSV files in the folder
+        response = requests.get(folder_url, headers=headers, timeout=30)
+        response.raise_for_status()
+
+        soup = BeautifulSoup(response.text, 'html.parser')
+
+        download_success = True
+        files_found = []
+
+        for csv_link in soup.find_all('a'):
+            if csv_link.text in required_files:
+                files_found.append(csv_link.text)
+                csv_url = urljoin(folder_url, csv_link['href'])
+                csv_path = os.path.join(local_folder, csv_link.text)
+
+                print(f"Downloading {csv_link.text} from {csv_url}")
+
+                # Use the same headers for file download
+                response = requests.get(csv_url, headers=headers, timeout=300)
+                response.raise_for_status()
+
+                with open(csv_path, 'wb') as f:
+                    f.write(response.content)
+
+                if os.path.getsize(csv_path) == 0:
+                    print(f"Warning: Downloaded file {csv_link.text} is empty")
+                    download_success = False
+                    break
+
+                time.sleep(0.5)  # Small delay between files
+
+        # Check if all required files were found
+        missing_files = set(required_files) - set(files_found)
+        if missing_files:
+            print(f"Warning: Could not find the following required files: {missing_files}")
+            download_success = False
+
+        return download_success
+
+    except requests.exceptions.HTTPError as e:
+        print(f"HTTP Error downloading folder {folder_url}: {str(e)}")
+        print(f"Response status code: {e.response.status_code}")
+        print(f"Response headers: {e.response.headers}")
+        return False
+    except Exception as e:
+        print(f"Error downloading folder {folder_url}: {str(e)}")
+        print(f"Response status code: {response.status_code if 'response' in locals() else 'N/A'}")
+        print(f"Response content: {response.text[:500] if 'response' in locals() else 'N/A'}")
+        return False
+
+
+def get_date_folders(base_url):
+    """
+    Get list of all date folder URLs.
+
+    Args:
+        base_url: Base URL to fetch the date folders from
+
+    Returns:
+        List of tuples containing (folder_name, folder_url)
+    """
+    try:
+        # Add headers to avoid potential 403 errors
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+
+        response = requests.get(base_url, headers=headers, timeout=30)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, 'html.parser')
+
+        # Find all folder links matching YYYY-MM pattern
+        date_folders = []
+        date_pattern = re.compile(r'^\d{4}-\d{2}/$')
+
+        for link in soup.find_all('a'):
+            if date_pattern.match(link.text):
+                folder_url = urljoin(base_url, link['href'])
+                folder_name = link.text.strip('/')
+                date_folders.append((folder_name, folder_url))
+
+        return sorted(date_folders)  # Sort by date
+
+    except Exception as e:
+        print(f"Error accessing {base_url}: {str(e)}")
+        # Add more detailed error information
+        print(f"Response status code: {response.status_code if 'response' in locals() else 'N/A'}")
+        print(f"Response content: {response.text[:500] if 'response' in locals() else 'N/A'}")
+        return []
+
+
+def download_conte_data(base_url, base_dir, required_files):
+    """
+    Download all Conte data folders using thread pool
+    Returns: List of successfully downloaded folder names
+    """
+    downloaded_folders = []
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    }
+
+    # Get all date folders
+    date_folders = get_date_folders(base_url)
+    total_folders = len(date_folders)
+
+    print(f"Found {total_folders} date folders to process")
+    if total_folders == 0:
+        print("No date folders found. URL content preview:")
+        try:
+            response = requests.get(base_url, headers=headers)
+            print(response.text[:1000])
+        except Exception as e:
+            print(f"Could not fetch URL content: {str(e)}")
+        return downloaded_folders
+
+    # Initialize download worker with 3 threads (conservative for old laptop)
+    downloader = DownloadWorker(max_workers=3)
+
+    try:
+        for i, (folder_name, folder_url) in enumerate(date_folders, 1):
+            print(f"\nProcessing folder {i}/{total_folders}: {folder_name}")
+            print(f"Folder URL: {folder_url}")
+
+            local_folder = os.path.join(base_dir, folder_name)
+
+            if downloader.download_folder_files(folder_url, local_folder, required_files, headers):
+                print(f"Successfully downloaded {folder_name}")
+                downloaded_folders.append(folder_name)
+            else:
+                print(f"Failed to download {folder_name}")
+
+            # Check disk space after each folder
+            if not check_critical_disk_space()[0]:
+                print("Critical disk space reached. Stopping downloads.")
+                break
+
+            # Small delay between folders to avoid overwhelming the server
+            time.sleep(1)
+
+    finally:
+        downloader.shutdown()
+
+    return downloaded_folders
 
 
 class DataVersionManager:
@@ -359,18 +646,45 @@ def update_monthly_data(existing_data, new_data):
 
 
 def main():
-    base_dir = "/path/to/fresco/repository/Conte/TACC_Stats"  # Update with actual path
+    base_dir = get_base_dir()
+    base_url = "https://www.datadepot.rcac.purdue.edu/sbagchi/fresco/repository/Conte/TACC_Stats/"
+
+    print(f"Base directory: {base_dir}")
+    print(f"Base URL: {base_url}")
+
+    # Test URL accessibility
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        response = requests.get(base_url, headers=headers, timeout=30)
+        print(f"Initial URL test - Status code: {response.status_code}")
+        print(f"Response content preview: {response.text[:500]}")
+    except Exception as e:
+        print(f"Error testing base URL: {str(e)}")
+        print("Please verify the URL is accessible and doesn't require authentication")
+        return
+
+    # Files we need from each folder
+    required_files = ['block.csv', 'cpu.csv', 'mem.csv', 'llite.csv']
 
     # Initialize trackers with reset option
     tracker = ProcessingTracker(base_dir, reset=True)
     version_manager = DataVersionManager(base_dir)
     monthly_data: Dict[str, pd.DataFrame] = {}
 
-    # Get all date folders
-    date_folders = sorted(glob.glob(os.path.join(base_dir, "????-??")))
+    print("\nStarting Conte data download and processing...")
 
-    for folder in date_folders:
-        folder_name = os.path.basename(folder)
+    # Download data with threading
+    downloaded_folders = download_conte_data(base_url, base_dir, required_files)
+    print(f"\nDownloaded folders: {downloaded_folders}")
+
+    if not downloaded_folders:
+        print("No folders were downloaded. Check the URL and network connection.")
+        return
+
+    # Process downloaded folders
+    for folder_name in downloaded_folders:
         print(f"\nProcessing folder: {folder_name}")
 
         if tracker.is_folder_processed(folder_name):
@@ -381,7 +695,8 @@ def main():
         manage_storage_and_upload(monthly_data, base_dir, version_manager)
 
         try:
-            result = process_conte_folder(folder)
+            folder_path = os.path.join(base_dir, folder_name)
+            result = process_conte_folder(folder_path)
 
             if result is not None:
                 # Split by month and update storage
@@ -482,3 +797,4 @@ def test_conte_processing():
 
 if __name__ == "__main__":
     main()
+    # test_conte_processing()
