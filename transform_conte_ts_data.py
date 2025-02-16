@@ -5,11 +5,9 @@ import re
 from pathlib import Path
 import gc
 import psutil
-import pandas as pd
 import boto3
 from botocore.exceptions import ClientError
 import shutil
-import os
 import threading
 from queue import Queue
 import time
@@ -17,16 +15,156 @@ from typing import List, Dict
 import requests
 from urllib.parse import urljoin
 from bs4 import BeautifulSoup
+import pandas as pd
+import numpy as np
 
-import os
-import threading
-from queue import Queue
-import time
-from typing import List, Dict
-import requests
-from urllib.parse import urljoin
-from bs4 import BeautifulSoup
 
+def safe_division(numerator, denominator, default: float = 0.0) -> float:
+    """Safely perform division with error handling"""
+    try:
+        return numerator / denominator if denominator != 0 else default
+    except Exception:
+        return default
+
+
+def validate_metric(value: float, min_val: float = 0.0, max_val: float = float('inf')) -> float:
+    """Ensure metric values are within valid range"""
+    return np.clip(value, min_val, max_val)
+
+
+def calculate_rate(current_value: float, previous_value: float,
+                   time_delta_seconds: float) -> float:
+    """Calculate rate of change per second"""
+    return safe_division(current_value - previous_value, time_delta_seconds)
+
+
+def process_block_file(file_path: str) -> pd.DataFrame:
+    """Process block.csv file with improved error handling"""
+    df = pd.read_csv(file_path)
+
+    # Calculate I/O throughput with safety checks
+    total_sectors = df['rd_sectors'] + df['wr_sectors']
+    total_ticks = df['rd_ticks'] + df['wr_ticks']
+
+    # Convert sectors to bytes and calculate throughput
+    bytes_processed = total_sectors * 512
+    throughput = [safe_division(b, t) for b, t in zip(bytes_processed, total_ticks)]
+
+    # Convert to GB/s and validate
+    df['Value'] = [validate_metric(t / (1024 * 1024 * 1024)) for t in throughput]
+    df['jobID'] = df['jobID'].str.replace('jobID', 'JOB', case=False)
+
+    return pd.DataFrame({
+        'Job Id': df['jobID'],
+        'Host': df['node'],
+        'Event': 'block',
+        'Value': df['Value'],
+        'Units': 'GB/s',
+        'Timestamp': pd.to_datetime(df['timestamp'])
+    })
+
+
+def process_cpu_file(file_path: str) -> pd.DataFrame:
+    """Process cpu.csv file with support for multi-core CPU percentages"""
+    df = pd.read_csv(file_path)
+
+    # Calculate total CPU time with all components
+    total = (df['user'] + df['nice'] + df['system'] +
+             df['idle'] + df['iowait'] + df['irq'] + df['softirq'])
+
+    # Calculate user CPU percentage without upper bound
+    # Including both user and nice time as per original
+    user_time = df['user'] + df['nice']
+    df['Value'] = [validate_metric(safe_division(u, t) * 100, 0)
+                   for u, t in zip(user_time, total)]
+
+    df['jobID'] = df['jobID'].str.replace('jobID', 'JOB', case=False)
+
+    return pd.DataFrame({
+        'Job Id': df['jobID'],
+        'Host': df['node'],
+        'Event': 'cpuuser',
+        'Value': df['Value'],
+        'Units': 'CPU %',
+        'Timestamp': pd.to_datetime(df['timestamp'])
+    })
+
+
+def process_mem_file(file_path: str) -> pd.DataFrame:
+    """Process mem.csv file with improved validation"""
+    df = pd.read_csv(file_path)
+
+    # Ensure memory values are non-negative
+    df['MemTotal'] = df['MemTotal'].clip(lower=0)
+    df['MemFree'] = df['MemFree'].clip(lower=0)
+    df['FilePages'] = df['FilePages'].clip(lower=0)
+
+    # Ensure MemFree doesn't exceed MemTotal
+    df['MemFree'] = df.apply(lambda row: min(row['MemFree'], row['MemTotal']), axis=1)
+
+    # Calculate memory usage in GB with validation
+    df['memused_value'] = ((df['MemTotal'] - df['MemFree']) /
+                           (1024 * 1024 * 1024)).clip(lower=0)
+
+    # Calculate memory usage minus disk cache
+    cache_adjusted = df['MemTotal'] - df['MemFree'] - df['FilePages']
+    df['memused_minus_diskcache_value'] = (validate_metric(cache_adjusted) /
+                                           (1024 * 1024 * 1024))
+
+    df['jobID'] = df['jobID'].str.replace('jobID', 'JOB', case=False)
+
+    # Create separate dataframes for each metric
+    memused = pd.DataFrame({
+        'Job Id': df['jobID'],
+        'Host': df['node'],
+        'Event': 'memused',
+        'Value': df['memused_value'],
+        'Units': 'GB',
+        'Timestamp': pd.to_datetime(df['timestamp'])
+    })
+
+    memused_minus_diskcache = pd.DataFrame({
+        'Job Id': df['jobID'],
+        'Host': df['node'],
+        'Event': 'memused_minus_diskcache',
+        'Value': df['memused_minus_diskcache_value'],
+        'Units': 'GB',
+        'Timestamp': pd.to_datetime(df['timestamp'])
+    })
+
+    return pd.concat([memused, memused_minus_diskcache])
+
+
+def process_nfs_file(file_path: str) -> pd.DataFrame:
+    """Process llite.csv file with improved rate calculation"""
+    df = pd.read_csv(file_path)
+
+    # Sort by timestamp to ensure correct rate calculation
+    df = df.sort_values('timestamp')
+
+    # Calculate time deltas in seconds
+    df['timestamp'] = pd.to_datetime(df['timestamp'])
+    time_deltas = df.groupby(['jobID', 'node'])['timestamp'].diff().dt.total_seconds()
+
+    # Calculate rates with proper time normalization
+    total_bytes = df['read_bytes'] + df['write_bytes']
+    byte_deltas = total_bytes.groupby([df['jobID'], df['node']]).diff()
+
+    # Calculate MB/s with validation
+    df['Value'] = [validate_metric(calculate_rate(bytes, prev_bytes, delta) / (1024 * 1024))
+                   for bytes, prev_bytes, delta in
+                   zip(total_bytes, byte_deltas, time_deltas)]
+
+    df['jobID'] = df['jobID'].str.replace('jobID', 'JOB', case=False)
+
+    return pd.DataFrame({
+        'Job Id': df['jobID'],
+        'Host': df['node'],
+        'Event': 'nfs',
+        'Value': df['Value'],
+        'Units': 'MB/s',
+        'Timestamp': df['timestamp']
+    })
 
 class ThreadedDownloader:
     def __init__(self, num_threads: int = 4, max_retries: int = 3, timeout: int = 300):
@@ -278,84 +416,6 @@ def get_folder_urls(base_url: str, headers: dict) -> List[tuple]:
     except Exception as e:
         print(f"Error accessing {base_url}: {str(e)}")
         return []
-
-
-def process_block_file(file_path: str) -> pd.DataFrame:
-    """Process block.csv file"""
-    df = pd.read_csv(file_path)
-    df['Value'] = ((df['rd_sectors'] + df['wr_sectors']) * 512) / (df['rd_ticks'] + df['wr_ticks'])
-    df['Value'] = df['Value'] / (1024 * 1024 * 1024)  # Convert to GB/s
-    df['jobID'] = df['jobID'].str.replace('jobID', 'JOB', case=False)
-
-    return pd.DataFrame({
-        'Job Id': df['jobID'],
-        'Host': df['node'],
-        'Event': 'block',
-        'Value': df['Value'],
-        'Units': 'GB/s',
-        'Timestamp': pd.to_datetime(df['timestamp'])
-    })
-
-
-def process_cpu_file(file_path: str) -> pd.DataFrame:
-    """Process cpu.csv file"""
-    df = pd.read_csv(file_path)
-    total = df['user'] + df['nice'] + df['system'] + df['idle'] + df['iowait'] + df['irq'] + df['softirq']
-    df['Value'] = ((df['user'] + df['nice']) / total) * 100
-    df['jobID'] = df['jobID'].str.replace('jobID', 'JOB', case=False)
-
-    return pd.DataFrame({
-        'Job Id': df['jobID'],
-        'Host': df['node'],
-        'Event': 'cpuuser',
-        'Value': df['Value'],
-        'Units': 'CPU %',
-        'Timestamp': pd.to_datetime(df['timestamp'])
-    })
-
-
-def process_mem_file(file_path: str) -> pd.DataFrame:
-    """Process mem.csv file"""
-    df = pd.read_csv(file_path)
-    df['memused_value'] = (df['MemTotal'] - df['MemFree']) / (1024 * 1024 * 1024)
-    df['memused_minus_diskcache_value'] = (df['MemTotal'] - df['MemFree'] - df['FilePages']) / (1024 * 1024 * 1024)
-    df['jobID'] = df['jobID'].str.replace('jobID', 'JOB', case=False)
-
-    memused = pd.DataFrame({
-        'Job Id': df['jobID'],
-        'Host': df['node'],
-        'Event': 'memused',
-        'Value': df['memused_value'],
-        'Units': 'GB',
-        'Timestamp': pd.to_datetime(df['timestamp'])
-    })
-
-    memused_minus_diskcache = pd.DataFrame({
-        'Job Id': df['jobID'],
-        'Host': df['node'],
-        'Event': 'memused_minus_diskcache',
-        'Value': df['memused_minus_diskcache_value'],
-        'Units': 'GB',
-        'Timestamp': pd.to_datetime(df['timestamp'])
-    })
-
-    return pd.concat([memused, memused_minus_diskcache])
-
-
-def process_nfs_file(file_path: str) -> pd.DataFrame:
-    """Process llite.csv file (NFS data)"""
-    df = pd.read_csv(file_path)
-    df['Value'] = (df['read_bytes'] + df['write_bytes']) / (1024 * 1024)  # Convert to MB/s
-    df['jobID'] = df['jobID'].str.replace('jobID', 'JOB', case=False)
-
-    return pd.DataFrame({
-        'Job Id': df['jobID'],
-        'Host': df['node'],
-        'Event': 'nfs',
-        'Value': df['Value'],
-        'Units': 'MB/s',
-        'Timestamp': pd.to_datetime(df['timestamp'])
-    })
 
 
 def process_folder_data(folder_path: str) -> pd.DataFrame:
