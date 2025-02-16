@@ -482,11 +482,11 @@ def main():
             try:
                 # Download and process folder using threaded downloader
                 if download_folder_threaded(
-                    folder_url,
-                    temp_folder,
-                    required_files,
-                    headers,
-                    num_threads=num_download_threads
+                        folder_url,
+                        temp_folder,
+                        required_files,
+                        headers,
+                        num_threads=num_download_threads
                 ):
                     result = process_folder_data(temp_folder)
 
@@ -532,3 +532,7 @@ def main():
                 print(f"Error saving final data: {str(save_error)}")
 
     print("Processing completed!")
+
+
+if __name__ == "__main__":
+    main()
