@@ -41,6 +41,14 @@ def calculate_rate(current_value: float, previous_value: float,
 
 def process_block_file(file_path: str) -> pl.DataFrame:
     """Process block.csv file with improved error handling"""
+    # Read file content first
+    try:
+        with open(file_path, 'r') as f:
+            content = f.read()
+    except Exception as e:
+        print(f"Error reading {file_path}: {str(e)}")
+        return None
+
     # Define schema with u64 for potentially large numbers
     schema = {
         'rd_ios': pl.UInt64,
@@ -48,42 +56,63 @@ def process_block_file(file_path: str) -> pl.DataFrame:
         'wr_ios': pl.UInt64,
         'wr_sectors': pl.UInt64,
         'rd_ticks': pl.UInt64,
-        'wr_ticks': pl.UInt64
+        'wr_ticks': pl.UInt64,
+        'in_flight': pl.UInt64,
+        'io_ticks': pl.UInt64,
+        'time_in_queue': pl.UInt64
     }
 
-    df = pl.read_csv(file_path, schema_overrides=schema)
+    try:
+        df = pl.read_csv(
+            file_path,
+            schema_overrides=schema,
+            infer_schema_length=None,
+            try_parse_dates=True
+        )
 
-    # Calculate I/O throughput with safety checks
-    df = df.with_columns([
-        (pl.col('rd_sectors') + pl.col('wr_sectors')).alias('total_sectors'),
-        (pl.col('rd_ticks') + pl.col('wr_ticks')).alias('total_ticks')
-    ])
+        # Calculate I/O throughput with safety checks
+        df = df.with_columns([
+            (pl.col('rd_sectors') + pl.col('wr_sectors')).alias('total_sectors'),
+            (pl.col('rd_ticks') + pl.col('wr_ticks')).alias('total_ticks')
+        ])
 
-    # Convert sectors to bytes and calculate throughput
-    df = df.with_columns([
-        (pl.col('total_sectors') * 512).alias('bytes_processed'),
-        pl.col('jobID').str.replace_all('jobID', 'JOB', case_sensitive=False).alias('jobID')
-    ])
+        # Convert sectors to bytes and calculate throughput
+        df = df.with_columns([
+            (pl.col('total_sectors') * 512).alias('bytes_processed'),
+            pl.col('jobID').str.replace_all('jobID', 'JOB', case_sensitive=False).alias('jobID')
+        ])
 
-    # Calculate throughput in GB/s
-    df = df.with_columns([
-        (pl.col('bytes_processed') / pl.col('total_ticks') / (1024 * 1024 * 1024))
-        .clip(0, None)
-        .alias('Value')
-    ])
+        # Calculate throughput in GB/s with validation
+        df = df.with_columns([
+            (pl.when(pl.col('total_ticks') > 0)
+             .then(pl.col('bytes_processed') / pl.col('total_ticks') / (1024 * 1024 * 1024))
+             .otherwise(0.0))
+            .clip(0, None)
+            .alias('Value')
+        ])
 
-    return pl.DataFrame({
-        'Job Id': df['jobID'],
-        'Host': df['node'],
-        'Event': pl.lit('block').repeat(len(df)),
-        'Value': df['Value'],
-        'Units': pl.lit('GB/s').repeat(len(df)),
-        'Timestamp': pl.col('timestamp').str.to_datetime()
-    })
+        return pl.DataFrame({
+            'Job Id': df['jobID'],
+            'Host': df['node'],
+            'Event': pl.lit('block').repeat(len(df)),
+            'Value': df['Value'],
+            'Units': pl.lit('GB/s').repeat(len(df)),
+            'Timestamp': pl.col('timestamp').str.to_datetime()
+        })
 
+    except Exception as e:
+        print(f"Error processing block file: {str(e)}")
+        return None
 
 def process_cpu_file(file_path: str) -> pl.DataFrame:
     """Process cpu.csv file with support for multi-core CPU percentages"""
+    try:
+        with open(file_path, 'r') as f:
+            content = f.read()
+    except Exception as e:
+        print(f"Error reading {file_path}: {str(e)}")
+        return None
+
     # Define schema with u64 for CPU metrics
     schema = {
         'user': pl.UInt64,
@@ -92,100 +121,144 @@ def process_cpu_file(file_path: str) -> pl.DataFrame:
         'idle': pl.UInt64,
         'iowait': pl.UInt64,
         'irq': pl.UInt64,
-        'softirq': pl.UInt64
+        'softirq': pl.UInt64,
+        'steal': pl.UInt64,
+        'guest': pl.UInt64,
+        'guest_nice': pl.UInt64
     }
 
-    df = pl.read_csv(file_path, schema_overrides=schema)
+    try:
+        df = pl.read_csv(
+            file_path,
+            schema_overrides=schema,
+            infer_schema_length=None,
+            try_parse_dates=True
+        )
 
-    # Calculate total CPU time with all components
-    df = df.with_columns([
-        (pl.col('user') + pl.col('nice') + pl.col('system') +
-         pl.col('idle') + pl.col('iowait') + pl.col('irq') +
-         pl.col('softirq')).alias('total'),
-        (pl.col('user') + pl.col('nice')).alias('user_time'),
-        pl.col('jobID').str.replace_all('jobID', 'JOB', case_sensitive=False).alias('jobID')
-    ])
+        # Calculate total CPU time with all components
+        df = df.with_columns([
+            (pl.col('user') + pl.col('nice') + pl.col('system') +
+             pl.col('idle') + pl.col('iowait') + pl.col('irq') +
+             pl.col('softirq') + pl.col('steal') + pl.col('guest') +
+             pl.col('guest_nice')).alias('total'),
+            (pl.col('user') + pl.col('nice')).alias('user_time'),
+            pl.col('jobID').str.replace_all('jobID', 'JOB', case_sensitive=False).alias('jobID')
+        ])
 
-    # Calculate CPU percentage
-    df = df.with_columns([
-        ((pl.col('user_time') / pl.col('total')) * 100)
-        .clip(0, None)
-        .alias('Value')
-    ])
+        # Calculate CPU percentage with validation
+        df = df.with_columns([
+            (pl.when(pl.col('total') > 0)
+             .then((pl.col('user_time') / pl.col('total')) * 100)
+             .otherwise(0.0))
+            .clip(0, 100)
+            .alias('Value')
+        ])
 
-    return pl.DataFrame({
-        'Job Id': df['jobID'],
-        'Host': df['node'],
-        'Event': pl.lit('cpuuser').repeat(len(df)),
-        'Value': df['Value'],
-        'Units': pl.lit('CPU %').repeat(len(df)),
-        'Timestamp': pl.col('timestamp').str.to_datetime()
-    })
+        return pl.DataFrame({
+            'Job Id': df['jobID'],
+            'Host': df['node'],
+            'Event': pl.lit('cpuuser').repeat(len(df)),
+            'Value': df['Value'],
+            'Units': pl.lit('CPU %').repeat(len(df)),
+            'Timestamp': pl.col('timestamp').str.to_datetime()
+        })
 
+    except Exception as e:
+        print(f"Error processing CPU file: {str(e)}")
+        return None
 
 def process_mem_file(file_path: str) -> pl.DataFrame:
     """Process mem.csv file with improved validation"""
+    try:
+        with open(file_path, 'r') as f:
+            content = f.read()
+    except Exception as e:
+        print(f"Error reading {file_path}: {str(e)}")
+        return None
+
     # Define schema with u64 for memory values
     schema = {
         'MemTotal': pl.UInt64,
         'MemFree': pl.UInt64,
         'Buffers': pl.UInt64,
         'Cached': pl.UInt64,
-        'FilePages': pl.UInt64
+        'SwapCached': pl.UInt64,
+        'Active': pl.UInt64,
+        'Inactive': pl.UInt64,
+        'FilePages': pl.UInt64,
+        'Dirty': pl.UInt64,
+        'Writeback': pl.UInt64
     }
 
-    df = pl.read_csv(file_path, schema_overrides=schema)
+    try:
+        df = pl.read_csv(
+            file_path,
+            schema_overrides=schema,
+            infer_schema_length=None,
+            try_parse_dates=True
+        )
 
-    # Ensure memory values are non-negative and MemFree doesn't exceed MemTotal
-    df = df.with_columns([
-        pl.col('MemTotal').clip(0, None).alias('MemTotal'),
-        pl.col('MemFree').clip(0, None).alias('MemFree'),
-        pl.col('FilePages').clip(0, None).alias('FilePages'),
-        pl.col('jobID').str.replace_all('jobID', 'JOB', case_sensitive=False).alias('jobID')
-    ])
+        # Ensure memory values are non-negative
+        df = df.with_columns([
+            pl.col('MemTotal').clip(0, None).alias('MemTotal'),
+            pl.col('MemFree').clip(0, None).alias('MemFree'),
+            pl.col('FilePages').clip(0, None).alias('FilePages'),
+            pl.col('jobID').str.replace_all('jobID', 'JOB', case_sensitive=False).alias('jobID')
+        ])
 
-    df = df.with_columns([
-        pl.min_horizontal([
-            pl.col('MemFree'),
-            pl.col('MemTotal')
-        ]).alias('MemFree')
-    ])
+        # Ensure MemFree doesn't exceed MemTotal
+        df = df.with_columns([
+            pl.min_horizontal([
+                pl.col('MemFree'),
+                pl.col('MemTotal')
+            ]).alias('MemFree')
+        ])
 
-    # Calculate memory metrics
-    df = df.with_columns([
-        ((pl.col('MemTotal') - pl.col('MemFree')) / (1024 * 1024 * 1024))
-        .clip(0, None)
-        .alias('memused_value'),
+        # Calculate memory metrics in GB
+        df = df.with_columns([
+            ((pl.col('MemTotal') - pl.col('MemFree')) / (1024 * 1024))
+            .clip(0, None)
+            .alias('memused_value'),
 
-        ((pl.col('MemTotal') - pl.col('MemFree') - pl.col('FilePages')) / (1024 * 1024 * 1024))
-        .clip(0, None)
-        .alias('memused_minus_diskcache_value')
-    ])
+            ((pl.col('MemTotal') - pl.col('MemFree') - pl.col('FilePages')) / (1024 * 1024))
+            .clip(0, None)
+            .alias('memused_minus_diskcache_value')
+        ])
 
-    # Create separate dataframes for each metric
-    memused = pl.DataFrame({
-        'Job Id': df['jobID'],
-        'Host': df['node'],
-        'Event': pl.lit('memused').repeat(len(df)),
-        'Value': df['memused_value'],
-        'Units': pl.lit('GB').repeat(len(df)),
-        'Timestamp': pl.col('timestamp').str.to_datetime()
-    })
+        # Create separate dataframes for each metric
+        memused = pl.DataFrame({
+            'Job Id': df['jobID'],
+            'Host': df['node'],
+            'Event': pl.lit('memused').repeat(len(df)),
+            'Value': df['memused_value'],
+            'Units': pl.lit('GB').repeat(len(df)),
+            'Timestamp': pl.col('timestamp').str.to_datetime()
+        })
 
-    memused_minus_diskcache = pl.DataFrame({
-        'Job Id': df['jobID'],
-        'Host': df['node'],
-        'Event': pl.lit('memused_minus_diskcache').repeat(len(df)),
-        'Value': df['memused_minus_diskcache_value'],
-        'Units': pl.lit('GB').repeat(len(df)),
-        'Timestamp': pl.col('timestamp').str.to_datetime()
-    })
+        memused_minus_diskcache = pl.DataFrame({
+            'Job Id': df['jobID'],
+            'Host': df['node'],
+            'Event': pl.lit('memused_minus_diskcache').repeat(len(df)),
+            'Value': df['memused_minus_diskcache_value'],
+            'Units': pl.lit('GB').repeat(len(df)),
+            'Timestamp': pl.col('timestamp').str.to_datetime()
+        })
 
-    return pl.concat([memused, memused_minus_diskcache])
+        return pl.concat([memused, memused_minus_diskcache])
 
+    except Exception as e:
+        print(f"Error processing memory file: {str(e)}")
+        return None
 
 def process_nfs_file(file_path: str) -> pl.DataFrame:
     """Process llite.csv file with improved rate calculation"""
+    try:
+        with open(file_path, 'r') as f:
+            content = f.read()
+    except Exception as e:
+        print(f"Error reading {file_path}: {str(e)}")
+        return None
+
     # Define schema with u64 for byte counts and operations
     schema = {
         'read_bytes': pl.UInt64,
@@ -195,49 +268,61 @@ def process_nfs_file(file_path: str) -> pl.DataFrame:
         'close': pl.UInt64,
         'mmap': pl.UInt64,
         'seek': pl.UInt64,
-        'fsync': pl.UInt64
+        'fsync': pl.UInt64,
+        'setattr': pl.UInt64,
+        'truncate': pl.UInt64
     }
 
-    df = pl.read_csv(file_path, schema_overrides=schema)
+    try:
+        df = pl.read_csv(
+            file_path,
+            schema_overrides=schema,
+            infer_schema_length=None,
+            try_parse_dates=True
+        )
 
-    # Sort by timestamp and calculate time deltas
-    df = df.with_columns([
-        pl.col('timestamp').str.to_datetime().alias('timestamp'),
-        pl.col('jobID').str.replace_all('jobID', 'JOB', case_sensitive=False).alias('jobID'),
-        (pl.col('read_bytes') + pl.col('write_bytes')).alias('total_bytes')
-    ]).sort(['jobID', 'node', 'timestamp'])
+        # Sort by timestamp and calculate time deltas
+        df = df.with_columns([
+            pl.col('timestamp').str.to_datetime().alias('timestamp'),
+            pl.col('jobID').str.replace_all('jobID', 'JOB', case_sensitive=False).alias('jobID'),
+            (pl.col('read_bytes') + pl.col('write_bytes')).alias('total_bytes')
+        ]).sort(['jobID', 'node', 'timestamp'])
 
-    # Calculate time deltas and byte deltas by group
-    df = df.with_columns([
-        pl.col('timestamp')
-        .diff()
-        .dt.seconds()
-        .over(['jobID', 'node'])
-        .alias('time_delta'),
+        # Calculate time deltas and byte deltas by group
+        df = df.with_columns([
+            pl.col('timestamp')
+            .diff()
+            .dt.seconds()
+            .over(['jobID', 'node'])
+            .alias('time_delta'),
 
-        pl.col('total_bytes')
-        .diff()
-        .over(['jobID', 'node'])
-        .alias('byte_delta')
-    ])
+            pl.col('total_bytes')
+            .diff()
+            .over(['jobID', 'node'])
+            .alias('byte_delta')
+        ])
 
-    # Calculate MB/s with validation
-    df = df.with_columns([
-        (pl.when(pl.col('time_delta') > 0)
-         .then(pl.col('byte_delta') / pl.col('time_delta') / (1024 * 1024))
-         .otherwise(0.0))
-        .clip(0, None)
-        .alias('Value')
-    ])
+        # Calculate MB/s with validation
+        df = df.with_columns([
+            (pl.when(pl.col('time_delta') > 0)
+             .then(pl.col('byte_delta') / pl.col('time_delta') / (1024 * 1024))
+             .otherwise(0.0))
+            .clip(0, None)
+            .alias('Value')
+        ])
 
-    return pl.DataFrame({
-        'Job Id': df['jobID'],
-        'Host': df['node'],
-        'Event': pl.lit('nfs').repeat(len(df)),
-        'Value': df['Value'],
-        'Units': pl.lit('MB/s').repeat(len(df)),
-        'Timestamp': df['timestamp']
-    })
+        return pl.DataFrame({
+            'Job Id': df['jobID'],
+            'Host': df['node'],
+            'Event': pl.lit('nfs').repeat(len(df)),
+            'Value': df['Value'],
+            'Units': pl.lit('MB/s').repeat(len(df)),
+            'Timestamp': df['timestamp']
+        })
+
+    except Exception as e:
+        print(f"Error processing NFS file: {str(e)}")
+        return None
 
 
 class ThreadedDownloader:
