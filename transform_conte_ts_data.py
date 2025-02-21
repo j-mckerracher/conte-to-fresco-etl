@@ -41,7 +41,17 @@ def calculate_rate(current_value: float, previous_value: float,
 
 def process_block_file(file_path: str) -> pl.DataFrame:
     """Process block.csv file with improved error handling"""
-    df = pl.read_csv(file_path)
+    # Define schema with u64 for potentially large numbers
+    schema = {
+        'rd_ios': pl.UInt64,
+        'rd_sectors': pl.UInt64,
+        'wr_ios': pl.UInt64,
+        'wr_sectors': pl.UInt64,
+        'rd_ticks': pl.UInt64,
+        'wr_ticks': pl.UInt64
+    }
+
+    df = pl.read_csv(file_path, schema_overrides=schema)
 
     # Calculate I/O throughput with safety checks
     df = df.with_columns([
@@ -74,7 +84,18 @@ def process_block_file(file_path: str) -> pl.DataFrame:
 
 def process_cpu_file(file_path: str) -> pl.DataFrame:
     """Process cpu.csv file with support for multi-core CPU percentages"""
-    df = pl.read_csv(file_path)
+    # Define schema with u64 for CPU metrics
+    schema = {
+        'user': pl.UInt64,
+        'nice': pl.UInt64,
+        'system': pl.UInt64,
+        'idle': pl.UInt64,
+        'iowait': pl.UInt64,
+        'irq': pl.UInt64,
+        'softirq': pl.UInt64
+    }
+
+    df = pl.read_csv(file_path, schema_overrides=schema)
 
     # Calculate total CPU time with all components
     df = df.with_columns([
@@ -104,7 +125,16 @@ def process_cpu_file(file_path: str) -> pl.DataFrame:
 
 def process_mem_file(file_path: str) -> pl.DataFrame:
     """Process mem.csv file with improved validation"""
-    df = pl.read_csv(file_path)
+    # Define schema with u64 for memory values
+    schema = {
+        'MemTotal': pl.UInt64,
+        'MemFree': pl.UInt64,
+        'Buffers': pl.UInt64,
+        'Cached': pl.UInt64,
+        'FilePages': pl.UInt64
+    }
+
+    df = pl.read_csv(file_path, schema_overrides=schema)
 
     # Ensure memory values are non-negative and MemFree doesn't exceed MemTotal
     df = df.with_columns([
@@ -156,7 +186,19 @@ def process_mem_file(file_path: str) -> pl.DataFrame:
 
 def process_nfs_file(file_path: str) -> pl.DataFrame:
     """Process llite.csv file with improved rate calculation"""
-    df = pl.read_csv(file_path)
+    # Define schema with u64 for byte counts and operations
+    schema = {
+        'read_bytes': pl.UInt64,
+        'write_bytes': pl.UInt64,
+        'ioctl': pl.UInt64,
+        'open': pl.UInt64,
+        'close': pl.UInt64,
+        'mmap': pl.UInt64,
+        'seek': pl.UInt64,
+        'fsync': pl.UInt64
+    }
+
+    df = pl.read_csv(file_path, schema_overrides=schema)
 
     # Sort by timestamp and calculate time deltas
     df = df.with_columns([
