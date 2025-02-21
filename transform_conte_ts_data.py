@@ -13,7 +13,7 @@ import shutil
 import threading
 from queue import Queue, Empty
 import time
-from typing import List, Dict, Callable
+from typing import List, Dict, Callable, Union
 import requests
 from urllib.parse import urljoin
 from bs4 import BeautifulSoup
@@ -40,9 +40,13 @@ def calculate_rate(current_value: float, previous_value: float,
     return safe_division(current_value - previous_value, time_delta_seconds)
 
 
-def process_block_file(file_path: str) -> pd.DataFrame:
+def process_block_file(input_data: Union[str, pd.DataFrame]) -> pd.DataFrame:
     """Process block.csv file with improved error handling"""
-    df = pd.read_csv(file_path)
+    # Handle both file path and DataFrame inputs
+    if isinstance(input_data, str):
+        df = pd.read_csv(input_data)
+    else:
+        df = input_data.copy()
 
     # Calculate I/O throughput with safety checks
     total_sectors = df['rd_sectors'] + df['wr_sectors']
@@ -66,16 +70,19 @@ def process_block_file(file_path: str) -> pd.DataFrame:
     })
 
 
-def process_cpu_file(file_path: str) -> pd.DataFrame:
+def process_cpu_file(input_data: Union[str, pd.DataFrame]) -> pd.DataFrame:
     """Process cpu.csv file with support for multi-core CPU percentages"""
-    df = pd.read_csv(file_path)
+    # Handle both file path and DataFrame inputs
+    if isinstance(input_data, str):
+        df = pd.read_csv(input_data)
+    else:
+        df = input_data.copy()
 
     # Calculate total CPU time with all components
     total = (df['user'] + df['nice'] + df['system'] +
              df['idle'] + df['iowait'] + df['irq'] + df['softirq'])
 
     # Calculate user CPU percentage without upper bound
-    # Including both user and nice time as per original
     user_time = df['user'] + df['nice']
     df['Value'] = [validate_metric(safe_division(u, t) * 100, 0)
                    for u, t in zip(user_time, total)]
@@ -92,9 +99,13 @@ def process_cpu_file(file_path: str) -> pd.DataFrame:
     })
 
 
-def process_mem_file(file_path: str) -> pd.DataFrame:
+def process_mem_file(input_data: Union[str, pd.DataFrame]) -> pd.DataFrame:
     """Process mem.csv file with improved validation"""
-    df = pd.read_csv(file_path)
+    # Handle both file path and DataFrame inputs
+    if isinstance(input_data, str):
+        df = pd.read_csv(input_data)
+    else:
+        df = input_data.copy()
 
     # Ensure memory values are non-negative
     df['MemTotal'] = df['MemTotal'].clip(lower=0)
@@ -137,9 +148,13 @@ def process_mem_file(file_path: str) -> pd.DataFrame:
     return pd.concat([memused, memused_minus_diskcache])
 
 
-def process_nfs_file(file_path: str) -> pd.DataFrame:
+def process_nfs_file(input_data: Union[str, pd.DataFrame]) -> pd.DataFrame:
     """Process llite.csv file with improved rate calculation"""
-    df = pd.read_csv(file_path)
+    # Handle both file path and DataFrame inputs
+    if isinstance(input_data, str):
+        df = pd.read_csv(input_data)
+    else:
+        df = input_data.copy()
 
     # Sort by timestamp to ensure correct rate calculation
     df = df.sort_values('timestamp')
