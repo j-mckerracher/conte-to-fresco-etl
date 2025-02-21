@@ -15,15 +15,8 @@ from typing import List, Dict
 import requests
 from urllib.parse import urljoin
 from bs4 import BeautifulSoup
+import pandas as pd
 import numpy as np
-import polars as pl
-
-
-def parse_timestamp(df: pl.DataFrame) -> pl.DataFrame:
-    """Parse timestamp column in MM/DD/YYYY HH:MM:SS format"""
-    return df.with_columns([
-        pl.col('timestamp').str.strptime(pl.Datetime, '%m/%d/%Y %H:%M:%S').alias('Timestamp')
-    ])
 
 
 def safe_division(numerator, denominator, default: float = 0.0) -> float:
@@ -45,166 +38,133 @@ def calculate_rate(current_value: float, previous_value: float,
     return safe_division(current_value - previous_value, time_delta_seconds)
 
 
-def process_block_file(file_path: str) -> pl.DataFrame:
+def process_block_file(file_path: str) -> pd.DataFrame:
     """Process block.csv file with improved error handling"""
-    try:
-        # Read CSV without schema constraints
-        df = pl.read_csv(file_path)
+    df = pd.read_csv(file_path)
 
-        # Cast numeric columns to Float64 for computation
-        df = df.with_columns([
-            pl.col('rd_sectors').cast(pl.Float64).alias('rd_sectors_num'),
-            pl.col('wr_sectors').cast(pl.Float64).alias('wr_sectors_num'),
-            pl.col('rd_ticks').cast(pl.Float64).alias('rd_ticks_num'),
-            pl.col('wr_ticks').cast(pl.Float64).alias('wr_ticks_num')
-        ])
+    # Calculate I/O throughput with safety checks
+    total_sectors = df['rd_sectors'] + df['wr_sectors']
+    total_ticks = df['rd_ticks'] + df['wr_ticks']
 
-        # Calculate throughput
-        df = df.with_columns([
-            (pl.col('rd_sectors_num') + pl.col('wr_sectors_num')).alias('total_sectors'),
-            ((pl.col('rd_ticks_num') + pl.col('wr_ticks_num')) / 1000).alias('total_ticks')
-        ])
+    # Convert sectors to bytes and calculate throughput
+    bytes_processed = total_sectors * 512
+    throughput = [safe_division(b, t) for b, t in zip(bytes_processed, total_ticks)]
 
-        # Convert to GB/s
-        df = df.with_columns([
-            pl.when(pl.col('total_ticks') > 0)
-            .then((pl.col('total_sectors') * 512) / pl.col('total_ticks') / (1024 ** 3))
-            .otherwise(0)
-            .alias('Value')
-        ])
+    # Convert to GB/s and validate
+    df['Value'] = [validate_metric(t / (1024 * 1024 * 1024)) for t in throughput]
+    df['jobID'] = df['jobID'].str.replace('jobID', 'JOB', case=False)
 
-        return df.select([
-            pl.col('jobID').str.replace_all('jobID', 'JOB', literal=True).alias('Job Id'),
-            pl.col('node').alias('Host'),
-            pl.col('timestamp').str.strptime(pl.Datetime, "%m/%d/%Y %H:%M:%S").alias('Timestamp'),
-            pl.lit('block').alias('Event'),
-            pl.col('Value'),
-            pl.lit('GB/s').alias('Units')
-        ])
-
-    except Exception as e:
-        print(f"Error processing block file: {str(e)}")
-        return None
+    return pd.DataFrame({
+        'Job Id': df['jobID'],
+        'Host': df['node'],
+        'Event': 'block',
+        'Value': df['Value'],
+        'Units': 'GB/s',
+        'Timestamp': pd.to_datetime(df['timestamp'])
+    })
 
 
-def process_cpu_file(file_path: str) -> pl.DataFrame:
-    """Process cpu.csv file with improved error handling"""
-    try:
-        # Read CSV without schema constraints
-        df = pl.read_csv(file_path)
+def process_cpu_file(file_path: str) -> pd.DataFrame:
+    """Process cpu.csv file with support for multi-core CPU percentages"""
+    df = pd.read_csv(file_path)
 
-        # Cast numeric columns and calculate total ticks
-        df = df.with_columns([
-            pl.col(col).cast(pl.Float64) for col in ['user', 'nice', 'system', 'idle', 'iowait', 'irq', 'softirq']
-        ])
+    # Calculate total CPU time with all components
+    total = (df['user'] + df['nice'] + df['system'] +
+             df['idle'] + df['iowait'] + df['irq'] + df['softirq'])
 
-        df = df.with_columns([
-            (pl.col('user') + pl.col('nice') + pl.col('system') +
-             pl.col('idle') + pl.col('iowait') + pl.col('irq') +
-             pl.col('softirq')).alias('total_ticks')
-        ])
+    # Calculate user CPU percentage without upper bound
+    # Including both user and nice time as per original
+    user_time = df['user'] + df['nice']
+    df['Value'] = [validate_metric(safe_division(u, t) * 100, 0)
+                   for u, t in zip(user_time, total)]
 
-        # Calculate CPU percentage
-        df = df.with_columns([
-            pl.when(pl.col('total_ticks') > 0)
-            .then(((pl.col('user') + pl.col('nice')) / pl.col('total_ticks')) * 100)
-            .otherwise(0)
-            .clip(0, 100)
-            .alias('Value')
-        ])
+    df['jobID'] = df['jobID'].str.replace('jobID', 'JOB', case=False)
 
-        return df.select([
-            pl.col('jobID').str.replace_all('jobID', 'JOB', literal=True).alias('Job Id'),
-            pl.col('node').alias('Host'),
-            pl.col('timestamp').str.strptime(pl.Datetime, "%m/%d/%Y %H:%M:%S").alias('Timestamp'),
-            pl.lit('cpuuser').alias('Event'),
-            pl.col('Value'),
-            pl.lit('CPU %').alias('Units')
-        ])
-
-    except Exception as e:
-        print(f"Error processing CPU file: {str(e)}")
-        return None
+    return pd.DataFrame({
+        'Job Id': df['jobID'],
+        'Host': df['node'],
+        'Event': 'cpuuser',
+        'Value': df['Value'],
+        'Units': 'CPU %',
+        'Timestamp': pd.to_datetime(df['timestamp'])
+    })
 
 
-def process_mem_file(file_path: str) -> pl.DataFrame:
-    """Process mem.csv file with improved error handling"""
-    try:
-        # Read CSV without schema constraints
-        df = pl.read_csv(file_path)
+def process_mem_file(file_path: str) -> pd.DataFrame:
+    """Process mem.csv file with improved validation"""
+    df = pd.read_csv(file_path)
 
-        # Convert to GB directly as MemUsed is already in KB
-        df = df.with_columns([
-            (pl.col('MemUsed').cast(pl.Float64) / (1024 * 1024)).alias('memused'),
-            ((pl.col('MemUsed').cast(pl.Float64) - pl.col('FilePages').cast(pl.Float64)) / (1024 * 1024))
-            .clip(0, None)
-            .alias('memused_minus_diskcache')
-        ])
+    # Ensure memory values are non-negative
+    df['MemTotal'] = df['MemTotal'].clip(lower=0)
+    df['MemFree'] = df['MemFree'].clip(lower=0)
+    df['FilePages'] = df['FilePages'].clip(lower=0)
 
-        # Create memused dataframe
-        memused_df = df.select([
-            pl.col('jobID').str.replace_all('jobID', 'JOB', literal=True).alias('Job Id'),
-            pl.col('node').alias('Host'),
-            pl.col('timestamp').str.strptime(pl.Datetime, "%m/%d/%Y %H:%M:%S").alias('Timestamp'),
-            pl.lit('memused').alias('Event'),
-            pl.col('memused').alias('Value'),
-            pl.lit('GB').alias('Units')
-        ])
+    # Ensure MemFree doesn't exceed MemTotal
+    df['MemFree'] = df.apply(lambda row: min(row['MemFree'], row['MemTotal']), axis=1)
 
-        # Create memused_minus_diskcache dataframe
-        memused_nocache_df = df.select([
-            pl.col('jobID').str.replace_all('jobID', 'JOB', literal=True).alias('Job Id'),
-            pl.col('node').alias('Host'),
-            pl.col('timestamp').str.strptime(pl.Datetime, "%m/%d/%Y %H:%M:%S").alias('Timestamp'),
-            pl.lit('memused_minus_diskcache').alias('Event'),
-            pl.col('memused_minus_diskcache').alias('Value'),
-            pl.lit('GB').alias('Units')
-        ])
+    # Calculate memory usage in GB with validation
+    df['memused_value'] = ((df['MemTotal'] - df['MemFree']) /
+                           (1024 * 1024 * 1024)).clip(lower=0)
 
-        return pl.concat([memused_df, memused_nocache_df])
+    # Calculate memory usage minus disk cache
+    cache_adjusted = df['MemTotal'] - df['MemFree'] - df['FilePages']
+    df['memused_minus_diskcache_value'] = (validate_metric(cache_adjusted) /
+                                           (1024 * 1024 * 1024))
 
-    except Exception as e:
-        print(f"Error processing memory file: {str(e)}")
-        return None
+    df['jobID'] = df['jobID'].str.replace('jobID', 'JOB', case=False)
+
+    # Create separate dataframes for each metric
+    memused = pd.DataFrame({
+        'Job Id': df['jobID'],
+        'Host': df['node'],
+        'Event': 'memused',
+        'Value': df['memused_value'],
+        'Units': 'GB',
+        'Timestamp': pd.to_datetime(df['timestamp'])
+    })
+
+    memused_minus_diskcache = pd.DataFrame({
+        'Job Id': df['jobID'],
+        'Host': df['node'],
+        'Event': 'memused_minus_diskcache',
+        'Value': df['memused_minus_diskcache_value'],
+        'Units': 'GB',
+        'Timestamp': pd.to_datetime(df['timestamp'])
+    })
+
+    return pd.concat([memused, memused_minus_diskcache])
 
 
-def process_nfs_file(file_path: str) -> pl.DataFrame:
-    """Process nfs file with improved rate calculation"""
-    try:
-        # Read CSV without schema constraints
-        df = pl.read_csv(file_path)
+def process_nfs_file(file_path: str) -> pd.DataFrame:
+    """Process llite.csv file with improved rate calculation"""
+    df = pd.read_csv(file_path)
 
-        # Calculate throughput from READ_bytes_recv and WRITE_bytes_sent
-        df = df.with_columns([
-            ((pl.col('READ_bytes_recv').cast(pl.Float64) +
-              pl.col('WRITE_bytes_sent').cast(pl.Float64)) / (1024 * 1024)).alias('Value'),
-            pl.col('timestamp').str.strptime(pl.Datetime, "%m/%d/%Y %H:%M:%S").alias('Timestamp')
-        ])
+    # Sort by timestamp to ensure correct rate calculation
+    df = df.sort_values('timestamp')
 
-        # Calculate time differences
-        df = df.with_columns([
-            pl.col('Timestamp').diff().cast(pl.Duration).dt.total_seconds()
-            .fill_null(600).alias('TimeDiff')
-        ])
+    # Calculate time deltas in seconds
+    df['timestamp'] = pd.to_datetime(df['timestamp'])
+    time_deltas = df.groupby(['jobID', 'node'])['timestamp'].diff().dt.total_seconds()
 
-        # Calculate final value (MB/s)
-        df = df.with_columns([
-            (pl.col('Value') / pl.col('TimeDiff')).alias('Value')
-        ])
+    # Calculate rates with proper time normalization
+    total_bytes = df['read_bytes'] + df['write_bytes']
+    byte_deltas = total_bytes.groupby([df['jobID'], df['node']]).diff()
 
-        return df.select([
-            pl.col('jobID').str.replace_all('jobID', 'JOB', literal=True).alias('Job Id'),
-            pl.col('node').alias('Host'),
-            pl.col('Timestamp'),
-            pl.lit('nfs').alias('Event'),
-            pl.col('Value'),
-            pl.lit('MB/s').alias('Units')
-        ])
+    # Calculate MB/s with validation
+    df['Value'] = [validate_metric(calculate_rate(bytes, prev_bytes, delta) / (1024 * 1024))
+                   for bytes, prev_bytes, delta in
+                   zip(total_bytes, byte_deltas, time_deltas)]
 
-    except Exception as e:
-        print(f"Error processing NFS file: {str(e)}")
-        return None
+    df['jobID'] = df['jobID'].str.replace('jobID', 'JOB', case=False)
 
+    return pd.DataFrame({
+        'Job Id': df['jobID'],
+        'Host': df['node'],
+        'Event': 'nfs',
+        'Value': df['Value'],
+        'Units': 'MB/s',
+        'Timestamp': df['timestamp']
+    })
 
 class ThreadedDownloader:
     def __init__(self, num_threads: int = 4, max_retries: int = 3, timeout: int = 300):
@@ -458,7 +418,7 @@ def get_folder_urls(base_url: str, headers: dict) -> List[tuple]:
         return []
 
 
-def process_folder_data(folder_path: str) -> pl.DataFrame:
+def process_folder_data(folder_path: str) -> pd.DataFrame:
     """Process all files in a folder with immediate cleanup"""
     results = []
     file_processors = {
@@ -472,10 +432,15 @@ def process_folder_data(folder_path: str) -> pl.DataFrame:
         file_path = os.path.join(folder_path, filename)
         if os.path.exists(file_path):
             try:
-                # Process in chunks if file is large
+                # Read the file in chunks if it's large
                 if os.path.getsize(file_path) > 100 * 1024 * 1024:  # 100MB
-                    result = pl.scan_csv(file_path).collect()
-                    processed_result = processor(result)
+                    chunk_size = 10000  # Adjust based on your memory constraints
+                    chunks = []
+                    for chunk in pd.read_csv(file_path, chunksize=chunk_size):
+                        processed_chunk = processor(pd.DataFrame(chunk))
+                        chunks.append(processed_chunk)
+                        gc.collect()  # Force garbage collection after each chunk
+                    result = pd.concat(chunks, ignore_index=True)
                 else:
                     result = processor(file_path)
 
@@ -487,13 +452,14 @@ def process_folder_data(folder_path: str) -> pl.DataFrame:
                 gc.collect()
             except Exception as e:
                 print(f"Error processing {filename}: {str(e)}")
+                # Clean up even if processing fails
                 try:
                     os.remove(file_path)
                 except:
                     pass
 
     if results:
-        return pl.concat(results)
+        return pd.concat(results, ignore_index=True)
     return None
 
 
@@ -515,7 +481,7 @@ def check_disk_space(warning_gb=20, critical_gb=5) -> tuple:
         # Calculate available space in GB
         available_gb = (quota_total - used_space) / (1024 * 1024 * 1024)
 
-        return available_gb > critical_gb, available_gb > warning_gb
+        return (available_gb > critical_gb, available_gb > warning_gb)
     except Exception as e:
         print(f"Error checking disk space: {str(e)}")
         # If we can't check space, assume we're in a critical state
@@ -532,11 +498,11 @@ def save_monthly_data(monthly_data: Dict, base_dir: str, version_manager: DataVe
     for month, new_df in monthly_data.items():
         file_path = os.path.join(output_dir, f"FRESCO_Conte_ts_{month}_{version_suffix}.csv")
         if os.path.exists(file_path):
-            existing_df = pl.read_csv(file_path)
-            merged_df = pl.concat([existing_df, new_df]).unique()
-            merged_df.write_csv(file_path)  # 'w' mode is explicit here for clarity
+            existing_df = pd.read_csv(file_path)
+            merged_df = pd.concat([existing_df, new_df]).drop_duplicates()
+            merged_df.to_csv(file_path, index=False)
         else:
-            new_df.write_csv(file_path)
+            new_df.to_csv(file_path, index=False)
         saved_files.append(file_path)
 
     return saved_files
@@ -679,7 +645,7 @@ def main():
                         # Split and save results
                         batch_monthly = {
                             name: group for name, group in
-                            result.group_by(pl.col('Timestamp').dt.strftime('%Y_%m'))
+                            result.groupby(result['Timestamp'].dt.strftime('%Y_%m'))
                         }
                         monthly_data.update(batch_monthly)
                         save_monthly_data(batch_monthly, base_dir, version_manager)
