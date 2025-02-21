@@ -2,6 +2,8 @@ import os
 import glob
 import json
 import re
+import signal
+import sys
 from pathlib import Path
 import gc
 import psutil
@@ -9,9 +11,9 @@ import boto3
 from botocore.exceptions import ClientError
 import shutil
 import threading
-from queue import Queue
+from queue import Queue, Empty
 import time
-from typing import List, Dict
+from typing import List, Dict, Callable
 import requests
 from urllib.parse import urljoin
 from bs4 import BeautifulSoup
@@ -165,6 +167,203 @@ def process_nfs_file(file_path: str) -> pd.DataFrame:
         'Units': 'MB/s',
         'Timestamp': df['timestamp']
     })
+
+
+class DataProcessor:
+    def __init__(self, num_threads: int = 30):
+        self.num_threads = num_threads
+        self.process_queue = Queue()
+        self.results_queue = Queue()
+        self.lock = threading.Lock()
+        self.completed_files = 0
+        self.total_files = 0
+        self.print_lock = threading.Lock()
+        self.shutdown_event = threading.Event()
+        self.active_threads = []
+        self.shutdown_requested = False
+
+        # Set up signal handlers
+        signal.signal(signal.SIGINT, self.handle_interrupt)
+        signal.signal(signal.SIGTERM, self.handle_interrupt)
+
+    def handle_interrupt(self, signum, frame):
+        """Handle interrupt signals gracefully"""
+        print("\nShutdown requested. Cleaning up...")
+        self.shutdown_requested = True
+        self.shutdown()
+
+    def shutdown(self):
+        """Clean shutdown of all processing"""
+        # Signal threads to stop
+        self.shutdown_event.set()
+
+        # Clear the process queue
+        while not self.process_queue.empty():
+            try:
+                self.process_queue.get_nowait()
+                self.process_queue.task_done()
+            except:
+                pass
+
+        # Add sentinel values to ensure threads exit
+        for _ in range(self.num_threads):
+            self.process_queue.put(None)
+
+        # Wait for all threads to finish
+        for thread in self.active_threads:
+            if thread.is_alive():
+                thread.join(timeout=2.0)  # Give threads 2 seconds to finish
+
+        print("\nShutdown complete. All threads stopped.")
+
+    def process_worker(self, file_processors: Dict[str, Callable]):
+        """Worker thread function to process data files"""
+        while not self.shutdown_event.is_set():
+            try:
+                # Get the next task with timeout
+                try:
+                    task = self.process_queue.get(timeout=1.0)
+                except Queue.Empty:
+                    continue
+
+                if task is None:
+                    break
+
+                folder_path, filename = task
+                processor = file_processors.get(filename)
+                if not processor:
+                    continue
+
+                file_path = os.path.join(folder_path, filename)
+                if os.path.exists(file_path):
+                    try:
+                        # Check for shutdown before heavy processing
+                        if self.shutdown_event.is_set():
+                            break
+
+                        # Process file in chunks if it's large
+                        if os.path.getsize(file_path) > 100 * 1024 * 1024:  # 100MB
+                            chunk_size = 10000
+                            chunks = []
+                            for chunk in pd.read_csv(file_path, chunksize=chunk_size):
+                                if self.shutdown_event.is_set():
+                                    break
+                                processed_chunk = processor(pd.DataFrame(chunk))
+                                chunks.append(processed_chunk)
+                                gc.collect()
+
+                            if not self.shutdown_event.is_set():
+                                result = pd.concat(chunks, ignore_index=True)
+                        else:
+                            result = processor(file_path)
+
+                        if result is not None and not self.shutdown_event.is_set():
+                            self.results_queue.put(result)
+
+                        # Clean up the file after processing
+                        try:
+                            os.remove(file_path)
+                        except:
+                            pass
+                        gc.collect()
+
+                        # Update progress if not shutting down
+                        if not self.shutdown_event.is_set():
+                            with self.lock:
+                                self.completed_files += 1
+                                with self.print_lock:
+                                    print_progress(
+                                        self.completed_files,
+                                        self.total_files,
+                                        prefix='Processing Files:',
+                                        suffix=f'({self.completed_files}/{self.total_files})'
+                                    )
+
+                    except Exception as e:
+                        print(f"Error processing {filename}: {str(e)}")
+                        try:
+                            os.remove(file_path)
+                        except:
+                            pass
+
+            except Exception as e:
+                if not self.shutdown_event.is_set():
+                    print(f"Worker error: {str(e)}")
+            finally:
+                self.process_queue.task_done()
+
+    def process_folder_data_parallel(self, folder_path: str, file_processors: Dict[str, Callable]) -> pd.DataFrame:
+        """Process all files in a folder using parallel threads"""
+        try:
+            # Reset tracking variables
+            self.completed_files = 0
+            self.total_files = sum(1 for f in os.listdir(folder_path) if f in file_processors)
+            self.shutdown_event.clear()
+            self.active_threads = []
+
+            if self.total_files == 0:
+                return None
+
+            print(f"\nProcessing {self.total_files} files with {self.num_threads} threads")
+
+            # Start worker threads
+            for _ in range(self.num_threads):
+                thread = threading.Thread(
+                    target=self.process_worker,
+                    args=(file_processors,),
+                    daemon=True
+                )
+                thread.start()
+                self.active_threads.append(thread)
+
+            # Add processing tasks to queue
+            for filename in os.listdir(folder_path):
+                if filename in file_processors:
+                    self.process_queue.put((folder_path, filename))
+
+            # Add sentinel values to stop workers
+            for _ in range(self.num_threads):
+                self.process_queue.put(None)
+
+            if self.shutdown_requested:
+                return None
+
+            # Wait for all tasks to complete
+            self.process_queue.join()
+
+            # Collect all results
+            results = []
+            while not self.results_queue.empty():
+                results.append(self.results_queue.get())
+
+            if results:
+                return pd.concat(results, ignore_index=True)
+            return None
+
+        except KeyboardInterrupt:
+            self.shutdown()
+            return None
+        except Exception as e:
+            print(f"Error in parallel processing: {str(e)}")
+            self.shutdown()
+            raise
+        finally:
+            if not self.shutdown_event.is_set():  # Only call shutdown once
+                self.shutdown()
+
+
+def process_folder_data(folder_path: str) -> pd.DataFrame:
+    """Process all files in a folder using parallel processing"""
+    file_processors = {
+        'block.csv': process_block_file,
+        'cpu.csv': process_cpu_file,
+        'mem.csv': process_mem_file,
+        'llite.csv': process_nfs_file
+    }
+
+    processor = DataProcessor(num_threads=30)
+    return processor.process_folder_data_parallel(folder_path, file_processors)
+
 
 class ThreadedDownloader:
     def __init__(self, num_threads: int = 4, max_retries: int = 3, timeout: int = 300):
