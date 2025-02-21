@@ -15,9 +15,15 @@ from typing import List, Dict
 import requests
 from urllib.parse import urljoin
 from bs4 import BeautifulSoup
-import pandas as pd
 import numpy as np
 import polars as pl
+
+
+def parse_timestamp(df: pl.DataFrame) -> pl.DataFrame:
+    """Parse timestamp column in MM/DD/YYYY HH:MM:SS format"""
+    return df.with_columns([
+        pl.col('timestamp').str.strptime(pl.Datetime, '%m/%d/%Y %H:%M:%S').alias('Timestamp')
+    ])
 
 
 def safe_division(numerator, denominator, default: float = 0.0) -> float:
@@ -41,21 +47,15 @@ def calculate_rate(current_value: float, previous_value: float,
 
 def process_block_file(file_path: str) -> pl.DataFrame:
     """Process block.csv file with improved error handling"""
-    # Read file content first
-    try:
-        with open(file_path, 'r') as f:
-            content = f.read()
-    except Exception as e:
-        print(f"Error reading {file_path}: {str(e)}")
-        return None
-
-    # Define schema with u64 for potentially large numbers
+    # Define schema with u64 for all numeric columns
     schema = {
         'rd_ios': pl.UInt64,
+        'rd_merges': pl.UInt64,
         'rd_sectors': pl.UInt64,
-        'wr_ios': pl.UInt64,
-        'wr_sectors': pl.UInt64,
         'rd_ticks': pl.UInt64,
+        'wr_ios': pl.UInt64,
+        'wr_merges': pl.UInt64,
+        'wr_sectors': pl.UInt64,
         'wr_ticks': pl.UInt64,
         'in_flight': pl.UInt64,
         'io_ticks': pl.UInt64,
@@ -63,23 +63,26 @@ def process_block_file(file_path: str) -> pl.DataFrame:
     }
 
     try:
+        # Read CSV with explicit datetime parsing
         df = pl.read_csv(
             file_path,
             schema_overrides=schema,
-            infer_schema_length=None,
-            try_parse_dates=True
+            try_parse_dates=False  # We'll parse timestamp manually
         )
 
-        # Calculate I/O throughput with safety checks
+        # Parse timestamp
+        df = parse_timestamp(df)
+
+        # Calculate I/O throughput
         df = df.with_columns([
             (pl.col('rd_sectors') + pl.col('wr_sectors')).alias('total_sectors'),
-            (pl.col('rd_ticks') + pl.col('wr_ticks')).alias('total_ticks')
+            (pl.col('rd_ticks') + pl.col('wr_ticks')).alias('total_ticks'),
+            pl.col('jobID').str.replace_all('jobID', 'JOB', case_sensitive=False).alias('jobID')
         ])
 
         # Convert sectors to bytes and calculate throughput
         df = df.with_columns([
-            (pl.col('total_sectors') * 512).alias('bytes_processed'),
-            pl.col('jobID').str.replace_all('jobID', 'JOB', case_sensitive=False).alias('jobID')
+            (pl.col('total_sectors') * 512).alias('bytes_processed')
         ])
 
         # Calculate throughput in GB/s with validation
@@ -97,22 +100,16 @@ def process_block_file(file_path: str) -> pl.DataFrame:
             'Event': pl.lit('block').repeat(len(df)),
             'Value': df['Value'],
             'Units': pl.lit('GB/s').repeat(len(df)),
-            'Timestamp': pl.col('timestamp').str.to_datetime()
+            'Timestamp': df['Timestamp']
         })
 
     except Exception as e:
         print(f"Error processing block file: {str(e)}")
         return None
 
+
 def process_cpu_file(file_path: str) -> pl.DataFrame:
     """Process cpu.csv file with support for multi-core CPU percentages"""
-    try:
-        with open(file_path, 'r') as f:
-            content = f.read()
-    except Exception as e:
-        print(f"Error reading {file_path}: {str(e)}")
-        return None
-
     # Define schema with u64 for CPU metrics
     schema = {
         'user': pl.UInt64,
@@ -121,26 +118,25 @@ def process_cpu_file(file_path: str) -> pl.DataFrame:
         'idle': pl.UInt64,
         'iowait': pl.UInt64,
         'irq': pl.UInt64,
-        'softirq': pl.UInt64,
-        'steal': pl.UInt64,
-        'guest': pl.UInt64,
-        'guest_nice': pl.UInt64
+        'softirq': pl.UInt64
     }
 
     try:
+        # Read CSV with explicit datetime parsing
         df = pl.read_csv(
             file_path,
             schema_overrides=schema,
-            infer_schema_length=None,
-            try_parse_dates=True
+            try_parse_dates=False  # We'll parse timestamp manually
         )
 
-        # Calculate total CPU time with all components
+        # Parse timestamp
+        df = parse_timestamp(df)
+
+        # Calculate total CPU time
         df = df.with_columns([
             (pl.col('user') + pl.col('nice') + pl.col('system') +
              pl.col('idle') + pl.col('iowait') + pl.col('irq') +
-             pl.col('softirq') + pl.col('steal') + pl.col('guest') +
-             pl.col('guest_nice')).alias('total'),
+             pl.col('softirq')).alias('total'),
             (pl.col('user') + pl.col('nice')).alias('user_time'),
             pl.col('jobID').str.replace_all('jobID', 'JOB', case_sensitive=False).alias('jobID')
         ])
@@ -160,45 +156,48 @@ def process_cpu_file(file_path: str) -> pl.DataFrame:
             'Event': pl.lit('cpuuser').repeat(len(df)),
             'Value': df['Value'],
             'Units': pl.lit('CPU %').repeat(len(df)),
-            'Timestamp': pl.col('timestamp').str.to_datetime()
+            'Timestamp': df['Timestamp']
         })
 
     except Exception as e:
         print(f"Error processing CPU file: {str(e)}")
         return None
 
+
 def process_mem_file(file_path: str) -> pl.DataFrame:
     """Process mem.csv file with improved validation"""
-    try:
-        with open(file_path, 'r') as f:
-            content = f.read()
-    except Exception as e:
-        print(f"Error reading {file_path}: {str(e)}")
-        return None
-
     # Define schema with u64 for memory values
     schema = {
         'MemTotal': pl.UInt64,
         'MemFree': pl.UInt64,
-        'Buffers': pl.UInt64,
-        'Cached': pl.UInt64,
-        'SwapCached': pl.UInt64,
+        'MemUsed': pl.UInt64,
         'Active': pl.UInt64,
         'Inactive': pl.UInt64,
-        'FilePages': pl.UInt64,
         'Dirty': pl.UInt64,
-        'Writeback': pl.UInt64
+        'Writeback': pl.UInt64,
+        'FilePages': pl.UInt64,
+        'Mapped': pl.UInt64,
+        'AnonPages': pl.UInt64,
+        'PageTables': pl.UInt64,
+        'NFS_Unstable': pl.UInt64,
+        'Bounce': pl.UInt64,
+        'Slab': pl.UInt64,
+        'HugePages_Total': pl.UInt64,
+        'HugePages_Free': pl.UInt64
     }
 
     try:
+        # Read CSV with explicit datetime parsing
         df = pl.read_csv(
             file_path,
             schema_overrides=schema,
-            infer_schema_length=None,
-            try_parse_dates=True
+            try_parse_dates=False  # We'll parse timestamp manually
         )
 
-        # Ensure memory values are non-negative
+        # Parse timestamp
+        df = parse_timestamp(df)
+
+        # Ensure memory values are non-negative and validate
         df = df.with_columns([
             pl.col('MemTotal').clip(0, None).alias('MemTotal'),
             pl.col('MemFree').clip(0, None).alias('MemFree'),
@@ -232,7 +231,7 @@ def process_mem_file(file_path: str) -> pl.DataFrame:
             'Event': pl.lit('memused').repeat(len(df)),
             'Value': df['memused_value'],
             'Units': pl.lit('GB').repeat(len(df)),
-            'Timestamp': pl.col('timestamp').str.to_datetime()
+            'Timestamp': df['Timestamp']
         })
 
         memused_minus_diskcache = pl.DataFrame({
@@ -241,7 +240,7 @@ def process_mem_file(file_path: str) -> pl.DataFrame:
             'Event': pl.lit('memused_minus_diskcache').repeat(len(df)),
             'Value': df['memused_minus_diskcache_value'],
             'Units': pl.lit('GB').repeat(len(df)),
-            'Timestamp': pl.col('timestamp').str.to_datetime()
+            'Timestamp': df['Timestamp']
         })
 
         return pl.concat([memused, memused_minus_diskcache])
@@ -250,47 +249,45 @@ def process_mem_file(file_path: str) -> pl.DataFrame:
         print(f"Error processing memory file: {str(e)}")
         return None
 
+
 def process_nfs_file(file_path: str) -> pl.DataFrame:
     """Process llite.csv file with improved rate calculation"""
-    try:
-        with open(file_path, 'r') as f:
-            content = f.read()
-    except Exception as e:
-        print(f"Error reading {file_path}: {str(e)}")
-        return None
-
-    # Define schema with u64 for byte counts and operations
-    schema = {
-        'read_bytes': pl.UInt64,
-        'write_bytes': pl.UInt64,
-        'ioctl': pl.UInt64,
-        'open': pl.UInt64,
-        'close': pl.UInt64,
-        'mmap': pl.UInt64,
-        'seek': pl.UInt64,
-        'fsync': pl.UInt64,
-        'setattr': pl.UInt64,
-        'truncate': pl.UInt64
-    }
+    # Define all numeric columns as UInt64
+    schema = {col: pl.UInt64 for col in [
+        'inode_revalidate', 'dentry_revalidate', 'data_invalidate', 'attr_invalidate',
+        'vfs_open', 'vfs_lookup', 'vfs_access', 'vfs_updatepage', 'vfs_readpage',
+        'vfs_readpages', 'vfs_writepage', 'vfs_writepages', 'vfs_getdents',
+        'vfs_setattr', 'vfs_flush', 'vfs_fsync', 'vfs_lock', 'vfs_release',
+        'congestion_wait', 'setattr_trunc', 'extend_write', 'silly_rename',
+        'short_read', 'short_write', 'delay', 'normal_read', 'normal_write',
+        'direct_read', 'direct_write', 'server_read', 'server_write',
+        'read_page', 'write_page', 'xprt_sends', 'xprt_recvs', 'xprt_bad_xids',
+        'xprt_req_u', 'xprt_bklog_u'
+    ]}
 
     try:
+        # Read CSV with explicit datetime parsing
         df = pl.read_csv(
             file_path,
             schema_overrides=schema,
-            infer_schema_length=None,
-            try_parse_dates=True
+            try_parse_dates=False  # We'll parse timestamp manually
         )
 
-        # Sort by timestamp and calculate time deltas
+        # Parse timestamp and prepare data
+        df = parse_timestamp(df)
+
         df = df.with_columns([
-            pl.col('timestamp').str.to_datetime().alias('timestamp'),
-            pl.col('jobID').str.replace_all('jobID', 'JOB', case_sensitive=False).alias('jobID'),
-            (pl.col('read_bytes') + pl.col('write_bytes')).alias('total_bytes')
-        ]).sort(['jobID', 'node', 'timestamp'])
+            pl.col('jobID').str.replace_all('jobID', 'JOB', case_sensitive=False).alias('jobID')
+        ])
+
+        # Calculate total bytes and sort
+        df = df.with_columns([
+            (pl.col('normal_read') + pl.col('normal_write')).alias('total_bytes')
+        ]).sort(['jobID', 'node', 'Timestamp'])
 
         # Calculate time deltas and byte deltas by group
         df = df.with_columns([
-            pl.col('timestamp')
+            pl.col('Timestamp')
             .diff()
             .dt.seconds()
             .over(['jobID', 'node'])
@@ -317,7 +314,7 @@ def process_nfs_file(file_path: str) -> pl.DataFrame:
             'Event': pl.lit('nfs').repeat(len(df)),
             'Value': df['Value'],
             'Units': pl.lit('MB/s').repeat(len(df)),
-            'Timestamp': df['timestamp']
+            'Timestamp': df['Timestamp']
         })
 
     except Exception as e:
