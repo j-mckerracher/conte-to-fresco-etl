@@ -353,7 +353,8 @@ class DataProcessor:
 
 
 def process_folder_data(folder_path: str) -> pd.DataFrame:
-    """Process all files in a folder using parallel processing"""
+    """Process all files in a folder with immediate cleanup"""
+    results = []
     file_processors = {
         'block.csv': process_block_file,
         'cpu.csv': process_cpu_file,
@@ -361,8 +362,41 @@ def process_folder_data(folder_path: str) -> pd.DataFrame:
         'llite.csv': process_nfs_file
     }
 
-    processor = DataProcessor(num_threads=30)
-    return processor.process_folder_data_parallel(folder_path, file_processors)
+    for filename, processor in file_processors.items():
+        file_path = os.path.join(folder_path, filename)
+        if os.path.exists(file_path):
+            try:
+                # Read the file in chunks if it's large
+                if os.path.getsize(file_path) > 100 * 1024 * 1024:  # 100MB
+                    chunk_size = 10000
+                    chunks = []
+                    for chunk in pd.read_csv(file_path, chunksize=chunk_size):
+                        # Important: Create a new DataFrame from the chunk
+                        chunk_df = pd.DataFrame(chunk)
+                        processed_chunk = processor(chunk_df)  # Pass the DataFrame
+                        chunks.append(processed_chunk)
+                        gc.collect()
+                    result = pd.concat(chunks, ignore_index=True)
+                else:
+                    result = processor(file_path)  # Pass the file path directly
+
+                if result is not None:
+                    results.append(result)
+
+                # Immediately remove the file after processing
+                os.remove(file_path)
+                gc.collect()
+            except Exception as e:
+                print(f"Error processing {filename}: {str(e)}")
+                # Clean up even if processing fails
+                try:
+                    os.remove(file_path)
+                except:
+                    pass
+
+    if results:
+        return pd.concat(results, ignore_index=True)
+    return None
 
 
 class ThreadedDownloader:
