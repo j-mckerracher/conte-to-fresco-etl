@@ -419,7 +419,7 @@ def get_folder_urls(base_url: str, headers: dict) -> List[tuple]:
 
 
 def process_folder_data(folder_path: str) -> pd.DataFrame:
-    """Process all files in a folder"""
+    """Process all files in a folder with immediate cleanup"""
     results = []
     file_processors = {
         'block.csv': process_block_file,
@@ -432,24 +432,60 @@ def process_folder_data(folder_path: str) -> pd.DataFrame:
         file_path = os.path.join(folder_path, filename)
         if os.path.exists(file_path):
             try:
-                result = processor(file_path)
+                # Read the file in chunks if it's large
+                if os.path.getsize(file_path) > 100 * 1024 * 1024:  # 100MB
+                    chunk_size = 10000  # Adjust based on your memory constraints
+                    chunks = []
+                    for chunk in pd.read_csv(file_path, chunksize=chunk_size):
+                        processed_chunk = processor(pd.DataFrame(chunk))
+                        chunks.append(processed_chunk)
+                        gc.collect()  # Force garbage collection after each chunk
+                    result = pd.concat(chunks, ignore_index=True)
+                else:
+                    result = processor(file_path)
+
                 if result is not None:
                     results.append(result)
-                os.remove(file_path)  # Delete file after processing
+
+                # Immediately remove the file after processing
+                os.remove(file_path)
                 gc.collect()
             except Exception as e:
                 print(f"Error processing {filename}: {str(e)}")
+                # Clean up even if processing fails
+                try:
+                    os.remove(file_path)
+                except:
+                    pass
 
     if results:
         return pd.concat(results, ignore_index=True)
     return None
 
 
-def check_disk_space(warning_gb=50, critical_gb=20) -> tuple:
-    """Check available disk space"""
-    disk_usage = psutil.disk_usage('/')
-    available_gb = 23.0
-    return (available_gb > critical_gb, available_gb > warning_gb)
+def check_disk_space(warning_gb=20, critical_gb=5) -> tuple:
+    """
+    Check available disk space considering user quota
+    Returns: (is_safe, is_abundant)
+    """
+    try:
+        # Get user's home directory
+        home_dir = os.path.expanduser('~')
+
+        # Get total quota (24GB) and used space
+        quota_total = 24 * 1024 * 1024 * 1024  # 24GB in bytes
+        used_space = sum(os.path.getsize(os.path.join(dirpath, filename))
+                         for dirpath, _, filenames in os.walk(home_dir)
+                         for filename in filenames)
+
+        # Calculate available space in GB
+        available_gb = (quota_total - used_space) / (1024 * 1024 * 1024)
+
+        return (available_gb > critical_gb, available_gb > warning_gb)
+    except Exception as e:
+        print(f"Error checking disk space: {str(e)}")
+        # If we can't check space, assume we're in a critical state
+        return (False, False)
 
 
 def save_monthly_data(monthly_data: Dict, base_dir: str, version_manager: DataVersionManager) -> List[str]:
@@ -496,7 +532,8 @@ def upload_to_s3(file_paths: List[str], bucket_name="data-transform-conte") -> b
 
 def manage_storage(monthly_data: Dict, base_dir: str, version_manager: DataVersionManager) -> bool:
     """Manage storage and upload data when needed"""
-    is_safe, is_abundant = check_disk_space()
+    is_safe, is_abundant = check_disk_space(warning_gb=20, critical_gb=5)
+
     if not is_safe:
         print("\nCritical disk space reached. Uploading data...")
         version_suffix = version_manager.get_current_version()
@@ -504,6 +541,13 @@ def manage_storage(monthly_data: Dict, base_dir: str, version_manager: DataVersi
 
         if upload_to_s3(local_files):
             print(f"Successfully uploaded {version_suffix} files")
+            # Clean up local files after successful upload
+            for file in local_files:
+                try:
+                    os.remove(file)
+                except Exception as e:
+                    print(f"Error removing {file}: {str(e)}")
+
             version_manager.increment_version()
             monthly_data.clear()
             gc.collect()
@@ -514,6 +558,9 @@ def manage_storage(monthly_data: Dict, base_dir: str, version_manager: DataVersi
 
     elif not is_abundant:
         print("\nWarning: Disk space running low")
+        # Optionally trigger an upload even when not critical
+        if len(monthly_data) > 10:  # If we have accumulated significant data
+            return manage_storage(monthly_data, base_dir, version_manager)
 
     return False
 
