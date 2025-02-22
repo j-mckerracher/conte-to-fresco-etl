@@ -3,20 +3,18 @@ import glob
 import time
 import boto3
 import botocore.config
-import shutil
 
 
 def upload_to_s3(file_paths, bucket_name="data-transform-conte"):
-    """Upload files to S3 public bucket without requiring credentials"""
+    """Upload files to S3 bucket using AWS credentials"""
     print("\nStarting S3 upload...")
 
-    # Configure S3 client for public bucket access
+    # Configure S3 client using environment variables for credentials
     s3_client = boto3.client(
         's3',
-        config=botocore.config.Config(
-            signature_version=botocore.UNSIGNED,
-            region_name='us-east-1'
-        )
+        aws_access_key_id=os.environ.get('AWS_ACCESS_KEY_ID'),
+        aws_secret_access_key=os.environ.get('AWS_SECRET_ACCESS_KEY'),
+        region_name='us-east-1'
     )
 
     total_files = len(file_paths)
@@ -30,8 +28,7 @@ def upload_to_s3(file_paths, bucket_name="data-transform-conte"):
             try:
                 # Add content type for CSV files
                 extra_args = {
-                    'ContentType': 'text/csv',
-                    'ACL': 'public-read'
+                    'ContentType': 'text/csv'
                 }
 
                 s3_client.upload_file(
@@ -55,7 +52,23 @@ def upload_to_s3(file_paths, bucket_name="data-transform-conte"):
     return uploaded_files
 
 
+def check_aws_credentials():
+    """Check if AWS credentials are set in environment variables"""
+    access_key = os.environ.get('AWS_ACCESS_KEY_ID')
+    secret_key = os.environ.get('AWS_SECRET_ACCESS_KEY')
+
+    if not access_key or not secret_key:
+        print("AWS credentials not found in environment variables.")
+        print("Please set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY")
+        return False
+    return True
+
+
 def main():
+    # Check for AWS credentials first
+    if not check_aws_credentials():
+        return
+
     # Directory containing the files
     directory = "/home/dynamo/a/jmckerra/projects/conte-to-fresco-etl/monthly_data"
 
