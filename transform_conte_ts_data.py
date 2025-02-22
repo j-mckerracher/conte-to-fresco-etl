@@ -183,7 +183,7 @@ def process_nfs_file(input_data: Union[str, pd.DataFrame]) -> pd.DataFrame:
 
 
 class DataProcessor:
-    def __init__(self, num_threads: int = 30):
+    def __init__(self, num_threads: int = 40):
         self.num_threads = num_threads
         self.process_queue = Queue()
         self.results_queue = Queue()
@@ -773,8 +773,7 @@ def upload_to_s3(file_paths: List[str], bucket_name="data-transform-conte") -> b
             try:
                 # Add content type for CSV files
                 extra_args = {
-                    'ContentType': 'text/csv',
-                    'ACL': 'public-read'
+                    'ContentType': 'text/csv'
                 }
 
                 s3_client.upload_file(
@@ -865,7 +864,7 @@ def main():
     }
 
     # Initialize managers
-    tracker = ProcessingTracker(base_dir, reset=True)
+    tracker = ProcessingTracker(base_dir, reset=False)
     version_manager = DataVersionManager(base_dir)
     monthly_data = {}
 
