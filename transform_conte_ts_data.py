@@ -3,15 +3,13 @@ import glob
 import json
 import re
 import signal
-import sys
 from pathlib import Path
 import gc
-import psutil
+import botocore
 import boto3
-from botocore.exceptions import ClientError
 import shutil
 import threading
-from queue import Queue, Empty
+from queue import Queue
 import time
 from typing import List, Dict, Callable, Union
 import requests
@@ -66,7 +64,7 @@ def process_block_file(input_data: Union[str, pd.DataFrame]) -> pd.DataFrame:
         'Event': 'block',
         'Value': df['Value'],
         'Units': 'GB/s',
-        'Timestamp': pd.to_datetime(df['timestamp'])
+        'Timestamp': pd.to_datetime(df['timestamp'], format='%Y-%m-%d %H:%M:%S')
     })
 
 
@@ -95,7 +93,7 @@ def process_cpu_file(input_data: Union[str, pd.DataFrame]) -> pd.DataFrame:
         'Event': 'cpuuser',
         'Value': df['Value'],
         'Units': 'CPU %',
-        'Timestamp': pd.to_datetime(df['timestamp'])
+        'Timestamp': pd.to_datetime(df['timestamp'], format='%Y-%m-%d %H:%M:%S')
     })
 
 
@@ -133,7 +131,7 @@ def process_mem_file(input_data: Union[str, pd.DataFrame]) -> pd.DataFrame:
         'Event': 'memused',
         'Value': df['memused_value'],
         'Units': 'GB',
-        'Timestamp': pd.to_datetime(df['timestamp'])
+        'Timestamp': pd.to_datetime(df['timestamp'], format='%Y-%m-%d %H:%M:%S')
     })
 
     memused_minus_diskcache = pd.DataFrame({
@@ -142,7 +140,7 @@ def process_mem_file(input_data: Union[str, pd.DataFrame]) -> pd.DataFrame:
         'Event': 'memused_minus_diskcache',
         'Value': df['memused_minus_diskcache_value'],
         'Units': 'GB',
-        'Timestamp': pd.to_datetime(df['timestamp'])
+        'Timestamp': pd.to_datetime(df['timestamp'], format='%Y-%m-%d %H:%M:%S')
     })
 
     return pd.concat([memused, memused_minus_diskcache])
@@ -757,19 +755,39 @@ def save_monthly_data(monthly_data: Dict, base_dir: str, version_manager: DataVe
 
 
 def upload_to_s3(file_paths: List[str], bucket_name="data-transform-conte") -> bool:
-    """Upload files to S3"""
+    """Upload files to S3 public bucket without requiring credentials"""
     print("\nStarting S3 upload...")
-    s3_client = boto3.client('s3')
+
+    # Configure S3 client for public bucket access
+    s3_client = boto3.client(
+        's3',
+        config=boto3.Config(
+            signature_version=botocore.UNSIGNED,
+            region_name='us-east-1'  # Adjust if bucket is in different region
+        )
+    )
 
     for i, file_path in enumerate(file_paths, 1):
         file_name = os.path.basename(file_path)
         for attempt in range(3):
             try:
-                s3_client.upload_file(file_path, bucket_name, file_name)
+                # Add content type for CSV files
+                extra_args = {
+                    'ContentType': 'text/csv',
+                    'ACL': 'public-read'
+                }
+
+                s3_client.upload_file(
+                    file_path,
+                    bucket_name,
+                    file_name,
+                    ExtraArgs=extra_args
+                )
+
                 if i % 2 == 0 or i == len(file_paths):
                     print(f"Uploaded {i}/{len(file_paths)} files")
                 break
-            except ClientError as e:
+            except Exception as e:
                 if attempt == 2:
                     print(f"Failed to upload {file_name}: {str(e)}")
                     return False
@@ -786,6 +804,20 @@ def manage_storage(monthly_data: Dict, base_dir: str, version_manager: DataVersi
         print("\nCritical disk space reached. Uploading data...")
         version_suffix = version_manager.get_current_version()
         local_files = glob.glob(os.path.join(base_dir, "monthly_data", f"*_{version_suffix}.csv"))
+
+        # Check if we have enough space for the upload operation
+        total_upload_size = sum(os.path.getsize(f) for f in local_files)
+        _, available_space = check_disk_space()
+        if available_space * 1024 * 1024 * 1024 < total_upload_size * 1.2:  # 20% buffer
+            print("Warning: Insufficient space for safe upload. Removing oldest files first...")
+            # Sort files by modification time and remove until we have enough space
+            files_by_age = sorted(local_files, key=os.path.getmtime)
+            while files_by_age and available_space * 1024 * 1024 * 1024 < total_upload_size * 1.2:
+                try:
+                    os.remove(files_by_age.pop(0))
+                    _, available_space = check_disk_space()
+                except Exception as e:
+                    print(f"Error removing file: {str(e)}")
 
         if upload_to_s3(local_files):
             print(f"Successfully uploaded {version_suffix} files")
@@ -806,8 +838,8 @@ def manage_storage(monthly_data: Dict, base_dir: str, version_manager: DataVersi
 
     elif not is_abundant:
         print("\nWarning: Disk space running low")
-        # Optionally trigger an upload even when not critical
-        if len(monthly_data) > 10:  # If we have accumulated significant data
+        # Trigger an upload if we have accumulated significant data
+        if len(monthly_data) > 10:
             return manage_storage(monthly_data, base_dir, version_manager)
 
     return False
