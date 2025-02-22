@@ -66,7 +66,7 @@ def process_block_file(input_data: Union[str, pd.DataFrame]) -> pd.DataFrame:
         'Event': 'block',
         'Value': df['Value'],
         'Units': 'GB/s',
-        'Timestamp': pd.to_datetime(df['timestamp'], format='%Y-%m-%d %H:%M:%S')
+        'Timestamp': pd.to_datetime(df['timestamp'])
     })
 
 
@@ -95,7 +95,7 @@ def process_cpu_file(input_data: Union[str, pd.DataFrame]) -> pd.DataFrame:
         'Event': 'cpuuser',
         'Value': df['Value'],
         'Units': 'CPU %',
-        'Timestamp': pd.to_datetime(df['timestamp'], format='%Y-%m-%d %H:%M:%S')
+        'Timestamp': pd.to_datetime(df['timestamp'])
     })
 
 
@@ -126,9 +126,6 @@ def process_mem_file(input_data: Union[str, pd.DataFrame]) -> pd.DataFrame:
 
     df['jobID'] = df['jobID'].str.replace('jobID', 'JOB', case=False)
 
-    # Parse timestamp once
-    timestamps = pd.to_datetime(df['timestamp'], format='%Y-%m-%d %H:%M:%S')
-
     # Create separate dataframes for each metric
     memused = pd.DataFrame({
         'Job Id': df['jobID'],
@@ -136,7 +133,7 @@ def process_mem_file(input_data: Union[str, pd.DataFrame]) -> pd.DataFrame:
         'Event': 'memused',
         'Value': df['memused_value'],
         'Units': 'GB',
-        'Timestamp': timestamps
+        'Timestamp': pd.to_datetime(df['timestamp'])
     })
 
     memused_minus_diskcache = pd.DataFrame({
@@ -145,7 +142,7 @@ def process_mem_file(input_data: Union[str, pd.DataFrame]) -> pd.DataFrame:
         'Event': 'memused_minus_diskcache',
         'Value': df['memused_minus_diskcache_value'],
         'Units': 'GB',
-        'Timestamp': timestamps
+        'Timestamp': pd.to_datetime(df['timestamp'])
     })
 
     return pd.concat([memused, memused_minus_diskcache])
@@ -159,13 +156,11 @@ def process_nfs_file(input_data: Union[str, pd.DataFrame]) -> pd.DataFrame:
     else:
         df = input_data.copy()
 
-    # Parse timestamp with format
-    df['timestamp'] = pd.to_datetime(df['timestamp'], format='%Y-%m-%d %H:%M:%S')
-
     # Sort by timestamp to ensure correct rate calculation
     df = df.sort_values('timestamp')
 
     # Calculate time deltas in seconds
+    df['timestamp'] = pd.to_datetime(df['timestamp'])
     time_deltas = df.groupby(['jobID', 'node'])['timestamp'].diff().dt.total_seconds()
 
     # Calculate rates with proper time normalization
