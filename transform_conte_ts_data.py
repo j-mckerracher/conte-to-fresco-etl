@@ -64,7 +64,7 @@ def process_block_file(input_data: Union[str, pd.DataFrame]) -> pd.DataFrame:
         'Event': 'block',
         'Value': df['Value'],
         'Units': 'GB/s',
-        'Timestamp': pd.to_datetime(df['timestamp'], format='%Y-%m-%d %H:%M:%S')
+        'Timestamp': pd.to_datetime(df['timestamp'], format='%m/%d/%Y %H:%M:%S')  # Updated format
     })
 
 
@@ -93,7 +93,7 @@ def process_cpu_file(input_data: Union[str, pd.DataFrame]) -> pd.DataFrame:
         'Event': 'cpuuser',
         'Value': df['Value'],
         'Units': 'CPU %',
-        'Timestamp': pd.to_datetime(df['timestamp'], format='%Y-%m-%d %H:%M:%S')
+        'Timestamp': pd.to_datetime(df['timestamp'], format='%m/%d/%Y %H:%M:%S')  # Updated format
     })
 
 
@@ -124,6 +124,9 @@ def process_mem_file(input_data: Union[str, pd.DataFrame]) -> pd.DataFrame:
 
     df['jobID'] = df['jobID'].str.replace('jobID', 'JOB', case=False)
 
+    # Parse timestamp with updated format
+    timestamps = pd.to_datetime(df['timestamp'], format='%m/%d/%Y %H:%M:%S')
+
     # Create separate dataframes for each metric
     memused = pd.DataFrame({
         'Job Id': df['jobID'],
@@ -131,7 +134,7 @@ def process_mem_file(input_data: Union[str, pd.DataFrame]) -> pd.DataFrame:
         'Event': 'memused',
         'Value': df['memused_value'],
         'Units': 'GB',
-        'Timestamp': pd.to_datetime(df['timestamp'], format='%Y-%m-%d %H:%M:%S')
+        'Timestamp': timestamps
     })
 
     memused_minus_diskcache = pd.DataFrame({
@@ -140,7 +143,7 @@ def process_mem_file(input_data: Union[str, pd.DataFrame]) -> pd.DataFrame:
         'Event': 'memused_minus_diskcache',
         'Value': df['memused_minus_diskcache_value'],
         'Units': 'GB',
-        'Timestamp': pd.to_datetime(df['timestamp'], format='%Y-%m-%d %H:%M:%S')
+        'Timestamp': timestamps
     })
 
     return pd.concat([memused, memused_minus_diskcache])
@@ -154,11 +157,11 @@ def process_nfs_file(input_data: Union[str, pd.DataFrame]) -> pd.DataFrame:
     else:
         df = input_data.copy()
 
-    # Sort by timestamp to ensure correct rate calculation
+    # Parse timestamp with updated format and sort
+    df['timestamp'] = pd.to_datetime(df['timestamp'], format='%m/%d/%Y %H:%M:%S')
     df = df.sort_values('timestamp')
 
     # Calculate time deltas in seconds
-    df['timestamp'] = pd.to_datetime(df['timestamp'])
     time_deltas = df.groupby(['jobID', 'node'])['timestamp'].diff().dt.total_seconds()
 
     # Calculate rates with proper time normalization
@@ -183,7 +186,7 @@ def process_nfs_file(input_data: Union[str, pd.DataFrame]) -> pd.DataFrame:
 
 
 class DataProcessor:
-    def __init__(self, num_threads: int = 40):
+    def __init__(self, num_threads: int = 50):
         self.num_threads = num_threads
         self.process_queue = Queue()
         self.results_queue = Queue()
