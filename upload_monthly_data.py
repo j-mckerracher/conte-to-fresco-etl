@@ -2,7 +2,7 @@ import os
 import glob
 import time
 import boto3
-import botocore
+import botocore.config
 import shutil
 
 
@@ -13,7 +13,7 @@ def upload_to_s3(file_paths, bucket_name="data-transform-conte"):
     # Configure S3 client for public bucket access
     s3_client = boto3.client(
         's3',
-        config=boto3.Config(
+        config=botocore.config.Config(
             signature_version=botocore.UNSIGNED,
             region_name='us-east-1'
         )
