@@ -762,13 +762,12 @@ def upload_to_s3(file_paths: List[str], bucket_name="data-transform-conte") -> b
     print("\nStarting S3 upload...")
 
     # Configure S3 client for public bucket access
-    s3_client = boto3.client(
-        's3',
-        config=boto3.Config(
-            signature_version=botocore.UNSIGNED,
-            region_name='us-east-1'  # Adjust if bucket is in different region
-        )
+    config = botocore.config.Config(
+        signature_version=botocore.UNSIGNED,
+        region_name='us-east-1'  # Adjust if bucket is in different region
     )
+
+    s3_client = boto3.client('s3', config=config)
 
     for i, file_path in enumerate(file_paths, 1):
         file_name = os.path.basename(file_path)
