@@ -61,13 +61,12 @@ def upload_to_s3(file_paths: Union[str, List[str]], bucket_name="data-transform-
     if isinstance(file_paths, str):
         file_paths = [file_paths]
 
-    # Configure S3 client for public bucket access
-    config = botocore.config.Config(
-        signature_version=botocore.UNSIGNED,
+    s3_client = boto3.client(
+        's3',
+        aws_access_key_id=os.environ.get('AWS_ACCESS_KEY_ID'),
+        aws_secret_access_key=os.environ.get('AWS_SECRET_ACCESS_KEY'),
         region_name='us-east-1'
     )
-
-    s3_client = boto3.client('s3', config=config)
 
     for i, file_path in enumerate(file_paths, 1):
         if not os.path.exists(file_path):

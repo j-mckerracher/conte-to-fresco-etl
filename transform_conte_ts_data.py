@@ -761,13 +761,12 @@ def upload_to_s3(file_paths: List[str], bucket_name="data-transform-conte") -> b
     """Upload files to S3 public bucket without requiring credentials"""
     print("\nStarting S3 upload...")
 
-    # Configure S3 client for public bucket access
-    config = botocore.config.Config(
-        signature_version=botocore.UNSIGNED,
-        region_name='us-east-1'  # Adjust if bucket is in different region
+    s3_client = boto3.client(
+        's3',
+        aws_access_key_id=os.environ.get('AWS_ACCESS_KEY_ID'),
+        aws_secret_access_key=os.environ.get('AWS_SECRET_ACCESS_KEY'),
+        region_name='us-east-1'
     )
-
-    s3_client = boto3.client('s3', config=config)
 
     for i, file_path in enumerate(file_paths, 1):
         file_name = os.path.basename(file_path)
