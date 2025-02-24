@@ -1,8 +1,9 @@
 import os
+import time
 import pandas as pd
 import botocore
 import boto3
-import io
+from typing import List, Union
 from datetime import datetime, timedelta
 
 
@@ -52,49 +53,53 @@ def save_test_file(df: pd.DataFrame, base_dir: str) -> str:
     return file_path
 
 
-def upload_to_s3(file_path: str, bucket_name="data-transform-conte") -> bool:
-    """Upload test file to S3"""
-    if not os.path.exists(file_path):
-        print(f"Error: File not found: {file_path}")
-        return False
+def upload_to_s3(file_paths: Union[str, List[str]], bucket_name="data-transform-conte") -> bool:
+    """Upload files to S3 public bucket without requiring credentials"""
+    print("\nStarting S3 upload...")
 
-    print(f"\nAttempting to upload: {os.path.basename(file_path)}")
+    # Handle single file path
+    if isinstance(file_paths, str):
+        file_paths = [file_paths]
 
-    # Configure S3 client
+    # Configure S3 client for public bucket access
     config = botocore.config.Config(
         signature_version=botocore.UNSIGNED,
-        region_name='us-east-1',
-        retries={'max_attempts': 3, 'mode': 'adaptive'}
+        region_name='us-east-1'
     )
 
     s3_client = boto3.client('s3', config=config)
 
-    try:
-        # Read file content
-        with open(file_path, 'rb') as f:
-            file_content = f.read()
+    for i, file_path in enumerate(file_paths, 1):
+        if not os.path.exists(file_path):
+            print(f"File not found: {file_path}")
+            return False
 
-        # Set up upload parameters
         file_name = os.path.basename(file_path)
-        extra_args = {
-            'ContentType': 'text/csv',
-            'ContentLength': len(file_content)
-        }
+        for attempt in range(3):
+            try:
+                # Simple content type for CSV files
+                extra_args = {
+                    'ContentType': 'text/csv'
+                }
 
-        # Perform upload
-        s3_client.upload_fileobj(
-            io.BytesIO(file_content),
-            bucket_name,
-            file_name,
-            ExtraArgs=extra_args
-        )
+                print(f"Uploading {file_name}...")
+                s3_client.upload_file(
+                    file_path,
+                    bucket_name,
+                    file_name,
+                    ExtraArgs=extra_args
+                )
 
-        print(f"Successfully uploaded {file_name} to S3")
-        return True
+                print(f"Successfully uploaded {file_name}")
+                break
+            except Exception as e:
+                if attempt == 2:
+                    print(f"Failed to upload {file_name} after 3 attempts: {str(e)}")
+                    return False
+                print(f"Retry {attempt + 1} for {file_name}")
+                time.sleep(2 ** attempt)
 
-    except Exception as e:
-        print(f"Error uploading to S3: {str(e)}")
-        return False
+    return True
 
 
 def main():
