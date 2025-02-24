@@ -1,11 +1,10 @@
 import os
-import glob
 import json
+import queue
 import re
 import signal
 from pathlib import Path
 import gc
-import botocore
 import boto3
 import shutil
 import threading
@@ -239,7 +238,7 @@ class DataProcessor:
                 # Get the next task with timeout
                 try:
                     task = self.process_queue.get(timeout=1.0)
-                except Queue.Empty:
+                except queue.Empty:
                     continue
 
                 if task is None:
@@ -368,53 +367,6 @@ class DataProcessor:
                 self.shutdown()
 
 
-def process_folder_data(folder_path: str) -> pd.DataFrame:
-    """Process all files in a folder with immediate cleanup"""
-    results = []
-    file_processors = {
-        'block.csv': process_block_file,
-        'cpu.csv': process_cpu_file,
-        'mem.csv': process_mem_file,
-        'llite.csv': process_nfs_file
-    }
-
-    for filename, processor in file_processors.items():
-        file_path = os.path.join(folder_path, filename)
-        if os.path.exists(file_path):
-            try:
-                # Read the file in chunks if it's large
-                if os.path.getsize(file_path) > 100 * 1024 * 1024:  # 100MB
-                    chunk_size = 10000
-                    chunks = []
-                    for chunk in pd.read_csv(file_path, chunksize=chunk_size):
-                        # Important: Create a new DataFrame from the chunk
-                        chunk_df = pd.DataFrame(chunk)
-                        processed_chunk = processor(chunk_df)  # Pass the DataFrame
-                        chunks.append(processed_chunk)
-                        gc.collect()
-                    result = pd.concat(chunks, ignore_index=True)
-                else:
-                    result = processor(file_path)  # Pass the file path directly
-
-                if result is not None:
-                    results.append(result)
-
-                # Immediately remove the file after processing
-                os.remove(file_path)
-                gc.collect()
-            except Exception as e:
-                print(f"Error processing {filename}: {str(e)}")
-                # Clean up even if processing fails
-                try:
-                    os.remove(file_path)
-                except:
-                    pass
-
-    if results:
-        return pd.concat(results, ignore_index=True)
-    return None
-
-
 class ThreadedDownloader:
     def __init__(self, num_threads: int = 4, max_retries: int = 3, timeout: int = 300):
         self.num_threads = num_threads
@@ -431,7 +383,6 @@ class ThreadedDownloader:
         """Worker thread function to process download queue"""
         while True:
             try:
-                # Get the next task from queue
                 task = self.download_queue.get()
                 if task is None:
                     break
@@ -448,6 +399,10 @@ class ThreadedDownloader:
                         with open(local_path, 'wb') as f:
                             f.write(response.content)
 
+                        # Explicitly close and cleanup response
+                        response.close()
+                        del response
+
                         if os.path.getsize(local_path) > 0:
                             success = True
                             break
@@ -456,14 +411,13 @@ class ThreadedDownloader:
                         if attempt == self.max_retries - 1:
                             print(f"Failed to download {url}: {str(e)}")
                         else:
-                            time.sleep(2 ** attempt)  # Exponential backoff
+                            time.sleep(2 ** attempt)
 
-                # Update results and progress
+                # Update results and progress with proper error handling
                 with self.lock:
                     self.results[url] = success
                     self.completed_downloads += 1
 
-                    # Print progress
                     with self.print_lock:
                         print_progress(
                             self.completed_downloads,
@@ -683,12 +637,13 @@ def process_folder_data(folder_path: str) -> pd.DataFrame:
             try:
                 # Read the file in chunks if it's large
                 if os.path.getsize(file_path) > 100 * 1024 * 1024:  # 100MB
-                    chunk_size = 10000  # Adjust based on your memory constraints
+                    chunk_size = 10000
                     chunks = []
                     for chunk in pd.read_csv(file_path, chunksize=chunk_size):
-                        processed_chunk = processor(pd.DataFrame(chunk))
+                        chunk_df = pd.DataFrame(chunk)
+                        processed_chunk = processor(chunk_df)
                         chunks.append(processed_chunk)
-                        gc.collect()  # Force garbage collection after each chunk
+                        gc.collect()
                     result = pd.concat(chunks, ignore_index=True)
                 else:
                     result = processor(file_path)
@@ -712,9 +667,10 @@ def process_folder_data(folder_path: str) -> pd.DataFrame:
     return None
 
 
+
 def check_disk_space(warning_gb=20, critical_gb=5) -> tuple:
     """
-    Check available disk space considering user quota
+    Check available disk space considering user quota with safety margin
     Returns: (is_safe, is_abundant)
     """
     try:
@@ -723,14 +679,21 @@ def check_disk_space(warning_gb=20, critical_gb=5) -> tuple:
 
         # Get total quota (24GB) and used space
         quota_total = 24 * 1024 * 1024 * 1024  # 24GB in bytes
+
+        # Add 10% safety margin to used space calculation
         used_space = sum(os.path.getsize(os.path.join(dirpath, filename))
                          for dirpath, _, filenames in os.walk(home_dir)
                          for filename in filenames)
+        used_space = int(used_space * 1.1)  # Add 10% safety margin
 
         # Calculate available space in GB
         available_gb = (quota_total - used_space) / (1024 * 1024 * 1024)
 
-        return (available_gb > critical_gb, available_gb > warning_gb)
+        # Add extra margin to thresholds
+        safe_threshold = critical_gb * 1.2  # 20% higher than critical
+        abundant_threshold = warning_gb * 1.1  # 10% higher than warning
+
+        return (available_gb > safe_threshold, available_gb > abundant_threshold)
     except Exception as e:
         print(f"Error checking disk space: {str(e)}")
         # If we can't check space, assume we're in a critical state
@@ -796,55 +759,6 @@ def upload_to_s3(file_paths: List[str], bucket_name="data-transform-conte") -> b
     return True
 
 
-def manage_storage(monthly_data: Dict, base_dir: str, version_manager: DataVersionManager) -> bool:
-    """Manage storage and upload data when needed"""
-    is_safe, is_abundant = check_disk_space(warning_gb=20, critical_gb=5)
-
-    if not is_safe:
-        print("\nCritical disk space reached. Uploading data...")
-        version_suffix = version_manager.get_current_version()
-        local_files = glob.glob(os.path.join(base_dir, "monthly_data", f"*_{version_suffix}.csv"))
-
-        # Check if we have enough space for the upload operation
-        total_upload_size = sum(os.path.getsize(f) for f in local_files)
-        _, available_space = check_disk_space()
-        if available_space * 1024 * 1024 * 1024 < total_upload_size * 1.2:  # 20% buffer
-            print("Warning: Insufficient space for safe upload. Removing oldest files first...")
-            # Sort files by modification time and remove until we have enough space
-            files_by_age = sorted(local_files, key=os.path.getmtime)
-            while files_by_age and available_space * 1024 * 1024 * 1024 < total_upload_size * 1.2:
-                try:
-                    os.remove(files_by_age.pop(0))
-                    _, available_space = check_disk_space()
-                except Exception as e:
-                    print(f"Error removing file: {str(e)}")
-
-        if upload_to_s3(local_files):
-            print(f"Successfully uploaded {version_suffix} files")
-            # Clean up local files after successful upload
-            for file in local_files:
-                try:
-                    os.remove(file)
-                except Exception as e:
-                    print(f"Error removing {file}: {str(e)}")
-
-            version_manager.increment_version()
-            monthly_data.clear()
-            gc.collect()
-            return True
-        else:
-            print("Upload failed. Will retry when critical.")
-            return False
-
-    elif not is_abundant:
-        print("\nWarning: Disk space running low")
-        # Trigger an upload if we have accumulated significant data
-        if len(monthly_data) > 10:
-            return manage_storage(monthly_data, base_dir, version_manager)
-
-    return False
-
-
 def print_progress(current: int, total: int, prefix: str = '', suffix: str = ''):
     """Print progress as a percentage with a progress bar"""
     percent = (current / total) * 100
@@ -854,6 +768,56 @@ def print_progress(current: int, total: int, prefix: str = '', suffix: str = '')
     print(f'\r{prefix} |{bar}| {percent:.1f}% {suffix}', end='', flush=True)
     if current == total:
         print()
+
+
+def save_and_upload_folder_data(result_df: pd.DataFrame, folder_name: str, base_dir: str,
+                                version_manager: DataVersionManager) -> bool:
+    """Save folder data and immediately upload to S3"""
+    saved_files = []
+    try:
+        # Split results by month
+        monthly_data = {
+            name: group for name, group in
+            result_df.groupby(result_df['Timestamp'].dt.strftime('%Y_%m'))
+        }
+
+        # Save files and get paths
+        saved_files = save_monthly_data(monthly_data, base_dir, version_manager)
+
+        # Upload immediately to S3
+        if upload_to_s3(saved_files):
+            print(f"\nSuccessfully uploaded data for folder {folder_name}")
+
+            # Clean up local files after successful upload
+            cleanup_success = True
+            for file in saved_files:
+                try:
+                    os.remove(file)
+                except Exception as e:
+                    print(f"Error removing {file}: {str(e)}")
+                    cleanup_success = False
+
+            # Only increment version if upload and cleanup were successful
+            if cleanup_success:
+                version_manager.increment_version()
+                return True
+            else:
+                print("Warning: Some files could not be cleaned up")
+                return False
+        else:
+            print(f"\nFailed to upload data for folder {folder_name}")
+            return False
+
+    except Exception as e:
+        print(f"Error in save_and_upload_folder_data: {str(e)}")
+        # Attempt to clean up any saved files on error
+        for file in saved_files:
+            try:
+                if os.path.exists(file):
+                    os.remove(file)
+            except:
+                pass
+        return False
 
 
 def main():
@@ -867,10 +831,9 @@ def main():
     # Initialize managers
     tracker = ProcessingTracker(base_dir, reset=False)
     version_manager = DataVersionManager(base_dir)
-    monthly_data = {}
 
-    # Configure number of download threads based on system capabilities
-    num_download_threads = min(os.cpu_count() or 4, 8)  # Use at most 8 threads
+    # Configure number of download threads
+    num_download_threads = min(os.cpu_count() or 4, 8)
     print(f"Using {num_download_threads} download threads")
 
     try:
@@ -902,16 +865,13 @@ def main():
 
             # Check disk space
             if not check_disk_space()[0]:
-                print("Critical disk space reached. Uploading current data...")
-                if manage_storage(monthly_data, base_dir, version_manager):
-                    continue
-                else:
-                    break
+                print("Critical disk space reached. Cannot continue.")
+                break
 
             # Create temporary folder
             temp_folder = os.path.join(base_dir, folder_name)
             try:
-                # Download and process folder using threaded downloader
+                # Download and process folder
                 if download_folder_threaded(
                         folder_url,
                         temp_folder,
@@ -922,19 +882,15 @@ def main():
                     result = process_folder_data(temp_folder)
 
                     if result is not None:
-                        # Split and save results
-                        batch_monthly = {
-                            name: group for name, group in
-                            result.groupby(result['Timestamp'].dt.strftime('%Y_%m'))
-                        }
-                        monthly_data.update(batch_monthly)
-                        save_monthly_data(batch_monthly, base_dir, version_manager)
+                        # Immediately save and upload results
+                        if save_and_upload_folder_data(result, folder_name, base_dir, version_manager):
+                            tracker.mark_folder_processed(folder_name, i)
+                        else:
+                            tracker.mark_folder_failed(folder_name)
 
                         # Clear memory
-                        del result, batch_monthly
+                        del result
                         gc.collect()
-
-                        tracker.mark_folder_processed(folder_name, i)
                     else:
                         tracker.mark_folder_failed(folder_name)
                 else:
@@ -950,17 +906,8 @@ def main():
                     shutil.rmtree(temp_folder)
                 time.sleep(1)  # Small delay between folders
 
-        # Final data upload
-        if monthly_data:
-            manage_storage(monthly_data, base_dir, version_manager)
-
     except Exception as e:
         print(f"Error in main processing loop: {str(e)}")
-        if monthly_data:
-            try:
-                save_monthly_data(monthly_data, base_dir, version_manager)
-            except Exception as save_error:
-                print(f"Error saving final data: {str(save_error)}")
 
     print("Processing completed!")
 
