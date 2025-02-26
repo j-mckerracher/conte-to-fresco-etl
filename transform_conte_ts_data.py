@@ -414,6 +414,7 @@ class ProcessingTracker:
     def __init__(self, base_dir, reset=False):
         self.base_dir = base_dir
         self.tracker_file = Path(base_dir) / "processing_status.json"
+        self.status = {}
 
         if reset and self.tracker_file.exists():
             self.tracker_file.unlink()
@@ -435,6 +436,7 @@ class ProcessingTracker:
     def save_status(self):
         with open(self.tracker_file, 'w') as f:
             json.dump(self.status, f)
+            print(f"Processing status: {self.status}")
 
     def mark_folder_processed(self, folder_name, index):
         if folder_name not in self.status['processed_folders']:
@@ -766,22 +768,33 @@ def main():
             print("No folders found to process")
             return
 
-        print(f"Found {len(folder_urls)} folders to process")
-        start_idx = tracker.get_next_index()
+        # Extract just the folder names from folder_urls
+        all_folder_names = [name for name, _ in folder_urls]
+        # Create a mapping from folder name to its index and URL
+        folder_map = {name: (i, url) for i, (name, url) in enumerate(folder_urls)}
+
+        # Identify folders that need processing (not in processed_folders)
+        processed_set = set(tracker.status['processed_folders'])
+        folders_to_process = [name for name in all_folder_names if name not in processed_set]
+
+        # Special handling for previously failed folders
+        failed_folders = tracker.status.get('failed_folders', [])
+        print(f"Previously failed folders: {failed_folders}")
 
         # Calculate total folders to process
-        total_folders = len(folder_urls) - start_idx
+        total_folders = len(folders_to_process)
         print(f"\nStarting processing of {total_folders} folders")
 
-        # Process one folder at a time
-        for i in range(start_idx, len(folder_urls)):
-            # Update overall progress
-            current_folder = i - start_idx + 1
-            print_progress(current_folder, total_folders, prefix='Overall Progress:', suffix='Complete')
-            folder_name, folder_url = folder_urls[i]
-            print(f"\nProcessing folder {i + 1}/{len(folder_urls)}: {folder_name}")
+        # Process folders one at a time
+        for idx, folder_name in enumerate(folders_to_process):
+            # Get the original index and URL for this folder
+            orig_idx, folder_url = folder_map[folder_name]
 
-            # Skip if already processed
+            # Update overall progress
+            print_progress(idx + 1, total_folders, prefix='Overall Progress:', suffix='Complete')
+            print(f"\nProcessing folder {idx + 1}/{total_folders}: {folder_name}")
+
+            # Skip if already processed (double-check)
             if tracker.is_folder_processed(folder_name):
                 print(f"Folder {folder_name} already processed, skipping...")
                 continue
@@ -807,8 +820,13 @@ def main():
                     if result is not None:
                         # Immediately save and upload results
                         if save_and_upload_folder_data(result, folder_name, base_dir, version_manager):
-                            print(f"Uploading {folder_name} to S3")
-                            tracker.mark_folder_processed(folder_name, i)
+                            print(f"Successfully uploaded {folder_name} to S3")
+                            tracker.mark_folder_processed(folder_name, orig_idx)
+
+                            # If this was a previously failed folder, remove it from failed list
+                            if folder_name in tracker.status['failed_folders']:
+                                tracker.status['failed_folders'].remove(folder_name)
+                                tracker.save_status()
                         else:
                             tracker.mark_folder_failed(folder_name)
 
