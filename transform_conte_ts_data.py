@@ -48,7 +48,20 @@ def process_block_file(input_data: Union[str, pd.DataFrame]) -> pd.DataFrame:
     else:
         df = input_data.copy()
 
-    # Rest of function remains the same
+    # Drop rows with missing required columns
+    required_columns = ['rd_sectors', 'wr_sectors', 'rd_ticks', 'wr_ticks', 'jobID', 'node', 'timestamp']
+    for col in required_columns:
+        if col not in df.columns:
+            print(f"Missing required column: {col}")
+            return pd.DataFrame()  # Return empty dataframe
+
+    # Drop rows with NaN in required columns
+    df = df.dropna(subset=required_columns)
+
+    if len(df) == 0:
+        print("No valid data rows after filtering")
+        return pd.DataFrame()
+
     # Calculate I/O throughput with safety checks
     total_sectors = df['rd_sectors'] + df['wr_sectors']
     total_ticks = df['rd_ticks'] + df['wr_ticks']
@@ -59,7 +72,28 @@ def process_block_file(input_data: Union[str, pd.DataFrame]) -> pd.DataFrame:
 
     # Convert to GB/s and validate
     df['Value'] = [validate_metric(t / (1024 * 1024 * 1024)) for t in throughput]
-    df['jobID'] = df['jobID'].str.replace('jobID', 'JOB', case=False)
+
+    # Handle jobID safely
+    if 'jobID' in df.columns and df['jobID'].dtype == object:
+        df['jobID'] = df['jobID'].fillna('unknown')
+        df['jobID'] = df['jobID'].astype(str).str.replace('jobID', 'JOB', case=False)
+
+    # Parse timestamps safely
+    try:
+        timestamps = pd.to_datetime(df['timestamp'], format='%m/%d/%Y %H:%M:%S', errors='coerce')
+        # Drop rows with invalid timestamps
+        valid_mask = ~timestamps.isna()
+        if valid_mask.sum() < len(df):
+            print(f"Dropped {len(df) - valid_mask.sum()} rows with invalid timestamps")
+            df = df[valid_mask]
+            timestamps = timestamps[valid_mask]
+    except Exception as e:
+        print(f"Error parsing timestamps: {str(e)}")
+        return pd.DataFrame()
+
+    if len(df) == 0:
+        print("No valid data rows after timestamp filtering")
+        return pd.DataFrame()
 
     return pd.DataFrame({
         'Job Id': df['jobID'],
@@ -67,7 +101,7 @@ def process_block_file(input_data: Union[str, pd.DataFrame]) -> pd.DataFrame:
         'Event': 'block',
         'Value': df['Value'],
         'Units': 'GB/s',
-        'Timestamp': pd.to_datetime(df['timestamp'], format='%m/%d/%Y %H:%M:%S')  # Updated format
+        'Timestamp': timestamps
     })
 
 
@@ -83,7 +117,20 @@ def process_cpu_file(input_data: Union[str, pd.DataFrame]) -> pd.DataFrame:
     else:
         df = input_data.copy()
 
-    # Rest of function remains the same
+    # Drop rows with missing required columns
+    required_columns = ['user', 'nice', 'system', 'idle', 'iowait', 'irq', 'softirq', 'jobID', 'node', 'timestamp']
+    for col in required_columns:
+        if col not in df.columns:
+            print(f"Missing required column: {col}")
+            return pd.DataFrame()  # Return empty dataframe
+
+    # Drop rows with NaN in required columns
+    df = df.dropna(subset=required_columns)
+
+    if len(df) == 0:
+        print("No valid data rows after filtering")
+        return pd.DataFrame()
+
     # Calculate total CPU time with all components
     total = (df['user'] + df['nice'] + df['system'] +
              df['idle'] + df['iowait'] + df['irq'] + df['softirq'])
@@ -93,7 +140,27 @@ def process_cpu_file(input_data: Union[str, pd.DataFrame]) -> pd.DataFrame:
     df['Value'] = [validate_metric(safe_division(u, t) * 100, 0)
                    for u, t in zip(user_time, total)]
 
-    df['jobID'] = df['jobID'].str.replace('jobID', 'JOB', case=False)
+    # Handle jobID safely
+    if 'jobID' in df.columns and df['jobID'].dtype == object:
+        df['jobID'] = df['jobID'].fillna('unknown')
+        df['jobID'] = df['jobID'].astype(str).str.replace('jobID', 'JOB', case=False)
+
+    # Parse timestamps safely
+    try:
+        timestamps = pd.to_datetime(df['timestamp'], format='%m/%d/%Y %H:%M:%S', errors='coerce')
+        # Drop rows with invalid timestamps
+        valid_mask = ~timestamps.isna()
+        if valid_mask.sum() < len(df):
+            print(f"Dropped {len(df) - valid_mask.sum()} rows with invalid timestamps")
+            df = df[valid_mask]
+            timestamps = timestamps[valid_mask]
+    except Exception as e:
+        print(f"Error parsing timestamps: {str(e)}")
+        return pd.DataFrame()
+
+    if len(df) == 0:
+        print("No valid data rows after timestamp filtering")
+        return pd.DataFrame()
 
     return pd.DataFrame({
         'Job Id': df['jobID'],
@@ -101,7 +168,7 @@ def process_cpu_file(input_data: Union[str, pd.DataFrame]) -> pd.DataFrame:
         'Event': 'cpuuser',
         'Value': df['Value'],
         'Units': 'CPU %',
-        'Timestamp': pd.to_datetime(df['timestamp'], format='%m/%d/%Y %H:%M:%S')  # Updated format
+        'Timestamp': timestamps
     })
 
 
@@ -117,7 +184,20 @@ def process_mem_file(input_data: Union[str, pd.DataFrame]) -> pd.DataFrame:
     else:
         df = input_data.copy()
 
-    # Rest of function remains the same
+    # Drop rows with missing required columns
+    required_columns = ['MemTotal', 'MemFree', 'FilePages', 'jobID', 'node', 'timestamp']
+    for col in required_columns:
+        if col not in df.columns:
+            print(f"Missing required column: {col}")
+            return pd.DataFrame()  # Return empty dataframe
+
+    # Drop rows with NaN in required columns
+    df = df.dropna(subset=required_columns)
+
+    if len(df) == 0:
+        print("No valid data rows after filtering")
+        return pd.DataFrame()
+
     # Ensure memory values are non-negative
     df['MemTotal'] = df['MemTotal'].clip(lower=0)
     df['MemFree'] = df['MemFree'].clip(lower=0)
@@ -135,10 +215,27 @@ def process_mem_file(input_data: Union[str, pd.DataFrame]) -> pd.DataFrame:
     df['memused_minus_diskcache_value'] = (validate_metric(cache_adjusted) /
                                            (1024 * 1024 * 1024))
 
-    df['jobID'] = df['jobID'].str.replace('jobID', 'JOB', case=False)
+    # Handle jobID safely
+    if 'jobID' in df.columns and df['jobID'].dtype == object:
+        df['jobID'] = df['jobID'].fillna('unknown')
+        df['jobID'] = df['jobID'].astype(str).str.replace('jobID', 'JOB', case=False)
 
-    # Parse timestamp with updated format
-    timestamps = pd.to_datetime(df['timestamp'], format='%m/%d/%Y %H:%M:%S')
+    # Parse timestamps safely
+    try:
+        timestamps = pd.to_datetime(df['timestamp'], format='%m/%d/%Y %H:%M:%S', errors='coerce')
+        # Drop rows with invalid timestamps
+        valid_mask = ~timestamps.isna()
+        if valid_mask.sum() < len(df):
+            print(f"Dropped {len(df) - valid_mask.sum()} rows with invalid timestamps")
+            df = df[valid_mask]
+            timestamps = timestamps[valid_mask]
+    except Exception as e:
+        print(f"Error parsing timestamps: {str(e)}")
+        return pd.DataFrame()
+
+    if len(df) == 0:
+        print("No valid data rows after timestamp filtering")
+        return pd.DataFrame()
 
     # Create separate dataframes for each metric
     memused = pd.DataFrame({
@@ -174,24 +271,55 @@ def process_nfs_file(input_data: Union[str, pd.DataFrame]) -> pd.DataFrame:
     else:
         df = input_data.copy()
 
-    # Rest of function remains the same
-    # Parse timestamp with updated format and sort
-    df['timestamp'] = pd.to_datetime(df['timestamp'], format='%m/%d/%Y %H:%M:%S')
-    df = df.sort_values('timestamp')
+    # Drop rows with missing required columns
+    required_columns = ['read_bytes', 'write_bytes', 'jobID', 'node', 'timestamp']
+    for col in required_columns:
+        if col not in df.columns:
+            print(f"Missing required column: {col}")
+            return pd.DataFrame()  # Return empty dataframe
 
-    # Calculate time deltas in seconds
+    # Drop rows with NaN in required columns
+    df = df.dropna(subset=required_columns)
+
+    if len(df) == 0:
+        print("No valid data rows after filtering")
+        return pd.DataFrame()
+
+    # Parse timestamp safely and sort
+    try:
+        df['timestamp'] = pd.to_datetime(df['timestamp'], format='%m/%d/%Y %H:%M:%S', errors='coerce')
+        # Drop rows with invalid timestamps
+        valid_mask = ~df['timestamp'].isna()
+        if valid_mask.sum() < len(df):
+            print(f"Dropped {len(df) - valid_mask.sum()} rows with invalid timestamps")
+            df = df[valid_mask]
+
+        if len(df) == 0:
+            print("No valid data rows after timestamp filtering")
+            return pd.DataFrame()
+
+        df = df.sort_values('timestamp')
+    except Exception as e:
+        print(f"Error parsing timestamps: {str(e)}")
+        return pd.DataFrame()
+
+    # Handle jobID safely
+    if 'jobID' in df.columns and df['jobID'].dtype == object:
+        df['jobID'] = df['jobID'].fillna('unknown')
+        df['jobID'] = df['jobID'].astype(str).str.replace('jobID', 'JOB', case=False)
+
+    # Calculate time deltas in seconds - handle NaN values
     time_deltas = df.groupby(['jobID', 'node'])['timestamp'].diff().dt.total_seconds()
+    time_deltas = time_deltas.fillna(0)
 
     # Calculate rates with proper time normalization
     total_bytes = df['read_bytes'] + df['write_bytes']
-    byte_deltas = total_bytes.groupby([df['jobID'], df['node']]).diff()
+    byte_deltas = total_bytes.groupby([df['jobID'], df['node']]).diff().fillna(0)
 
-    # Calculate MB/s with validation
-    df['Value'] = [validate_metric(calculate_rate(bytes, prev_bytes, delta) / (1024 * 1024))
+    # Calculate MB/s with validation and handle division by zero
+    df['Value'] = [validate_metric(calculate_rate(bytes, prev_bytes, max(0.1, delta)) / (1024 * 1024))
                    for bytes, prev_bytes, delta in
                    zip(total_bytes, byte_deltas, time_deltas)]
-
-    df['jobID'] = df['jobID'].str.replace('jobID', 'JOB', case=False)
 
     return pd.DataFrame({
         'Job Id': df['jobID'],
@@ -232,8 +360,13 @@ def read_csv_with_fallback_encoding(file_path, chunk_size=None, **kwargs):
             if error_param:
                 encoding_kwargs['encoding_errors'] = error_param
 
-            # Combine with user kwargs, letting user kwargs override
-            combined_kwargs = {**encoding_kwargs, **kwargs}
+            # Add error_bad_lines=False to skip bad lines (parameter name depends on pandas version)
+            try:
+                # For newer pandas versions (1.3+)
+                combined_kwargs = {**encoding_kwargs, 'on_bad_lines': 'skip', **kwargs}
+            except TypeError:
+                # For older pandas versions
+                combined_kwargs = {**encoding_kwargs, 'error_bad_lines': False, **kwargs}
 
             if chunk_size is not None:
                 return pd.read_csv(file_path, chunksize=chunk_size, **combined_kwargs)
@@ -251,6 +384,15 @@ def read_csv_with_fallback_encoding(file_path, chunk_size=None, **kwargs):
 
     # If we get here, all encodings failed
     raise ValueError(f"Failed to read file with any encoding: {last_exception}")
+
+
+def safe_parse_timestamp(timestamp_str, default=None):
+    """Safely parse timestamp with fallback to default value if parsing fails"""
+    try:
+        return pd.to_datetime(timestamp_str, format='%m/%d/%Y %H:%M:%S')
+    except (ValueError, TypeError):
+        print(f"Warning: Couldn't parse timestamp '{timestamp_str}', using default value")
+        return default
 
 
 class ThreadedDownloader:
@@ -536,19 +678,32 @@ def process_folder_data(folder_path: str) -> Optional[pd.DataFrame]:
 
                 try:
                     # Use the read_csv_with_fallback_encoding function for chunked reading
-                    for chunk in read_csv_with_fallback_encoding(file_path, chunk_size=chunk_size):
-                        processed_chunk = processor(chunk)
-                        chunks.append(processed_chunk)
-                        del chunk  # Explicitly delete chunk
-                        gc.collect()
+                    chunk_reader = read_csv_with_fallback_encoding(file_path, chunk_size=chunk_size)
+                    for chunk_idx, chunk in enumerate(chunk_reader):
+                        try:
+                            processed_chunk = processor(chunk)
+                            if processed_chunk is not None and not processed_chunk.empty:
+                                chunks.append(processed_chunk)
+                            # Print progress for large files
+                            if chunk_idx % 50 == 0:
+                                print(f"Processed {chunk_idx * chunk_size} rows from {filename}")
+                        except Exception as e:
+                            print(f"Error processing chunk {chunk_idx} in {filename}: {str(e)}")
+                            continue  # Skip this chunk but continue processing
+                        finally:
+                            del chunk  # Explicitly delete chunk
+                            gc.collect()
 
                     if chunks:
+                        print(f"Combining {len(chunks)} processed chunks from {filename}")
                         result = pd.concat(chunks, ignore_index=True)
                         del chunks  # Clean up chunks list
+                    else:
+                        print(f"No valid data chunks found in {filename}")
                 except Exception as e:
-                    print(f"Error processing chunks in {filename}: {str(e)}")
+                    print(f"Error in chunked processing of {filename}: {str(e)}")
             else:
-                # Use processor directly for small files (it already uses read_csv_with_fallback_encoding)
+                # Use processor directly for small files
                 result = processor(file_path)
 
         except Exception as e:
@@ -576,23 +731,29 @@ def process_folder_data(folder_path: str) -> Optional[pd.DataFrame]:
             filename = future_to_file[future]
             try:
                 result = future.result()
-                if result is not None:
+                if result is not None and not result.empty:
                     results.append(result)
+                    print(f"Successfully processed {filename} with {len(result)} valid rows")
+                else:
+                    print(f"No valid data extracted from {filename}")
             except Exception as e:
                 print(f"Error completing parallel processing for {filename}: {str(e)}")
 
     # Combine results
     if results:
         try:
+            print(f"Combining results from {len(results)} successfully processed files")
             final_result = pd.concat(results, ignore_index=True)
+            print(f"Final result contains {len(final_result)} rows")
             del results  # Clean up individual results
             gc.collect()
             return final_result
         except Exception as e:
             print(f"Error combining results: {str(e)}")
             return None
-
-    return None
+    else:
+        print("No valid results to combine")
+        return None
 
 
 def check_disk_space(warning_gb=20, critical_gb=5) -> tuple:
