@@ -595,6 +595,37 @@ def process_folder_data(folder_path: str) -> Optional[pd.DataFrame]:
     return None
 
 
+def check_disk_space(warning_gb=20, critical_gb=5) -> tuple:
+    """
+    Check available disk space considering user quota with safety margin
+    Returns: (is_safe, is_abundant)
+    """
+    try:
+        # Get user's home directory
+        home_dir = os.path.expanduser('~')
+
+        # Get total quota (24GB) and used space
+        quota_total = 24 * 1024 * 1024 * 1024  # 24GB in bytes
+
+        # Add 10% safety margin to used space calculation
+        used_space = sum(os.path.getsize(os.path.join(dirpath, filename))
+                         for dirpath, _, filenames in os.walk(home_dir)
+                         for filename in filenames)
+        used_space = int(used_space * 1.1)  # Add 10% safety margin
+
+        # Calculate available space in GB
+        available_gb = (quota_total - used_space) / (1024 * 1024 * 1024)
+
+        # Add extra margin to thresholds
+        safe_threshold = critical_gb * 1.2  # 20% higher than critical
+        abundant_threshold = warning_gb * 1.1  # 10% higher than warning
+
+        return (available_gb > safe_threshold, available_gb > abundant_threshold)
+    except Exception as e:
+        print(f"Error checking disk space: {str(e)}")
+        # If we can't check space, assume we're in a critical state
+        return (False, False)
+
 def save_monthly_data(monthly_data: Dict, base_dir: str, version_manager: DataVersionManager) -> List[str]:
     """Save monthly data to files"""
     output_dir = os.path.join(base_dir, "monthly_data")
