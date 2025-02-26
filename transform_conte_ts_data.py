@@ -1,21 +1,20 @@
-import os
 import json
-import queue
 import re
-import signal
 from pathlib import Path
-import gc
 import boto3
 import shutil
 import threading
 from queue import Queue
 import time
-from typing import List, Dict, Callable, Union
 import requests
 from urllib.parse import urljoin
 from bs4 import BeautifulSoup
-import pandas as pd
 import numpy as np
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import pandas as pd
+import os
+import gc
+from typing import Optional, Dict, Callable, Union, List
 
 
 def safe_division(numerator, denominator, default: float = 0.0) -> float:
@@ -41,10 +40,15 @@ def process_block_file(input_data: Union[str, pd.DataFrame]) -> pd.DataFrame:
     """Process block.csv file with improved error handling"""
     # Handle both file path and DataFrame inputs
     if isinstance(input_data, str):
-        df = pd.read_csv(input_data)
+        try:
+            df = read_csv_with_fallback_encoding(input_data)
+        except Exception as e:
+            print(f"Error reading block file: {str(e)}")
+            raise
     else:
         df = input_data.copy()
 
+    # Rest of function remains the same
     # Calculate I/O throughput with safety checks
     total_sectors = df['rd_sectors'] + df['wr_sectors']
     total_ticks = df['rd_ticks'] + df['wr_ticks']
@@ -71,10 +75,15 @@ def process_cpu_file(input_data: Union[str, pd.DataFrame]) -> pd.DataFrame:
     """Process cpu.csv file with support for multi-core CPU percentages"""
     # Handle both file path and DataFrame inputs
     if isinstance(input_data, str):
-        df = pd.read_csv(input_data)
+        try:
+            df = read_csv_with_fallback_encoding(input_data)
+        except Exception as e:
+            print(f"Error reading CPU file: {str(e)}")
+            raise
     else:
         df = input_data.copy()
 
+    # Rest of function remains the same
     # Calculate total CPU time with all components
     total = (df['user'] + df['nice'] + df['system'] +
              df['idle'] + df['iowait'] + df['irq'] + df['softirq'])
@@ -100,10 +109,15 @@ def process_mem_file(input_data: Union[str, pd.DataFrame]) -> pd.DataFrame:
     """Process mem.csv file with improved validation"""
     # Handle both file path and DataFrame inputs
     if isinstance(input_data, str):
-        df = pd.read_csv(input_data)
+        try:
+            df = read_csv_with_fallback_encoding(input_data)
+        except Exception as e:
+            print(f"Error reading memory file: {str(e)}")
+            raise
     else:
         df = input_data.copy()
 
+    # Rest of function remains the same
     # Ensure memory values are non-negative
     df['MemTotal'] = df['MemTotal'].clip(lower=0)
     df['MemFree'] = df['MemFree'].clip(lower=0)
@@ -152,10 +166,15 @@ def process_nfs_file(input_data: Union[str, pd.DataFrame]) -> pd.DataFrame:
     """Process llite.csv file with improved rate calculation"""
     # Handle both file path and DataFrame inputs
     if isinstance(input_data, str):
-        df = pd.read_csv(input_data)
+        try:
+            df = read_csv_with_fallback_encoding(input_data)
+        except Exception as e:
+            print(f"Error reading NFS file: {str(e)}")
+            raise
     else:
         df = input_data.copy()
 
+    # Rest of function remains the same
     # Parse timestamp with updated format and sort
     df['timestamp'] = pd.to_datetime(df['timestamp'], format='%m/%d/%Y %H:%M:%S')
     df = df.sort_values('timestamp')
@@ -184,187 +203,54 @@ def process_nfs_file(input_data: Union[str, pd.DataFrame]) -> pd.DataFrame:
     })
 
 
-class DataProcessor:
-    def __init__(self, num_threads: int = 50):
-        self.num_threads = num_threads
-        self.process_queue = Queue()
-        self.results_queue = Queue()
-        self.lock = threading.Lock()
-        self.completed_files = 0
-        self.total_files = 0
-        self.print_lock = threading.Lock()
-        self.shutdown_event = threading.Event()
-        self.active_threads = []
-        self.shutdown_requested = False
+def read_csv_with_fallback_encoding(file_path, chunk_size=None, **kwargs):
+    """
+    Attempt to read a CSV file with multiple encodings, falling back if one fails.
 
-        # Set up signal handlers
-        signal.signal(signal.SIGINT, self.handle_interrupt)
-        signal.signal(signal.SIGTERM, self.handle_interrupt)
+    Args:
+        file_path: Path to the CSV file
+        chunk_size: If not None, read file in chunks of this size
+        **kwargs: Additional arguments to pass to pd.read_csv
 
-    def handle_interrupt(self, signum, frame):
-        """Handle interrupt signals gracefully"""
-        print("\nShutdown requested. Cleaning up...")
-        self.shutdown_requested = True
-        self.shutdown()
+    Returns:
+        DataFrame or TextFileReader if using chunks
+    """
+    # Try these encodings in order - latin1 rarely fails as it can read any byte
+    encodings = ['latin1', 'ISO-8859-1', 'utf-8']
 
-    def shutdown(self):
-        """Clean shutdown of all processing"""
-        # Signal threads to stop
-        self.shutdown_event.set()
+    # For the last attempt with utf-8, we'll use error handling
+    errors = [None, None, 'replace']
 
-        # Clear the process queue
-        while not self.process_queue.empty():
-            try:
-                self.process_queue.get_nowait()
-                self.process_queue.task_done()
-            except:
-                pass
+    last_exception = None
 
-        # Add sentinel values to ensure threads exit
-        for _ in range(self.num_threads):
-            self.process_queue.put(None)
-
-        # Wait for all threads to finish
-        for thread in self.active_threads:
-            if thread.is_alive():
-                thread.join(timeout=2.0)  # Give threads 2 seconds to finish
-
-        print("\nShutdown complete. All threads stopped.")
-
-    def process_worker(self, file_processors: Dict[str, Callable]):
-        """Worker thread function to process data files"""
-        while not self.shutdown_event.is_set():
-            try:
-                # Get the next task with timeout
-                try:
-                    task = self.process_queue.get(timeout=1.0)
-                except queue.Empty:
-                    continue
-
-                if task is None:
-                    break
-
-                folder_path, filename = task
-                processor = file_processors.get(filename)
-                if not processor:
-                    continue
-
-                file_path = os.path.join(folder_path, filename)
-                if os.path.exists(file_path):
-                    try:
-                        # Check for shutdown before heavy processing
-                        if self.shutdown_event.is_set():
-                            break
-
-                        # Process file in chunks if it's large
-                        if os.path.getsize(file_path) > 100 * 1024 * 1024:  # 100MB
-                            chunk_size = 10000
-                            chunks = []
-                            for chunk in pd.read_csv(file_path, chunksize=chunk_size):
-                                if self.shutdown_event.is_set():
-                                    break
-                                processed_chunk = processor(pd.DataFrame(chunk))
-                                chunks.append(processed_chunk)
-                                gc.collect()
-
-                            if not self.shutdown_event.is_set():
-                                result = pd.concat(chunks, ignore_index=True)
-                        else:
-                            result = processor(file_path)
-
-                        if result is not None and not self.shutdown_event.is_set():
-                            self.results_queue.put(result)
-
-                        # Clean up the file after processing
-                        try:
-                            os.remove(file_path)
-                        except:
-                            pass
-                        gc.collect()
-
-                        # Update progress if not shutting down
-                        if not self.shutdown_event.is_set():
-                            with self.lock:
-                                self.completed_files += 1
-                                with self.print_lock:
-                                    print_progress(
-                                        self.completed_files,
-                                        self.total_files,
-                                        prefix='Processing Files:',
-                                        suffix=f'({self.completed_files}/{self.total_files})'
-                                    )
-
-                    except Exception as e:
-                        print(f"Error processing {filename}: {str(e)}")
-                        try:
-                            os.remove(file_path)
-                        except:
-                            pass
-
-            except Exception as e:
-                if not self.shutdown_event.is_set():
-                    print(f"Worker error: {str(e)}")
-            finally:
-                self.process_queue.task_done()
-
-    def process_folder_data_parallel(self, folder_path: str, file_processors: Dict[str, Callable]) -> pd.DataFrame:
-        """Process all files in a folder using parallel threads"""
+    for i, encoding in enumerate(encodings):
         try:
-            # Reset tracking variables
-            self.completed_files = 0
-            self.total_files = sum(1 for f in os.listdir(folder_path) if f in file_processors)
-            self.shutdown_event.clear()
-            self.active_threads = []
+            error_param = errors[i]
+            encoding_kwargs = {'encoding': encoding}
 
-            if self.total_files == 0:
-                return None
+            # Add error handling if specified
+            if error_param:
+                encoding_kwargs['encoding_errors'] = error_param
 
-            print(f"\nProcessing {self.total_files} files with {self.num_threads} threads")
+            # Combine with user kwargs, letting user kwargs override
+            combined_kwargs = {**encoding_kwargs, **kwargs}
 
-            # Start worker threads
-            for _ in range(self.num_threads):
-                thread = threading.Thread(
-                    target=self.process_worker,
-                    args=(file_processors,),
-                    daemon=True
-                )
-                thread.start()
-                self.active_threads.append(thread)
+            if chunk_size is not None:
+                return pd.read_csv(file_path, chunksize=chunk_size, **combined_kwargs)
+            else:
+                return pd.read_csv(file_path, **combined_kwargs)
 
-            # Add processing tasks to queue
-            for filename in os.listdir(folder_path):
-                if filename in file_processors:
-                    self.process_queue.put((folder_path, filename))
-
-            # Add sentinel values to stop workers
-            for _ in range(self.num_threads):
-                self.process_queue.put(None)
-
-            if self.shutdown_requested:
-                return None
-
-            # Wait for all tasks to complete
-            self.process_queue.join()
-
-            # Collect all results
-            results = []
-            while not self.results_queue.empty():
-                results.append(self.results_queue.get())
-
-            if results:
-                return pd.concat(results, ignore_index=True)
-            return None
-
-        except KeyboardInterrupt:
-            self.shutdown()
-            return None
+        except UnicodeDecodeError as e:
+            last_exception = e
+            print(f"Encoding {encoding} failed, trying next encoding...")
+            continue
         except Exception as e:
-            print(f"Error in parallel processing: {str(e)}")
-            self.shutdown()
+            # If it's not an encoding error, re-raise
+            print(f"Error reading file with {encoding} encoding: {str(e)}")
             raise
-        finally:
-            if not self.shutdown_event.is_set():  # Only call shutdown once
-                self.shutdown()
+
+    # If we get here, all encodings failed
+    raise ValueError(f"Failed to read file with any encoding: {last_exception}")
 
 
 class ThreadedDownloader:
@@ -621,8 +507,8 @@ def get_folder_urls(base_url: str, headers: dict) -> List[tuple]:
         return []
 
 
-def process_folder_data(folder_path: str) -> pd.DataFrame:
-    """Process all files in a folder with immediate cleanup"""
+def process_folder_data(folder_path: str) -> Optional[pd.DataFrame]:
+    """Process all files in a folder with immediate cleanup and parallel processing"""
     results = []
     file_processors = {
         'block.csv': process_block_file,
@@ -631,41 +517,78 @@ def process_folder_data(folder_path: str) -> pd.DataFrame:
         'llite.csv': process_nfs_file
     }
 
-    for filename, processor in file_processors.items():
+    def process_file(filename: str, processor: Callable) -> Optional[pd.DataFrame]:
+        """Process a single file with proper cleanup"""
+        print(f"Processing {filename}")
         file_path = os.path.join(folder_path, filename)
-        if os.path.exists(file_path):
-            try:
-                # Read the file in chunks if it's large
-                if os.path.getsize(file_path) > 100 * 1024 * 1024:  # 100MB
-                    chunk_size = 10000
-                    chunks = []
-                    for chunk in pd.read_csv(file_path, chunksize=chunk_size):
-                        chunk_df = pd.DataFrame(chunk)
-                        processed_chunk = processor(chunk_df)
-                        chunks.append(processed_chunk)
-                        gc.collect()
-                    result = pd.concat(chunks, ignore_index=True)
-                else:
-                    result = processor(file_path)
+        result = None
 
+        if not os.path.exists(file_path):
+            return None
+
+        try:
+            # Read and process the file
+            if os.path.getsize(file_path) > 100 * 1024 * 1024:  # 100MB
+                chunk_size = 10000
+                chunks = []
+
+                try:
+                    for chunk in pd.read_csv(file_path, chunksize=chunk_size):
+                        processed_chunk = processor(chunk)
+                        chunks.append(processed_chunk)
+                        del chunk  # Explicitly delete chunk
+                        gc.collect()
+
+                    if chunks:
+                        result = pd.concat(chunks, ignore_index=True)
+                        del chunks  # Clean up chunks list
+                except Exception as e:
+                    print(f"Error processing chunks in {filename}: {str(e)}")
+            else:
+                result = processor(file_path)
+
+        except Exception as e:
+            print(f"Error processing {filename}: {str(e)}")
+
+        finally:
+            # Always attempt to clean up the file
+            try:
+                os.remove(file_path)
+            except Exception as e:
+                print(f"Error removing {filename}: {str(e)}")
+
+            gc.collect()  # Force garbage collection
+
+        return result
+
+    # Process files in parallel
+    with ThreadPoolExecutor(max_workers=min(len(file_processors), os.cpu_count() or 4)) as executor:
+        future_to_file = {
+            executor.submit(process_file, filename, processor): filename
+            for filename, processor in file_processors.items()
+        }
+
+        for future in as_completed(future_to_file):
+            filename = future_to_file[future]
+            try:
+                result = future.result()
                 if result is not None:
                     results.append(result)
-
-                # Immediately remove the file after processing
-                os.remove(file_path)
-                gc.collect()
             except Exception as e:
-                print(f"Error processing {filename}: {str(e)}")
-                # Clean up even if processing fails
-                try:
-                    os.remove(file_path)
-                except:
-                    pass
+                print(f"Error completing parallel processing for {filename}: {str(e)}")
 
+    # Combine results
     if results:
-        return pd.concat(results, ignore_index=True)
-    return None
+        try:
+            final_result = pd.concat(results, ignore_index=True)
+            del results  # Clean up individual results
+            gc.collect()
+            return final_result
+        except Exception as e:
+            print(f"Error combining results: {str(e)}")
+            return None
 
+    return None
 
 
 def check_disk_space(warning_gb=20, critical_gb=5) -> tuple:
@@ -884,6 +807,7 @@ def main():
                     if result is not None:
                         # Immediately save and upload results
                         if save_and_upload_folder_data(result, folder_name, base_dir, version_manager):
+                            print(f"Uploading {folder_name} to S3")
                             tracker.mark_folder_processed(folder_name, i)
                         else:
                             tracker.mark_folder_failed(folder_name)
