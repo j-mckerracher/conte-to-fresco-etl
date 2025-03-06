@@ -1,7 +1,6 @@
 import re
 from collections import defaultdict
 from pathlib import Path
-
 import polars as pl
 from tqdm import tqdm
 import os
@@ -360,11 +359,11 @@ def join_job_timeseries(job_file: str, timeseries_file: str, output_file: str, c
         # Handle datetime columns with explicit null checks
         # Use str.lengths() > 0 instead of str.len() > 0 for string length
         jobs_df = jobs_df.with_columns([
-            pl.when(pl.col("start").is_not_null() & (pl.col("start").str.lengths() > 0))
+            pl.when(pl.col("start").is_not_null() & (pl.col("start").str.length() > 0))
             .then(pl.col("start").str.strptime(pl.Datetime, JOB_DATETIME_FMT))
             .otherwise(None).alias("start"),
 
-            pl.when(pl.col("end").is_not_null() & (pl.col("end").str.lengths() > 0))
+            pl.when(pl.col("end").is_not_null() & (pl.col("end").str.length() > 0))
             .then(pl.col("end").str.strptime(pl.Datetime, JOB_DATETIME_FMT))
             .otherwise(None).alias("end")
         ])
