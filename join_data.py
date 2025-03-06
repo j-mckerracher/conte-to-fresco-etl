@@ -36,6 +36,14 @@ def standardize_job_id(id_series: pl.Series) -> pl.Series:
 def process_chunk(jobs_df: pl.DataFrame, ts_chunk: pl.DataFrame) -> pl.DataFrame:
     """Process a chunk of time series data against all jobs"""
     try:
+        # Check if dataframes are valid
+        if jobs_df is None or jobs_df.height == 0 or ts_chunk is None or ts_chunk.height == 0:
+            logger.warning("Empty dataframe passed to process_chunk")
+            return None
+
+        # Log the initial join attempt
+        logger.info(f"Joining {ts_chunk.height} time series rows with {jobs_df.height} job rows")
+
         # Join time series chunk with jobs data on jobID
         joined = ts_chunk.join(
             jobs_df,
@@ -43,6 +51,8 @@ def process_chunk(jobs_df: pl.DataFrame, ts_chunk: pl.DataFrame) -> pl.DataFrame
             right_on="jobID",
             how="inner"
         )
+
+        logger.info(f"Join result has {joined.height} rows")
 
         # Filter timestamps that fall between job start and end times
         # Add null handling to prevent filtering issues
@@ -54,18 +64,36 @@ def process_chunk(jobs_df: pl.DataFrame, ts_chunk: pl.DataFrame) -> pl.DataFrame
             (pl.col("Timestamp") <= pl.col("end"))
         )
 
+        logger.info(f"After time filtering: {filtered.height} rows")
+
         if filtered.height == 0:
+            logger.warning("No rows remained after time filtering")
             return None
 
-        # Pivot the metrics into columns based on Event
-        group_cols = [col for col in filtered.columns if col not in ["Event", "Value"]]
+        # Check for event and value columns
+        if "Event" not in filtered.columns or "Value" not in filtered.columns:
+            logger.error("Required columns 'Event' or 'Value' missing from filtered data")
+            return None
 
-        result = filtered.pivot(
-            values="Value",
-            index=group_cols,
-            on="Event",
-            aggregate_function="first"
-        )
+        # Get unique events for debugging
+        unique_events = filtered.select(pl.col("Event").unique()).to_series().to_list()
+        logger.info(f"Unique events: {unique_events}")
+
+        # Pivot the metrics into columns based on Event
+        try:
+            group_cols = [col for col in filtered.columns if col not in ["Event", "Value"]]
+
+            result = filtered.pivot(
+                values="Value",
+                index=group_cols,
+                on="Event",
+                aggregate_function="first"
+            )
+
+            logger.info(f"After pivot: {result.height} rows with {len(result.columns)} columns")
+        except Exception as e:
+            logger.error(f"Error during pivot operation: {e}")
+            return None
 
         # Map columns to the target schema (Set 3)
         # First, handle the event-based metrics
@@ -113,44 +141,58 @@ def process_chunk(jobs_df: pl.DataFrame, ts_chunk: pl.DataFrame) -> pl.DataFrame
 
         # Apply the column mapping
         columns_to_rename = {col: mapping for col, mapping in column_mapping.items()
-                            if col in result.columns}
+                             if col in result.columns}
 
         result = result.rename(columns_to_rename)
 
         # Convert walltime to seconds with better error handling
         if "timelimit" in result.columns:
-            result = result.with_columns([
-                pl.when(pl.col("timelimit").is_not_null())
-                .then(convert_walltime_to_seconds(pl.col("timelimit")))
-                .otherwise(None).alias("timelimit")
-            ])
+            try:
+                result = result.with_columns([
+                    pl.when(pl.col("timelimit").is_not_null())
+                    .then(convert_walltime_to_seconds(pl.col("timelimit")))
+                    .otherwise(None).alias("timelimit")
+                ])
+            except Exception as e:
+                logger.warning(f"Error converting walltime: {e}")
+                # Keep original values if conversion fails
+                pass
 
         # Combine jobevent and Exit_status for detailed exitcode if both exist
         if "exitcode" in result.columns and "Exit_status" in result.columns:
-            result = result.with_columns([
-                pl.concat_str([
-                    pl.col("exitcode"),
-                    pl.lit(":"),
-                    pl.when(pl.col("Exit_status").is_not_null())
-                      .then(pl.col("Exit_status").cast(pl.Utf8))
-                      .otherwise(pl.lit(""))
-                ]).alias("exitcode")
-            ])
+            try:
+                result = result.with_columns([
+                    pl.concat_str([
+                        pl.col("exitcode"),
+                        pl.lit(":"),
+                        pl.when(pl.col("Exit_status").is_not_null())
+                        .then(pl.col("Exit_status").cast(pl.Utf8))
+                        .otherwise(pl.lit(""))
+                    ]).alias("exitcode")
+                ])
 
-        # Drop the original Exit_status column after combining
-        if "Exit_status" in result.columns:
-            result = result.drop("Exit_status")
+                # Drop the original Exit_status column after combining
+                result = result.drop("Exit_status")
+            except Exception as e:
+                logger.warning(f"Error combining exitcode fields: {e}")
+                # Keep original columns if combination fails
 
         # Convert any missing dates to proper format
         date_columns = ["time", "submit_time", "start_time", "end_time"]
         for col in date_columns:
             if col in result.columns:
-                result = result.with_columns([
-                    pl.when(pl.col(col).is_not_null() & ~pl.col(col).dtype.is_temporal())
-                    .then(pl.col(col).cast(pl.Datetime))
-                    .otherwise(pl.col(col))
-                    .alias(col)
-                ])
+                try:
+                    result = result.with_columns([
+                        pl.when(
+                            pl.col(col).is_not_null() &
+                            ~pl.col(col).dtype.is_temporal()
+                        )
+                        .then(pl.col(col).cast(pl.Datetime))
+                        .otherwise(pl.col(col))
+                        .alias(col)
+                    ])
+                except Exception as e:
+                    logger.warning(f"Error converting date column {col}: {e}")
 
         # Add any missing columns with null values
         set3_columns = ["time", "submit_time", "start_time", "end_time", "timelimit",
@@ -159,18 +201,29 @@ def process_chunk(jobs_df: pl.DataFrame, ts_chunk: pl.DataFrame) -> pl.DataFrame
                         "value_cpuuser", "value_gpu", "value_memused",
                         "value_memused_minus_diskcache", "value_nfs", "value_block"]
 
-        for col in set3_columns:
-            if col not in result.columns:
-                result = result.with_columns([
-                    pl.lit(None).alias(col)
-                ])
+        # Add missing columns
+        existing_columns = set(result.columns)
+        missing_columns = [col for col in set3_columns if col not in existing_columns]
+
+        if missing_columns:
+            logger.info(f"Adding missing columns: {missing_columns}")
+            # Create expressions for each missing column
+            exprs = [pl.lit(None).alias(col) for col in missing_columns]
+
+            # Add missing columns to the dataframe
+            if exprs:
+                result = result.with_columns(exprs)
 
         # Select only the columns needed for Set 3
-        result = result.select(set3_columns)
+        # Handle the case where some columns might still be missing
+        available_columns = [col for col in set3_columns if col in result.columns]
+        result = result.select(available_columns)
 
+        logger.info(f"Final result has {result.height} rows with {len(result.columns)} columns")
         return result
+
     except Exception as e:
-        logger.error(f"Error in process_chunk: {e}")
+        logger.error(f"Error in process_chunk: {e}", exc_info=True)
         return None
 
 
@@ -305,12 +358,13 @@ def join_job_timeseries(job_file: str, timeseries_file: str, output_file: str, c
         ])
 
         # Handle datetime columns with explicit null checks
+        # Use str.lengths() > 0 instead of str.len() > 0 for string length
         jobs_df = jobs_df.with_columns([
-            pl.when(pl.col("start").is_not_null() & pl.col("start").str.len() > 0)
+            pl.when(pl.col("start").is_not_null() & (pl.col("start").str.lengths() > 0))
             .then(pl.col("start").str.strptime(pl.Datetime, JOB_DATETIME_FMT))
             .otherwise(None).alias("start"),
 
-            pl.when(pl.col("end").is_not_null() & pl.col("end").str.len() > 0)
+            pl.when(pl.col("end").is_not_null() & (pl.col("end").str.lengths() > 0))
             .then(pl.col("end").str.strptime(pl.Datetime, JOB_DATETIME_FMT))
             .otherwise(None).alias("end")
         ])
