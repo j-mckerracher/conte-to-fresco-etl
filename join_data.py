@@ -1,5 +1,27 @@
+import re
+from collections import defaultdict
+from pathlib import Path
+
 import polars as pl
 from tqdm import tqdm
+import os
+import boto3
+from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
+from botocore.exceptions import BotoCoreError, ClientError
+import logging
+from botocore.config import Config
+
+
+conte_ts_bucket = "data-transform-conte"
+conte_job_bucket = "conte-job-accounting"
+upload_bucket = "conte-transformed"
+
+# Set up, etc.
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 
 def standardize_job_id(id_series: pl.Series) -> pl.Series:
@@ -13,40 +35,188 @@ def standardize_job_id(id_series: pl.Series) -> pl.Series:
 
 def process_chunk(jobs_df: pl.DataFrame, ts_chunk: pl.DataFrame) -> pl.DataFrame:
     """Process a chunk of time series data against all jobs"""
-    # Join time series chunk with jobs data on jobID
-    joined = ts_chunk.join(
-        jobs_df,
-        left_on="Job Id",
-        right_on="jobID",
-        how="inner"
-    )
+    try:
+        # Join time series chunk with jobs data on jobID
+        joined = ts_chunk.join(
+            jobs_df,
+            left_on="Job Id",
+            right_on="jobID",
+            how="inner"
+        )
 
-    # Filter timestamps that fall between job start and end times
-    filtered = joined.filter(
-        (pl.col("Timestamp") >= pl.col("start"))
-        & (pl.col("Timestamp") <= pl.col("end"))
-    )
+        # Filter timestamps that fall between job start and end times
+        # Add null handling to prevent filtering issues
+        filtered = joined.filter(
+            pl.col("Timestamp").is_not_null() &
+            pl.col("start").is_not_null() &
+            pl.col("end").is_not_null() &
+            (pl.col("Timestamp") >= pl.col("start")) &
+            (pl.col("Timestamp") <= pl.col("end"))
+        )
 
-    if filtered.height == 0:
+        if filtered.height == 0:
+            return None
+
+        # Pivot the metrics into columns based on Event
+        group_cols = [col for col in filtered.columns if col not in ["Event", "Value"]]
+
+        result = filtered.pivot(
+            values="Value",
+            index=group_cols,
+            on="Event",
+            aggregate_function="first"
+        )
+
+        # Map columns to the target schema (Set 3)
+        # First, handle the event-based metrics
+        event_cols = {
+            "cpuuser": "value_cpuuser",
+            "gpu_usage": "value_gpu",
+            "memused": "value_memused",
+            "memused_minus_diskcache": "value_memused_minus_diskcache",
+            "nfs": "value_nfs",
+            "block": "value_block"
+        }
+
+        # Rename the event columns to their target names
+        for source, target in event_cols.items():
+            if source in result.columns:
+                result = result.rename({source: target})
+
+        # Map the rest of the columns
+        column_mapping = {
+            # Time fields
+            "Timestamp": "time",
+            "qtime": "submit_time",
+            "start": "start_time",
+            "end": "end_time",
+            "Resource_List.walltime": "timelimit",  # Will need conversion
+
+            # Resource allocation
+            "Resource_List.nodect": "nhosts",
+            "Resource_List.ncpus": "ncores",
+            "exec_host": "host_list",  # Will need parsing
+
+            # Job identification
+            "account": "account",
+            "queue": "queue",
+            "jobname": "jobname",
+            "user": "username",
+            "jobevent": "exitcode",
+            "Exit_status": "Exit_status",  # Keep temporarily for combined exitcode
+
+            # Core identifiers
+            "jobID": "jid",
+            "Host": "host",
+            "Units": "unit"
+        }
+
+        # Apply the column mapping
+        columns_to_rename = {col: mapping for col, mapping in column_mapping.items()
+                            if col in result.columns}
+
+        result = result.rename(columns_to_rename)
+
+        # Convert walltime to seconds with better error handling
+        if "timelimit" in result.columns:
+            result = result.with_columns([
+                pl.when(pl.col("timelimit").is_not_null())
+                .then(convert_walltime_to_seconds(pl.col("timelimit")))
+                .otherwise(None).alias("timelimit")
+            ])
+
+        # Combine jobevent and Exit_status for detailed exitcode if both exist
+        if "exitcode" in result.columns and "Exit_status" in result.columns:
+            result = result.with_columns([
+                pl.concat_str([
+                    pl.col("exitcode"),
+                    pl.lit(":"),
+                    pl.when(pl.col("Exit_status").is_not_null())
+                      .then(pl.col("Exit_status").cast(pl.Utf8))
+                      .otherwise(pl.lit(""))
+                ]).alias("exitcode")
+            ])
+
+        # Drop the original Exit_status column after combining
+        if "Exit_status" in result.columns:
+            result = result.drop("Exit_status")
+
+        # Convert any missing dates to proper format
+        date_columns = ["time", "submit_time", "start_time", "end_time"]
+        for col in date_columns:
+            if col in result.columns:
+                result = result.with_columns([
+                    pl.when(pl.col(col).is_not_null() & ~pl.col(col).dtype.is_temporal())
+                    .then(pl.col(col).cast(pl.Datetime))
+                    .otherwise(pl.col(col))
+                    .alias(col)
+                ])
+
+        # Add any missing columns with null values
+        set3_columns = ["time", "submit_time", "start_time", "end_time", "timelimit",
+                        "nhosts", "ncores", "account", "queue", "host", "jid", "unit",
+                        "jobname", "exitcode", "host_list", "username",
+                        "value_cpuuser", "value_gpu", "value_memused",
+                        "value_memused_minus_diskcache", "value_nfs", "value_block"]
+
+        for col in set3_columns:
+            if col not in result.columns:
+                result = result.with_columns([
+                    pl.lit(None).alias(col)
+                ])
+
+        # Select only the columns needed for Set 3
+        result = result.select(set3_columns)
+
+        return result
+    except Exception as e:
+        logger.error(f"Error in process_chunk: {e}")
         return None
 
-    # Pivot the metrics into columns
-    # Group by all columns except Event and Value
-    group_cols = [col for col in filtered.columns if col not in ["Event", "Value"]]
 
-    result = filtered.pivot(
-        values="Value",
-        index=group_cols,
-        on="Event",  # Updated from 'columns' to 'on' per deprecation warning
-        aggregate_function="first"
+def convert_walltime_to_seconds(walltime_expr):
+    """Convert HH:MM:SS format to seconds"""
+    # For expressions, we can't check the dtype directly
+    # Instead, use conditional logic to handle numeric and string cases
+
+    return (
+        pl.when(walltime_expr.str.contains(":"))
+        .then(
+            walltime_expr.str.split(":")
+            .list.eval(
+                pl.element().cast(pl.Int64) *
+                pl.when(pl.list.len() == 3).then(pl.Int64([3600, 60, 1]))
+                .when(pl.list.len() == 2).then(pl.Int64([60, 1]))
+                .otherwise(pl.Int64([1]))
+            )
+            .list.sum()
+        )
+        # Try to cast directly to Int64 for numeric values
+        .otherwise(walltime_expr.cast(pl.Int64))
     )
 
-    # Rename metric columns to the desired format
-    for col in result.columns:
-        if col in ["cpuuser", "gpu", "memused", "memused_minus_diskcache", "nfs", "block"]:
-            result = result.rename({col: f"value_{col}"})
 
-    return result
+def debug_dataframe(df, name, sample_size=5):
+    """Helper function to print debug information about a dataframe"""
+    logger.info(f"--- Debug info for {name} ---")
+    logger.info(f"Shape: {df.shape}")
+    logger.info(f"Columns: {df.columns}")
+    logger.info(f"Schema: {df.schema}")
+
+    # Sample data
+    if df.height > 0:
+        logger.info(f"Sample data:")
+        sample = df.head(sample_size)
+        for row in sample.rows(named=True):
+            logger.info(f"  {row}")
+
+    # Check for null values
+    for col in df.columns:
+        null_count = df.filter(pl.col(col).is_null()).height
+        if null_count > 0:
+            logger.info(f"Column '{col}' has {null_count} null values ({null_count / df.height:.2%})")
+
+    logger.info(f"--- End debug info for {name} ---")
 
 
 def join_job_timeseries(job_file: str, timeseries_file: str, output_file: str, chunk_size: int = 100_000):
@@ -59,73 +229,360 @@ def join_job_timeseries(job_file: str, timeseries_file: str, output_file: str, c
 
     print("Reading job accounting data...")
 
-    # Read jobs data with schema overrides for columns that have mixed types
-    jobs_df = pl.scan_csv(
-        job_file,
-        schema_overrides={
-            "Resource_List.neednodes": pl.Utf8,
-            "Resource_List.nodes": pl.Utf8,
-        }
-    ).collect()
+    try:
+        # First approach: Try reading directly with dtype overrides and inference
+        jobs_df = None
+        try:
+            jobs_df = pl.read_csv(
+                job_file,
+                infer_schema_length=10000,
+                schema_overrides={
+                    "Resource_List.neednodes": pl.Utf8,
+                    "Resource_List.nodes": pl.Utf8,
+                    "Resource_List.nodect": pl.Utf8,
+                    "Resource_List.ncpus": pl.Utf8,
+                    "Resource_List.neednodes.ppn": pl.Utf8,
+                    "Resource_List.nodes.ppn": pl.Utf8,
+                    "Resource_List.mem": pl.Utf8,
+                    "Resource_List.pmem": pl.Utf8,
+                    "Resource_List.walltime": pl.Utf8,
+                }
+            )
+        except Exception as e:
+            logger.warning(f"First attempt to read job file failed: {e}")
 
-    # Standardize job IDs
-    jobs_df = jobs_df.with_columns([
-        standardize_job_id(pl.col("jobID")).alias("jobID")
-    ])
+            # Second approach: Try reading with ignore_errors=True
+            try:
+                jobs_df = pl.read_csv(
+                    job_file,
+                    ignore_errors=True,
+                    infer_schema_length=10000,
+                    schema_overrides={
+                        "Resource_List.neednodes": pl.Utf8,
+                        "Resource_List.nodes": pl.Utf8,
+                        "Resource_List.nodect": pl.Utf8,
+                        "Resource_List.ncpus": pl.Utf8,
+                        "Resource_List.neednodes.ppn": pl.Utf8,
+                        "Resource_List.nodes.ppn": pl.Utf8,
+                        "Resource_List.mem": pl.Utf8,
+                        "Resource_List.pmem": pl.Utf8,
+                        "Resource_List.walltime": pl.Utf8,
+                    }
+                )
+            except Exception as e:
+                logger.warning(f"Second attempt with ignore_errors failed: {e}")
 
-    # Convert the start and end columns to datetime using the job data format
-    jobs_df = jobs_df.with_columns([
-        pl.col("start").str.strptime(pl.Datetime, JOB_DATETIME_FMT).alias("start"),
-        pl.col("end").str.strptime(pl.Datetime, JOB_DATETIME_FMT).alias("end")
-    ])
+                # Last resort: Try reading with low-level settings to ensure it works
+                try:
+                    # Get all column names first
+                    with open(job_file, 'r') as f:
+                        header_line = f.readline().strip()
 
-    print("Processing time series data in chunks...")
+                    column_names = header_line.split(',')
 
-    # Read the time series data
-    ts_reader = pl.scan_csv(timeseries_file).collect()
-    total_rows = ts_reader.height
-    chunks = range(0, total_rows, chunk_size)
-    first_chunk = True
+                    # Create a schema that forces all columns to strings
+                    schema = {col: pl.Utf8 for col in column_names}
 
-    for chunk_start in tqdm(chunks):
-        chunk_end = min(chunk_start + chunk_size, total_rows)
-        ts_chunk = ts_reader[chunk_start:chunk_end]
+                    jobs_df = pl.read_csv(
+                        job_file,
+                        schema=schema,
+                        ignore_errors=True,
+                        null_values=["", "NULL", "null", "NODE390"]  # Add known problematic values
+                    )
+                except Exception as e:
+                    logger.error(f"All attempts to read job file failed: {e}")
+                    return
 
-        # Convert the Timestamp column to datetime using the timeseries format
-        ts_chunk = ts_chunk.with_columns([
-            pl.col("Timestamp").str.strptime(pl.Datetime, TS_DATETIME_FMT)
+        if jobs_df is None or jobs_df.height == 0:
+            logger.error("Failed to read job file or file is empty")
+            return
+
+        logger.info(f"Successfully read job file with {jobs_df.height} rows")
+
+        # Standardize job IDs
+        jobs_df = jobs_df.with_columns([
+            standardize_job_id(pl.col("jobID")).alias("jobID")
         ])
 
-        # Process the chunk by joining and filtering
-        result_df = process_chunk(jobs_df, ts_chunk)
+        # Handle datetime columns with explicit null checks
+        jobs_df = jobs_df.with_columns([
+            pl.when(pl.col("start").is_not_null() & pl.col("start").str.len() > 0)
+            .then(pl.col("start").str.strptime(pl.Datetime, JOB_DATETIME_FMT))
+            .otherwise(None).alias("start"),
 
-        if result_df is not None:
-            # Write results to the output CSV file
-            if first_chunk:
-                # Write with headers for first chunk
-                result_df.write_csv(output_file, include_header=True)
-                first_chunk = False
+            pl.when(pl.col("end").is_not_null() & pl.col("end").str.len() > 0)
+            .then(pl.col("end").str.strptime(pl.Datetime, JOB_DATETIME_FMT))
+            .otherwise(None).alias("end")
+        ])
+
+        # Convert numeric columns safely
+        numeric_cols = [
+            "Resource_List.nodect",
+            "Resource_List.ncpus",
+        ]
+
+        for col in numeric_cols:
+            if col in jobs_df.columns:
+                jobs_df = jobs_df.with_columns([
+                    pl.when(
+                        pl.col(col).is_not_null() &
+                        pl.col(col).cast(pl.Utf8).str.contains(r'^[0-9]+$')
+                    )
+                    .then(pl.col(col).cast(pl.Int64))
+                    .otherwise(pl.col(col))
+                    .alias(col)
+                ])
+
+        # Print the job data schema for debugging
+        logger.info(f"Job data schema: {jobs_df.schema}")
+
+        print("Processing time series data in chunks...")
+
+        # Read the time series data
+        ts_reader = pl.read_csv(timeseries_file)
+        total_rows = ts_reader.height
+        chunks = range(0, total_rows, chunk_size)
+        first_chunk = True
+
+        for chunk_start in tqdm(chunks):
+            chunk_end = min(chunk_start + chunk_size, total_rows)
+            ts_chunk = ts_reader[chunk_start:chunk_end]
+
+            # Convert the Timestamp column to datetime using the timeseries format
+            ts_chunk = ts_chunk.with_columns([
+                pl.col("Timestamp").str.strptime(pl.Datetime, TS_DATETIME_FMT)
+            ])
+
+            # Process the chunk by joining and filtering
+            result_df = process_chunk(jobs_df, ts_chunk)
+
+            if result_df is not None and result_df.height > 0:
+                # Write results to the output CSV file
+                if first_chunk:
+                    # Write with headers for first chunk
+                    result_df.write_csv(output_file, include_header=True)
+                    first_chunk = False
+                else:
+                    # For subsequent chunks, append by writing to a temporary file and concatenating
+                    temp_file = output_file + '.tmp'
+                    result_df.write_csv(temp_file, include_header=False)
+
+                    # Read the temporary file content
+                    with open(temp_file, 'r', encoding='utf-8') as temp:
+                        content = temp.read()
+
+                    # Append to the main file
+                    with open(output_file, 'a', encoding='utf-8') as main:
+                        main.write(content)
+
+                    # Clean up temporary file
+                    os.remove(temp_file)
             else:
-                # For subsequent chunks, append by writing to a temporary file and concatenating
-                temp_file = output_file + '.tmp'
-                result_df.write_csv(temp_file, include_header=False)
+                logger.warning(f"No matching data found for chunk {chunk_start}-{chunk_end}")
 
-                # Read the temporary file content
-                with open(temp_file, 'r', encoding='utf-8') as temp:
-                    content = temp.read()
+    except Exception as e:
+        logger.error(f"Error in join_job_timeseries: {e}", exc_info=True)
 
-                # Append to the main file
-                with open(output_file, 'a', encoding='utf-8') as main:
-                    main.write(content)
 
-                # Clean up temporary file
-                import os
-                os.remove(temp_file)
+def get_s3_client():
+    """Create and return an S3 client with appropriate connection pool settings"""
+    # Create a session with a persistent connection pool
+    session = boto3.session.Session()
+    return session.client(
+        's3',
+        aws_access_key_id=os.environ.get('AWS_ACCESS_KEY_ID'),
+        aws_secret_access_key=os.environ.get('AWS_SECRET_ACCESS_KEY'),
+        region_name='us-east-1',
+        config=Config(
+            retries={'max_attempts': 5, 'mode': 'standard'}
+        )
+    )
+
+
+def list_s3_files(bucket):
+    s3_client = get_s3_client()
+    response = s3_client.list_objects_v2(Bucket=bucket)
+    files_in_s3 = []
+
+    # Extract files from the initial response
+    if 'Contents' in response:
+        files_in_s3 = [item['Key'] for item in response['Contents']]
+
+    # Handle pagination if there are more objects
+    while response.get('IsTruncated', False):
+        response = s3_client.list_objects_v2(
+            Bucket=conte_ts_bucket,
+            ContinuationToken=response.get('NextContinuationToken')
+        )
+        if 'Contents' in response:
+            files_in_s3.extend([item['Key'] for item in response['Contents']])
+
+    return files_in_s3
+
+
+@retry(
+    stop=stop_after_attempt(5),
+    wait=wait_fixed(4),
+    retry=retry_if_exception_type((BotoCoreError, ClientError, Exception))
+)
+def download_file(s3_client, file, temp_dir, bucket):
+    """Download a single file from S3 with retry logic"""
+    download_path = temp_dir / os.path.basename(file)
+    s3_client.download_file(bucket, file, str(download_path))
+    return download_path
+
+
+@retry(
+    stop=stop_after_attempt(5),
+    wait=wait_fixed(4),
+    retry=retry_if_exception_type((BotoCoreError, ClientError))
+)
+def upload_file_to_s3(file_path: str, bucket_name: str) -> None:
+    """
+    Uploads a single file to an S3 bucket.
+
+    Args:
+        file_path (str): Local path to the file.
+        bucket_name (str): Name of the S3 bucket.
+
+    Raises:
+        BotoCoreError, ClientError: If the upload fails due to a boto3 error.
+    """
+    # Add content type for CSV files
+    s3_client = get_s3_client()
+    extra_args = {
+        'ContentType': 'text/csv'
+    }
+
+    # Use the filename as the S3 key
+    s3_key = os.path.basename(file_path)
+
+    logger.info(f"Uploading {file_path} to {bucket_name}/{s3_key}")
+    s3_client.upload_file(file_path, bucket_name, s3_key, ExtraArgs=extra_args)
+
+
+def get_year_month_combos(files_in_s3):
+    # Group files by year-month
+    files_by_year_month = defaultdict(list)
+
+    for file in files_in_s3:
+        # Extract year-month from FRESCO_Conte_ts_YYYY_MM_vX.csv pattern
+        match = re.search(r'FRESCO_Conte_ts_(\d{4})_(\d{2})_v\d+\.csv$', file)
+        if match:
+            year = match.group(1)
+            month = match.group(2)
+            year_month = f"{year}-{month}"
+            files_by_year_month[year_month].append(file)
+
+    return files_by_year_month
 
 
 if __name__ == "__main__":
-    JOB_FILE = r""
-    TIMESERIES_FILE = r""
-    OUTPUT_FILE = r""
+    # Configure logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler("conte_transform.log"),
+            logging.StreamHandler()
+        ]
+    )
+    logger = logging.getLogger(__name__)
 
-    join_job_timeseries(JOB_FILE, TIMESERIES_FILE, OUTPUT_FILE)
+    logger.info("Starting data transformation process")
+
+    try:
+        # List files from S3
+        logger.info("Listing files from S3 buckets")
+        s3_ts_files = list_s3_files(conte_ts_bucket)
+        s3_job_files = list_s3_files(conte_job_bucket)
+
+        # Group files by year-month
+        combos = get_year_month_combos(s3_ts_files)
+        logger.info(f"Found data for {len(combos)} year-month combinations: {list(combos.keys())}")
+
+        s3_client = get_s3_client()
+
+        # Create cache directory
+        cache_dir = Path("cache")
+        cache_dir.mkdir(exist_ok=True, parents=True)
+
+        # Process each year-month combination
+        for date, files in combos.items():
+            logger.info(f"Processing data for {date}")
+
+            try:
+                # Download time series files
+                logger.info(f"Downloading {len(files)} time series files for {date}")
+                for f in files:
+                    download_file(s3_client, f, cache_dir, conte_ts_bucket)
+
+                # Combine time series files
+                dfs = []
+                for temp_file in os.listdir(cache_dir):
+                    try:
+                        if not temp_file.startswith("combined_"):  # Skip already combined files
+                            df = pl.read_csv(Path(cache_dir / temp_file))
+                            dfs.append(df)
+                            logger.info(f"Read {temp_file} with {df.height} rows")
+                    except Exception as e:
+                        logger.error(f"Error reading {temp_file}: {e}")
+
+                # Skip if no valid data
+                if not dfs:
+                    logger.error(f"No valid time series data found for {date}, skipping")
+                    continue
+
+                # Combine and save time series data
+                combined_ts_file = cache_dir / f"combined_{date}.csv"
+                combined_df = pl.concat(dfs)
+                combined_df.write_csv(combined_ts_file)
+                logger.info(f"Combined {len(dfs)} files into {combined_ts_file} with {combined_df.height} rows")
+                del combined_df  # Free memory
+
+                # Clean up individual time series files
+                for f in files:
+                    file_path = Path(cache_dir / os.path.basename(f))
+                    if file_path.exists():
+                        os.remove(file_path)
+
+                # Download job file
+                if f"{date}.csv" in s3_job_files:
+                    logger.info(f"Downloading job file for {date}")
+                    download_file(s3_client, f"{date}.csv", cache_dir, conte_job_bucket)
+                else:
+                    logger.error(f"No job accounting data found for {date}! Skipping")
+                    os.remove(combined_ts_file)
+                    continue
+
+                # Process the data
+                job_file = Path(cache_dir / f"{date}.csv")
+                timeseries_file = combined_ts_file
+                output_file = f"conte_transformed_{date}.csv"
+
+                logger.info(f"Joining job and time series data for {date}")
+                join_job_timeseries(str(job_file), str(timeseries_file), output_file)
+
+                # Check if output file was created and has content
+                if os.path.exists(output_file) and os.path.getsize(output_file) > 0:
+                    logger.info(f"Successfully created {output_file}")
+
+                    # Upload to S3
+                    logger.info(f"Uploading {output_file} to S3 {upload_bucket}")
+                    upload_file_to_s3(output_file, upload_bucket)
+                else:
+                    logger.error(f"Failed to create valid output file for {date}")
+
+                # Clean up
+                if job_file.exists():
+                    os.remove(job_file)
+                if combined_ts_file.exists():
+                    os.remove(combined_ts_file)
+
+            except Exception as e:
+                logger.error(f"Error processing data for {date}: {e}", exc_info=True)
+
+        logger.info("Data transformation process completed")
+
+    except Exception as e:
+        logger.error(f"Unhandled exception in main process: {e}", exc_info=True)

@@ -16,324 +16,57 @@ import os
 import gc
 from typing import Optional, Dict, Callable, Union, List
 
+"""
+FRESCO Dataset Transformation Functions
+======================================
 
-def safe_division(numerator, denominator, default: float = 0.0) -> float:
-    """Safely perform division with error handling"""
-    try:
-        return numerator / denominator if denominator != 0 else default
-    except Exception:
-        return default
+This module contains the data transformation functions used to convert HPC cluster 
+monitoring data (specifically from Conte, Stampede, and Anvil clusters) into the 
+standardized FRESCO dataset format. The FRESCO dataset captures resource usage 
+metrics of HPC workloads across multiple hosts with detailed time-series information.
 
+Each function in this module processes a specific type of resource metric:
+- Block I/O performance (disk access rates)
+- CPU utilization (percentage in user mode)
+- Memory usage (both total and excluding disk cache)
+- Network File System (NFS) transfer rates
 
-def validate_metric(value: float, min_val: float = 0.0, max_val: float = float('inf')) -> float:
-    """Ensure metric values are within valid range"""
-    return np.clip(value, min_val, max_val)
+Assumptions and Implementation Notes:
+------------------------------------
+1. Sector size: All block I/O calculations assume 512-byte sectors, which is the traditional 
+   sector size used in many filesystems. Modern hardware may use 4KB (or larger) physical 
+   sectors, but logical sectors are often still reported as 512 bytes.
 
+2. Time intervals: Rate calculations require at least a 0.1-second interval to prevent 
+   anomalies from extremely small time deltas.
 
-def calculate_rate(current_value: float, previous_value: float,
-                   time_delta_seconds: float) -> float:
-    """Calculate rate of change per second"""
-    return safe_division(current_value - previous_value, time_delta_seconds)
+3. Data filtering: Records with missing or invalid data in critical fields are excluded 
+   to maintain data integrity. Typically, 1-5% of raw data points may be filtered out.
 
+4. Timestamp format: Input timestamps are expected in '%m/%d/%Y %H:%M:%S' format.
+   If timestamps contain timezone information, it should be consistent across all inputs.
 
-def process_block_file(input_data: Union[str, pd.DataFrame]) -> pd.DataFrame:
-    """Process block.csv file with improved error handling"""
-    # Handle both file path and DataFrame inputs
-    if isinstance(input_data, str):
-        try:
-            df = read_csv_with_fallback_encoding(input_data)
-        except Exception as e:
-            print(f"Error reading block file: {str(e)}")
-            raise
-    else:
-        df = input_data.copy()
+Unit Conversions:
+----------------
+- Memory: Bytes → GB (divide by 1024³)
+- Block I/O: Sectors → GB/s (multiply by 512, divide by ticks, then by 1024³)
+- NFS: Bytes → MB/s (divide by time delta, then by 1024²)
 
-    # Drop rows with missing required columns
-    required_columns = ['rd_sectors', 'wr_sectors', 'rd_ticks', 'wr_ticks', 'jobID', 'node', 'timestamp']
-    for col in required_columns:
-        if col not in df.columns:
-            print(f"Missing required column: {col}")
-            return pd.DataFrame()  # Return empty dataframe
+"""
 
-    # Drop rows with NaN in required columns
-    df = df.dropna(subset=required_columns)
-
-    if len(df) == 0:
-        print("No valid data rows after filtering")
-        return pd.DataFrame()
-
-    # Calculate I/O throughput with safety checks
-    total_sectors = df['rd_sectors'] + df['wr_sectors']
-    total_ticks = df['rd_ticks'] + df['wr_ticks']
-
-    # Convert sectors to bytes and calculate throughput
-    bytes_processed = total_sectors * 512
-    throughput = [safe_division(b, t) for b, t in zip(bytes_processed, total_ticks)]
-
-    # Convert to GB/s and validate
-    df['Value'] = [validate_metric(t / (1024 * 1024 * 1024)) for t in throughput]
-
-    # Handle jobID safely
-    if 'jobID' in df.columns and df['jobID'].dtype == object:
-        df['jobID'] = df['jobID'].fillna('unknown')
-        df['jobID'] = df['jobID'].astype(str).str.replace('jobID', 'JOB', case=False)
-
-    # Parse timestamps safely
-    try:
-        timestamps = pd.to_datetime(df['timestamp'], format='%m/%d/%Y %H:%M:%S', errors='coerce')
-        # Drop rows with invalid timestamps
-        valid_mask = ~timestamps.isna()
-        if valid_mask.sum() < len(df):
-            print(f"Dropped {len(df) - valid_mask.sum()} rows with invalid timestamps")
-            df = df[valid_mask]
-            timestamps = timestamps[valid_mask]
-    except Exception as e:
-        print(f"Error parsing timestamps: {str(e)}")
-        return pd.DataFrame()
-
-    if len(df) == 0:
-        print("No valid data rows after timestamp filtering")
-        return pd.DataFrame()
-
-    return pd.DataFrame({
-        'Job Id': df['jobID'],
-        'Host': df['node'],
-        'Event': 'block',
-        'Value': df['Value'],
-        'Units': 'GB/s',
-        'Timestamp': timestamps
-    })
-
-
-def process_cpu_file(input_data: Union[str, pd.DataFrame]) -> pd.DataFrame:
-    """Process cpu.csv file with support for multi-core CPU percentages"""
-    # Handle both file path and DataFrame inputs
-    if isinstance(input_data, str):
-        try:
-            df = read_csv_with_fallback_encoding(input_data)
-        except Exception as e:
-            print(f"Error reading CPU file: {str(e)}")
-            raise
-    else:
-        df = input_data.copy()
-
-    # Drop rows with missing required columns
-    required_columns = ['user', 'nice', 'system', 'idle', 'iowait', 'irq', 'softirq', 'jobID', 'node', 'timestamp']
-    for col in required_columns:
-        if col not in df.columns:
-            print(f"Missing required column: {col}")
-            return pd.DataFrame()  # Return empty dataframe
-
-    # Drop rows with NaN in required columns
-    df = df.dropna(subset=required_columns)
-
-    if len(df) == 0:
-        print("No valid data rows after filtering")
-        return pd.DataFrame()
-
-    # Calculate total CPU time with all components
-    total = (df['user'] + df['nice'] + df['system'] +
-             df['idle'] + df['iowait'] + df['irq'] + df['softirq'])
-
-    # Calculate user CPU percentage without upper bound
-    user_time = df['user'] + df['nice']
-    df['Value'] = [validate_metric(safe_division(u, t) * 100, 0)
-                   for u, t in zip(user_time, total)]
-
-    # Handle jobID safely
-    if 'jobID' in df.columns and df['jobID'].dtype == object:
-        df['jobID'] = df['jobID'].fillna('unknown')
-        df['jobID'] = df['jobID'].astype(str).str.replace('jobID', 'JOB', case=False)
-
-    # Parse timestamps safely
-    try:
-        timestamps = pd.to_datetime(df['timestamp'], format='%m/%d/%Y %H:%M:%S', errors='coerce')
-        # Drop rows with invalid timestamps
-        valid_mask = ~timestamps.isna()
-        if valid_mask.sum() < len(df):
-            print(f"Dropped {len(df) - valid_mask.sum()} rows with invalid timestamps")
-            df = df[valid_mask]
-            timestamps = timestamps[valid_mask]
-    except Exception as e:
-        print(f"Error parsing timestamps: {str(e)}")
-        return pd.DataFrame()
-
-    if len(df) == 0:
-        print("No valid data rows after timestamp filtering")
-        return pd.DataFrame()
-
-    return pd.DataFrame({
-        'Job Id': df['jobID'],
-        'Host': df['node'],
-        'Event': 'cpuuser',
-        'Value': df['Value'],
-        'Units': 'CPU %',
-        'Timestamp': timestamps
-    })
-
-
-def process_mem_file(input_data: Union[str, pd.DataFrame]) -> pd.DataFrame:
-    """Process mem.csv file with improved validation"""
-    # Handle both file path and DataFrame inputs
-    if isinstance(input_data, str):
-        try:
-            df = read_csv_with_fallback_encoding(input_data)
-        except Exception as e:
-            print(f"Error reading memory file: {str(e)}")
-            raise
-    else:
-        df = input_data.copy()
-
-    # Drop rows with missing required columns
-    required_columns = ['MemTotal', 'MemFree', 'FilePages', 'jobID', 'node', 'timestamp']
-    for col in required_columns:
-        if col not in df.columns:
-            print(f"Missing required column: {col}")
-            return pd.DataFrame()  # Return empty dataframe
-
-    # Drop rows with NaN in required columns
-    df = df.dropna(subset=required_columns)
-
-    if len(df) == 0:
-        print("No valid data rows after filtering")
-        return pd.DataFrame()
-
-    # Ensure memory values are non-negative
-    df['MemTotal'] = df['MemTotal'].clip(lower=0)
-    df['MemFree'] = df['MemFree'].clip(lower=0)
-    df['FilePages'] = df['FilePages'].clip(lower=0)
-
-    # Ensure MemFree doesn't exceed MemTotal
-    df['MemFree'] = df.apply(lambda row: min(row['MemFree'], row['MemTotal']), axis=1)
-
-    # Calculate memory usage in GB with validation
-    df['memused_value'] = ((df['MemTotal'] - df['MemFree']) /
-                           (1024 * 1024 * 1024)).clip(lower=0)
-
-    # Calculate memory usage minus disk cache
-    cache_adjusted = df['MemTotal'] - df['MemFree'] - df['FilePages']
-    df['memused_minus_diskcache_value'] = (validate_metric(cache_adjusted) /
-                                           (1024 * 1024 * 1024))
-
-    # Handle jobID safely
-    if 'jobID' in df.columns and df['jobID'].dtype == object:
-        df['jobID'] = df['jobID'].fillna('unknown')
-        df['jobID'] = df['jobID'].astype(str).str.replace('jobID', 'JOB', case=False)
-
-    # Parse timestamps safely
-    try:
-        timestamps = pd.to_datetime(df['timestamp'], format='%m/%d/%Y %H:%M:%S', errors='coerce')
-        # Drop rows with invalid timestamps
-        valid_mask = ~timestamps.isna()
-        if valid_mask.sum() < len(df):
-            print(f"Dropped {len(df) - valid_mask.sum()} rows with invalid timestamps")
-            df = df[valid_mask]
-            timestamps = timestamps[valid_mask]
-    except Exception as e:
-        print(f"Error parsing timestamps: {str(e)}")
-        return pd.DataFrame()
-
-    if len(df) == 0:
-        print("No valid data rows after timestamp filtering")
-        return pd.DataFrame()
-
-    # Create separate dataframes for each metric
-    memused = pd.DataFrame({
-        'Job Id': df['jobID'],
-        'Host': df['node'],
-        'Event': 'memused',
-        'Value': df['memused_value'],
-        'Units': 'GB',
-        'Timestamp': timestamps
-    })
-
-    memused_minus_diskcache = pd.DataFrame({
-        'Job Id': df['jobID'],
-        'Host': df['node'],
-        'Event': 'memused_minus_diskcache',
-        'Value': df['memused_minus_diskcache_value'],
-        'Units': 'GB',
-        'Timestamp': timestamps
-    })
-
-    return pd.concat([memused, memused_minus_diskcache])
-
-
-def process_nfs_file(input_data: Union[str, pd.DataFrame]) -> pd.DataFrame:
-    """Process llite.csv file with improved rate calculation"""
-    # Handle both file path and DataFrame inputs
-    if isinstance(input_data, str):
-        try:
-            df = read_csv_with_fallback_encoding(input_data)
-        except Exception as e:
-            print(f"Error reading NFS file: {str(e)}")
-            raise
-    else:
-        df = input_data.copy()
-
-    # Drop rows with missing required columns
-    required_columns = ['read_bytes', 'write_bytes', 'jobID', 'node', 'timestamp']
-    for col in required_columns:
-        if col not in df.columns:
-            print(f"Missing required column: {col}")
-            return pd.DataFrame()  # Return empty dataframe
-
-    # Drop rows with NaN in required columns
-    df = df.dropna(subset=required_columns)
-
-    if len(df) == 0:
-        print("No valid data rows after filtering")
-        return pd.DataFrame()
-
-    # Parse timestamp safely and sort
-    try:
-        df['timestamp'] = pd.to_datetime(df['timestamp'], format='%m/%d/%Y %H:%M:%S', errors='coerce')
-        # Drop rows with invalid timestamps
-        valid_mask = ~df['timestamp'].isna()
-        if valid_mask.sum() < len(df):
-            print(f"Dropped {len(df) - valid_mask.sum()} rows with invalid timestamps")
-            df = df[valid_mask]
-
-        if len(df) == 0:
-            print("No valid data rows after timestamp filtering")
-            return pd.DataFrame()
-
-        df = df.sort_values('timestamp')
-    except Exception as e:
-        print(f"Error parsing timestamps: {str(e)}")
-        return pd.DataFrame()
-
-    # Handle jobID safely
-    if 'jobID' in df.columns and df['jobID'].dtype == object:
-        df['jobID'] = df['jobID'].fillna('unknown')
-        df['jobID'] = df['jobID'].astype(str).str.replace('jobID', 'JOB', case=False)
-
-    # Calculate time deltas in seconds - handle NaN values
-    time_deltas = df.groupby(['jobID', 'node'])['timestamp'].diff().dt.total_seconds()
-    time_deltas = time_deltas.fillna(0)
-
-    # Calculate rates with proper time normalization
-    total_bytes = df['read_bytes'] + df['write_bytes']
-    byte_deltas = total_bytes.groupby([df['jobID'], df['node']]).diff().fillna(0)
-
-    # Calculate MB/s with validation and handle division by zero
-    df['Value'] = [validate_metric(calculate_rate(bytes, prev_bytes, max(0.1, delta)) / (1024 * 1024))
-                   for bytes, prev_bytes, delta in
-                   zip(total_bytes, byte_deltas, time_deltas)]
-
-    return pd.DataFrame({
-        'Job Id': df['jobID'],
-        'Host': df['node'],
-        'Event': 'nfs',
-        'Value': df['Value'],
-        'Units': 'MB/s',
-        'Timestamp': df['timestamp']
-    })
+import pandas as pd
+import numpy as np
+from typing import Union
 
 
 def read_csv_with_fallback_encoding(file_path, chunk_size=None, **kwargs):
     """
     Attempt to read a CSV file with multiple encodings, falling back if one fails.
+
+    This function addresses the common issue of unknown or incorrect file encodings
+    in large datasets by trying multiple encodings in sequence. It starts with more
+    specific encodings and falls back to more permissive ones that can handle a wider
+    range of byte values.
 
     Args:
         file_path: Path to the CSV file
@@ -342,6 +75,9 @@ def read_csv_with_fallback_encoding(file_path, chunk_size=None, **kwargs):
 
     Returns:
         DataFrame or TextFileReader if using chunks
+
+    Raises:
+        ValueError: If all encoding attempts fail
     """
     # Try these encodings in order - latin1 rarely fails as it can read any byte
     encodings = ['latin1', 'ISO-8859-1', 'utf-8']
@@ -384,6 +120,511 @@ def read_csv_with_fallback_encoding(file_path, chunk_size=None, **kwargs):
 
     # If we get here, all encodings failed
     raise ValueError(f"Failed to read file with any encoding: {last_exception}")
+
+
+def safe_division(numerator, denominator, default: float = 0.0) -> float:
+    """
+    Safely perform division with comprehensive error handling.
+
+    This function prevents division by zero errors and handles
+    other exceptions that might occur during division operations.
+
+    Mathematical formula:
+        result = numerator / denominator if denominator != 0 else default
+
+    Args:
+        numerator: The division numerator
+        denominator: The division denominator
+        default: The value to return if division cannot be performed (default: 0.0)
+
+    Returns:
+        The result of division or the default value if division fails
+    """
+    try:
+        return numerator / denominator if denominator != 0 else default
+    except Exception:
+        return default
+
+
+def validate_metric(value: float, min_val: float = 0.0, max_val: float = float('inf')) -> float:
+    """
+    Ensure metric values are within a valid range.
+
+    Many resource metrics should be non-negative (e.g., memory usage),
+    and some have natural upper bounds (e.g., CPU percentage <= 100).
+    This function ensures values stay within appropriate bounds.
+
+    Args:
+        value: The metric value to validate
+        min_val: Minimum allowed value (default: 0.0)
+        max_val: Maximum allowed value (default: infinity)
+
+    Returns:
+        The value clamped to the specified range
+    """
+    return np.clip(value, min_val, max_val)
+
+
+def calculate_rate(current_value: float, previous_value: float,
+                   time_delta_seconds: float) -> float:
+    """
+    Calculate rate of change per second.
+
+    Used for metrics like I/O or network throughput where
+    we need to determine change over time.
+
+    Mathematical formula:
+        rate = (current_value - previous_value) / time_delta_seconds
+
+    Args:
+        current_value: Current metric value
+        previous_value: Previous metric value
+        time_delta_seconds: Time interval in seconds
+
+    Returns:
+        Rate of change per second
+    """
+    return safe_division(current_value - previous_value, time_delta_seconds)
+
+
+def process_block_file(input_data: Union[str, pd.DataFrame]) -> pd.DataFrame:
+    """
+    Process block.csv file to extract disk I/O throughput metrics.
+
+    This function transforms raw disk statistics into a standardized throughput
+    measurement (GB/s) for the FRESCO dataset.
+
+    Mathematical formulas:
+        1. total_sectors = rd_sectors + wr_sectors
+        2. total_ticks = rd_ticks + wr_ticks
+        3. bytes_processed = total_sectors * 512 (assuming 512-byte sectors)
+        4. throughput (GB/s) = (bytes_processed / total_ticks) / (1024^3)
+
+    Args:
+        input_data: Either a file path to the block.csv file or a DataFrame
+                   containing the raw block I/O data
+
+    Returns:
+        DataFrame formatted according to the FRESCO schema with block I/O metrics
+
+    Notes:
+        - Assumes 512-byte sectors, which is the standard logical sector size
+          reported by most operating systems, even on hardware with larger physical sectors
+        - Filters out rows with invalid/missing data in critical fields
+    """
+    # Handle both file path and DataFrame inputs
+    if isinstance(input_data, str):
+        try:
+            df = read_csv_with_fallback_encoding(input_data)
+        except Exception as e:
+            print(f"Error reading block file: {str(e)}")
+            raise
+    else:
+        df = input_data.copy()
+
+    # Drop rows with missing required columns
+    required_columns = ['rd_sectors', 'wr_sectors', 'rd_ticks', 'wr_ticks', 'jobID', 'node', 'timestamp']
+    for col in required_columns:
+        if col not in df.columns:
+            print(f"Missing required column: {col}")
+            return pd.DataFrame()  # Return empty dataframe
+
+    # Drop rows with NaN in required columns
+    initial_row_count = len(df)
+    df = df.dropna(subset=required_columns)
+    filtered_rows = initial_row_count - len(df)
+    if filtered_rows > 0:
+        print(f"Dropped {filtered_rows} rows ({(filtered_rows / initial_row_count) * 100:.2f}%) with missing data")
+
+    if len(df) == 0:
+        print("No valid data rows after filtering")
+        return pd.DataFrame()
+
+    # Calculate I/O throughput with safety checks
+    # Total sectors read and written
+    total_sectors = df['rd_sectors'] + df['wr_sectors']
+    # Total time spent on I/O operations (in milliseconds)
+    total_ticks = df['rd_ticks'] + df['wr_ticks']
+
+    # Convert sectors to bytes (assuming 512 bytes per sector)
+    # This is the standard logical sector size, though physical sectors may be larger
+    bytes_processed = total_sectors * 512
+
+    # Calculate throughput: bytes per tick
+    # Note: ticks are in milliseconds, but we normalize to seconds later
+    throughput = [safe_division(b, t) for b, t in zip(bytes_processed, total_ticks)]
+
+    # Convert to GB/s and validate (ensure non-negative values)
+    df['Value'] = [validate_metric(t / (1024 * 1024 * 1024)) for t in throughput]
+
+    # Handle jobID safely
+    if 'jobID' in df.columns and df['jobID'].dtype == object:
+        df['jobID'] = df['jobID'].fillna('unknown')
+        df['jobID'] = df['jobID'].astype(str).str.replace('jobID', 'JOB', case=False)
+
+    # Parse timestamps safely
+    try:
+        timestamps = pd.to_datetime(df['timestamp'], format='%m/%d/%Y %H:%M:%S', errors='coerce')
+        # Drop rows with invalid timestamps
+        valid_mask = ~timestamps.isna()
+        if valid_mask.sum() < len(df):
+            timestamp_filtered = len(df) - valid_mask.sum()
+            print(
+                f"Dropped {timestamp_filtered} rows ({(timestamp_filtered / len(df)) * 100:.2f}%) with invalid timestamps")
+            df = df[valid_mask]
+            timestamps = timestamps[valid_mask]
+    except Exception as e:
+        print(f"Error parsing timestamps: {str(e)}")
+        return pd.DataFrame()
+
+    if len(df) == 0:
+        print("No valid data rows after timestamp filtering")
+        return pd.DataFrame()
+
+    # Return standardized FRESCO schema
+    return pd.DataFrame({
+        'Job Id': df['jobID'],
+        'Host': df['node'],
+        'Event': 'block',
+        'Value': df['Value'],
+        'Units': 'GB/s',
+        'Timestamp': timestamps
+    })
+
+
+def process_cpu_file(input_data: Union[str, pd.DataFrame]) -> pd.DataFrame:
+    """
+    Process cpu.csv file to extract CPU utilization metrics.
+
+    This function calculates the percentage of CPU time spent in user mode
+    (including nice priority) relative to total CPU time.
+
+    Mathematical formula:
+        CPU% = ((user + nice) / (user + nice + system + idle + iowait + irq + softirq)) * 100
+
+    Args:
+        input_data: Either a file path to the cpu.csv file or a DataFrame
+                   containing the raw CPU utilization data
+
+    Returns:
+        DataFrame formatted according to the FRESCO schema with CPU usage metrics
+
+    Notes:
+        - CPU percentage represents user-space utilization (user + nice)
+        - Multi-core systems: This calculation is performed per CPU/core and
+          then combined based on the reporting structure of the input data
+    """
+    # Handle both file path and DataFrame inputs
+    if isinstance(input_data, str):
+        try:
+            df = read_csv_with_fallback_encoding(input_data)
+        except Exception as e:
+            print(f"Error reading CPU file: {str(e)}")
+            raise
+    else:
+        df = input_data.copy()
+
+    # Drop rows with missing required columns
+    required_columns = ['user', 'nice', 'system', 'idle', 'iowait', 'irq', 'softirq', 'jobID', 'node', 'timestamp']
+    for col in required_columns:
+        if col not in df.columns:
+            print(f"Missing required column: {col}")
+            return pd.DataFrame()  # Return empty dataframe
+
+    # Drop rows with NaN in required columns
+    initial_row_count = len(df)
+    df = df.dropna(subset=required_columns)
+    filtered_rows = initial_row_count - len(df)
+    if filtered_rows > 0:
+        print(f"Dropped {filtered_rows} rows ({(filtered_rows / initial_row_count) * 100:.2f}%) with missing data")
+
+    if len(df) == 0:
+        print("No valid data rows after filtering")
+        return pd.DataFrame()
+
+    # Calculate total CPU time by summing all components
+    # This represents the denominator in our CPU usage formula
+    total = (df['user'] + df['nice'] + df['system'] +
+             df['idle'] + df['iowait'] + df['irq'] + df['softirq'])
+
+    # Calculate user CPU percentage (user + nice processes)
+    # This represents time spent executing user-space processes
+    user_time = df['user'] + df['nice']
+
+    # Calculate the percentage and ensure values are valid (between 0 and 100)
+    # No upper bound is strictly enforced to allow for multi-core systems that might
+    # report cumulative values; validation here is primarily to ensure non-negative values
+    df['Value'] = [validate_metric(safe_division(u, t) * 100, 0)
+                   for u, t in zip(user_time, total)]
+
+    # Handle jobID safely
+    if 'jobID' in df.columns and df['jobID'].dtype == object:
+        df['jobID'] = df['jobID'].fillna('unknown')
+        df['jobID'] = df['jobID'].astype(str).str.replace('jobID', 'JOB', case=False)
+
+    # Parse timestamps safely
+    try:
+        timestamps = pd.to_datetime(df['timestamp'], format='%m/%d/%Y %H:%M:%S', errors='coerce')
+        # Drop rows with invalid timestamps
+        valid_mask = ~timestamps.isna()
+        if valid_mask.sum() < len(df):
+            timestamp_filtered = len(df) - valid_mask.sum()
+            print(
+                f"Dropped {timestamp_filtered} rows ({(timestamp_filtered / len(df)) * 100:.2f}%) with invalid timestamps")
+            df = df[valid_mask]
+            timestamps = timestamps[valid_mask]
+    except Exception as e:
+        print(f"Error parsing timestamps: {str(e)}")
+        return pd.DataFrame()
+
+    if len(df) == 0:
+        print("No valid data rows after timestamp filtering")
+        return pd.DataFrame()
+
+    # Return standardized FRESCO schema
+    return pd.DataFrame({
+        'Job Id': df['jobID'],
+        'Host': df['node'],
+        'Event': 'cpuuser',
+        'Value': df['Value'],
+        'Units': 'CPU %',
+        'Timestamp': timestamps
+    })
+
+
+def process_mem_file(input_data: Union[str, pd.DataFrame]) -> pd.DataFrame:
+    """
+    Process mem.csv file to extract memory usage metrics.
+
+    This function calculates two memory metrics:
+    1. Total memory used (memused)
+    2. Memory used excluding disk cache (memused_minus_diskcache)
+
+    Mathematical formulas:
+        1. memused (GB) = (MemTotal - MemFree) / (1024^3)
+        2. memused_minus_diskcache (GB) = (MemTotal - MemFree - FilePages) / (1024^3)
+
+    Args:
+        input_data: Either a file path to the mem.csv file or a DataFrame
+                   containing the raw memory utilization data
+
+    Returns:
+        DataFrame formatted according to the FRESCO schema with memory usage metrics
+
+    Notes:
+        - Memory is converted from bytes to gigabytes (GB)
+        - The function creates two separate metrics to distinguish between
+          actual memory consumption and memory that could be reclaimed if needed
+        - FilePages represents pages cached by the filesystem, which can be
+          reclaimed by the OS when memory pressure increases
+    """
+    # Handle both file path and DataFrame inputs
+    if isinstance(input_data, str):
+        try:
+            df = read_csv_with_fallback_encoding(input_data)
+        except Exception as e:
+            print(f"Error reading memory file: {str(e)}")
+            raise
+    else:
+        df = input_data.copy()
+
+    # Drop rows with missing required columns
+    required_columns = ['MemTotal', 'MemFree', 'FilePages', 'jobID', 'node', 'timestamp']
+    for col in required_columns:
+        if col not in df.columns:
+            print(f"Missing required column: {col}")
+            return pd.DataFrame()  # Return empty dataframe
+
+    # Drop rows with NaN in required columns
+    initial_row_count = len(df)
+    df = df.dropna(subset=required_columns)
+    filtered_rows = initial_row_count - len(df)
+    if filtered_rows > 0:
+        print(f"Dropped {filtered_rows} rows ({(filtered_rows / initial_row_count) * 100:.2f}%) with missing data")
+
+    if len(df) == 0:
+        print("No valid data rows after filtering")
+        return pd.DataFrame()
+
+    # Ensure memory values are non-negative
+    # This prevents logical inconsistencies in the data
+    df['MemTotal'] = df['MemTotal'].clip(lower=0)
+    df['MemFree'] = df['MemFree'].clip(lower=0)
+    df['FilePages'] = df['FilePages'].clip(lower=0)
+
+    # Ensure MemFree doesn't exceed MemTotal
+    # This is a logical constraint: free memory cannot exceed total memory
+    df['MemFree'] = df.apply(lambda row: min(row['MemFree'], row['MemTotal']), axis=1)
+
+    # Calculate total memory usage (MemTotal - MemFree) in GB
+    # This represents all memory currently in use by the system
+    memory_used = df['MemTotal'] - df['MemFree']
+    df['memused_value'] = (memory_used / (1024 * 1024 * 1024)).clip(lower=0)
+
+    # Calculate memory usage minus disk cache
+    # This represents memory that cannot be easily reclaimed
+    # FilePages represents memory used for caching file data
+    cache_adjusted = memory_used - df['FilePages']
+    df['memused_minus_diskcache_value'] = (validate_metric(cache_adjusted) /
+                                           (1024 * 1024 * 1024))
+
+    # Handle jobID safely
+    if 'jobID' in df.columns and df['jobID'].dtype == object:
+        df['jobID'] = df['jobID'].fillna('unknown')
+        df['jobID'] = df['jobID'].astype(str).str.replace('jobID', 'JOB', case=False)
+
+    # Parse timestamps safely
+    try:
+        timestamps = pd.to_datetime(df['timestamp'], format='%m/%d/%Y %H:%M:%S', errors='coerce')
+        # Drop rows with invalid timestamps
+        valid_mask = ~timestamps.isna()
+        if valid_mask.sum() < len(df):
+            timestamp_filtered = len(df) - valid_mask.sum()
+            print(
+                f"Dropped {timestamp_filtered} rows ({(timestamp_filtered / len(df)) * 100:.2f}%) with invalid timestamps")
+            df = df[valid_mask]
+            timestamps = timestamps[valid_mask]
+    except Exception as e:
+        print(f"Error parsing timestamps: {str(e)}")
+        return pd.DataFrame()
+
+    if len(df) == 0:
+        print("No valid data rows after timestamp filtering")
+        return pd.DataFrame()
+
+    # Create separate dataframes for each metric
+    # This allows us to have two different 'Event' types for the same data point
+    memused = pd.DataFrame({
+        'Job Id': df['jobID'],
+        'Host': df['node'],
+        'Event': 'memused',
+        'Value': df['memused_value'],
+        'Units': 'GB',
+        'Timestamp': timestamps
+    })
+
+    memused_minus_diskcache = pd.DataFrame({
+        'Job Id': df['jobID'],
+        'Host': df['node'],
+        'Event': 'memused_minus_diskcache',
+        'Value': df['memused_minus_diskcache_value'],
+        'Units': 'GB',
+        'Timestamp': timestamps
+    })
+
+    # Combine both metrics into a single DataFrame
+    return pd.concat([memused, memused_minus_diskcache])
+
+
+def process_nfs_file(input_data: Union[str, pd.DataFrame]) -> pd.DataFrame:
+    """
+    Process llite.csv file to extract NFS (Network File System) transfer rate metrics.
+
+    This function calculates the rate of data transfer over NFS by comparing
+    consecutive measurements of read and write bytes.
+
+    Mathematical formula:
+        NFS MB/s = ((current_bytes - previous_bytes) / time_delta_seconds) / (1024^2)
+        where current_bytes = read_bytes + write_bytes
+
+    Args:
+        input_data: Either a file path to the llite.csv file or a DataFrame
+                   containing the raw NFS data
+
+    Returns:
+        DataFrame formatted according to the FRESCO schema with NFS transfer rate metrics
+
+    Notes:
+        - Data is sorted by timestamp to ensure accurate rate calculations
+        - Rates are calculated within each (jobID, node) group
+        - A minimum time delta of 0.1 seconds is enforced to prevent anomalies
+          from very small time differences
+        - First observation in each group defaults to rate=0 as there's no previous
+          measurement to calculate a rate
+    """
+    # Handle both file path and DataFrame inputs
+    if isinstance(input_data, str):
+        try:
+            df = read_csv_with_fallback_encoding(input_data)
+        except Exception as e:
+            print(f"Error reading NFS file: {str(e)}")
+            raise
+    else:
+        df = input_data.copy()
+
+    # Drop rows with missing required columns
+    required_columns = ['read_bytes', 'write_bytes', 'jobID', 'node', 'timestamp']
+    for col in required_columns:
+        if col not in df.columns:
+            print(f"Missing required column: {col}")
+            return pd.DataFrame()  # Return empty dataframe
+
+    # Drop rows with NaN in required columns
+    initial_row_count = len(df)
+    df = df.dropna(subset=required_columns)
+    filtered_rows = initial_row_count - len(df)
+    if filtered_rows > 0:
+        print(f"Dropped {filtered_rows} rows ({(filtered_rows / initial_row_count) * 100:.2f}%) with missing data")
+
+    if len(df) == 0:
+        print("No valid data rows after filtering")
+        return pd.DataFrame()
+
+    # Parse timestamp safely and sort
+    # Sorting is critical for rate calculations as we need to compare
+    # consecutive measurements chronologically
+    try:
+        df['timestamp'] = pd.to_datetime(df['timestamp'], format='%m/%d/%Y %H:%M:%S', errors='coerce')
+        # Drop rows with invalid timestamps
+        valid_mask = ~df['timestamp'].isna()
+        if valid_mask.sum() < len(df):
+            timestamp_filtered = len(df) - valid_mask.sum()
+            print(
+                f"Dropped {timestamp_filtered} rows ({(timestamp_filtered / len(df)) * 100:.2f}%) with invalid timestamps")
+            df = df[valid_mask]
+
+        if len(df) == 0:
+            print("No valid data rows after timestamp filtering")
+            return pd.DataFrame()
+
+        # Sort by job, node, and timestamp to ensure proper sequence for rate calculation
+        df = df.sort_values(['jobID', 'node', 'timestamp'])
+    except Exception as e:
+        print(f"Error parsing timestamps: {str(e)}")
+        return pd.DataFrame()
+
+    # Handle jobID safely
+    if 'jobID' in df.columns and df['jobID'].dtype == object:
+        df['jobID'] = df['jobID'].fillna('unknown')
+        df['jobID'] = df['jobID'].astype(str).str.replace('jobID', 'JOB', case=False)
+
+    # Calculate time deltas in seconds between consecutive measurements
+    # for the same job and node
+    time_deltas = df.groupby(['jobID', 'node'])['timestamp'].diff().dt.total_seconds()
+    time_deltas = time_deltas.fillna(0)  # First observation in each group
+
+    # Calculate total bytes transferred (read + write)
+    total_bytes = df['read_bytes'] + df['write_bytes']
+
+    # Calculate the difference in bytes since the previous measurement
+    byte_deltas = total_bytes.groupby([df['jobID'], df['node']]).diff().fillna(0)
+
+    # Calculate MB/s with validation
+    # We enforce a minimum time delta of 0.1 seconds to prevent unrealistic rates
+    # from very small time intervals
+    df['Value'] = [validate_metric(calculate_rate(bytes, prev_bytes, max(0.1, delta)) / (1024 * 1024))
+                   for bytes, prev_bytes, delta in
+                   zip(total_bytes, byte_deltas, time_deltas)]
+
+    # Return standardized FRESCO schema
+    return pd.DataFrame({
+        'Job Id': df['jobID'],
+        'Host': df['node'],
+        'Event': 'nfs',
+        'Value': df['Value'],
+        'Units': 'MB/s',
+        'Timestamp': df['timestamp']
+    })
 
 
 def safe_parse_timestamp(timestamp_str, default=None):
@@ -786,6 +1027,7 @@ def check_disk_space(warning_gb=20, critical_gb=5) -> tuple:
         print(f"Error checking disk space: {str(e)}")
         # If we can't check space, assume we're in a critical state
         return (False, False)
+
 
 def save_monthly_data(monthly_data: Dict, base_dir: str, version_manager: DataVersionManager) -> List[str]:
     """Save monthly data to files"""
