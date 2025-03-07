@@ -127,104 +127,58 @@ def process_chunk(jobs_df, ts_chunk):
     if filtered.empty:
         return None
 
-    # Try different pivoting approaches to handle the data
+    # Skip the pivot operation completely and use a different approach
     try:
-        # First approach: Use groupby + agg to create a pivot
-        # Add a dummy column to distinguish duplicate rows
-        filtered.loc[:, '_row_id'] = range(len(filtered))
+        # Get unique Events
+        events = filtered['Event'].unique()
 
-        # Group by Event and all other columns except Value
-        value_cols = ['Value', '_row_id']
-        group_cols = [col for col in filtered.columns if col not in value_cols]
+        # Create a list to hold dataframes for each event
+        event_dfs = []
 
-        # First group to find duplicates in the index
-        grouped = filtered.groupby(group_cols + ['Event'])
+        # Process each event type separately
+        for event in events:
+            # Filter rows for this event
+            event_data = filtered[filtered['Event'] == event].copy()
 
-        # If there are no duplicates, use the faster pivot approach
-        if grouped.size().max() == 1:
-            # Use traditional pivot
-            group_cols = [col for col in filtered.columns if col not in ['Event', 'Value']]
-            pivoted = filtered.pivot(
-                index=group_cols,
-                columns='Event',
-                values='Value'
-            ).reset_index()
+            # Rename the Value column to include the event name
+            if event in ["cpuuser", "gpu_usage", "memused", "memused_minus_diskcache", "nfs", "block"]:
+                event_data = event_data.rename(columns={'Value': f'value_{event}'})
+            else:
+                event_data = event_data.rename(columns={'Value': event})
+
+            # Drop the Event column since it's now encoded in the column name
+            event_data = event_data.drop(columns=['Event'])
+
+            event_dfs.append(event_data)
+
+        # If we have any event dataframes
+        if event_dfs:
+            # Start with the first event dataframe
+            result_df = event_dfs[0]
+
+            # Merge in each additional event dataframe
+            for i in range(1, len(event_dfs)):
+                # Get columns to merge on (all except the value columns)
+                value_cols = [col for col in event_dfs[i].columns if col.startswith('value_') or col in events]
+                merge_cols = [col for col in event_dfs[i].columns if col not in value_cols]
+
+                # Merge with the result
+                result_df = pd.merge(result_df, event_dfs[i], on=merge_cols, how='outer', suffixes=('', '_drop'))
+
+                # Drop any duplicate columns from the merge
+                drop_cols = [col for col in result_df.columns if col.endswith('_drop')]
+                if drop_cols:
+                    result_df = result_df.drop(columns=drop_cols)
+
+            pivoted = result_df
+            logger.debug(f"Merged dataframe has {len(pivoted)} rows and {len(pivoted.columns)} columns")
         else:
-            # There are duplicates, use the more flexible pivot_table with a first aggregation
-            logger.info("Using pivot_table with first aggregation due to duplicates")
-            pivoted = pd.pivot_table(
-                filtered,
-                values='Value',
-                index=group_cols,
-                columns='Event',
-                aggfunc='first'
-            ).reset_index()
-
-        logger.debug(f"Pivoted dataframe has {len(pivoted)} rows and {len(pivoted.columns)} columns")
-    except Exception as e:
-        logger.error(f"Error during pivot: {e}")
-
-        # Alternative approach if the above fails
-        try:
-            logger.info("Trying alternative pivot approach")
-
-            # Create a fresh copy for the alternative approach
-            filtered_alt = filtered.copy()
-
-            # Create a unique compound key from all group columns
-            # This ensures we have a unique index for the pivot
-            key_cols = [col for col in filtered_alt.columns if col not in ['Event', 'Value']]
-
-            # Convert all columns to strings and concatenate to form a unique key
-            for col in key_cols:
-                if pd.api.types.is_integer_dtype(filtered_alt[col]):
-                    filtered_alt.loc[:, col] = filtered_alt[col].astype(str)
-
-            # Create a unique key by concatenating all columns
-            filtered_alt.loc[:, '_unique_key'] = filtered_alt[key_cols].apply(
-                lambda row: '__'.join([str(v) for v in row.values]), axis=1
-            )
-
-            # Now use the unique key for pivoting
-            pivoted = pd.pivot_table(
-                filtered_alt,
-                values='Value',
-                index='_unique_key',
-                columns='Event',
-                aggfunc='first'
-            )
-
-            # Recover the original columns by splitting the index
-            key_parts = pd.DataFrame(
-                pivoted.index.map(lambda x: x.split('__')).tolist(),
-                columns=key_cols,
-                index=pivoted.index
-            )
-
-            # Join the key parts with the pivoted data
-            result = pd.concat([key_parts, pivoted.reset_index(drop=True)], axis=1)
-            pivoted = result
-
-            logger.info("Alternative pivot approach succeeded")
-        except Exception as e2:
-            logger.error(f"Both pivot approaches failed: {e2}")
+            logger.warning("No event dataframes created")
             return None
 
-    # Map columns to the target schema (Set 3)
-    # First, handle the event-based metrics
-    event_cols = {
-        "cpuuser": "value_cpuuser",
-        "gpu_usage": "value_gpu",
-        "memused": "value_memused",
-        "memused_minus_diskcache": "value_memused_minus_diskcache",
-        "nfs": "value_nfs",
-        "block": "value_block"
-    }
-
-    # Rename the event columns to their target names
-    for source, target in event_cols.items():
-        if source in pivoted.columns:
-            pivoted = pivoted.rename(columns={source: target})
+    except Exception as e:
+        logger.error(f"Error during dataframe merging: {e}")
+        return None
 
     # Map the rest of the columns
     column_mapping = {
