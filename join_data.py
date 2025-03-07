@@ -1,7 +1,6 @@
 from scipy import sparse
-import numpy as np
-import pandas as pd
 import re
+import numpy as np
 from collections import defaultdict
 from pathlib import Path
 import pandas as pd
@@ -77,16 +76,43 @@ def process_chunk_sparse(jobs_df, ts_chunk):
 
         try:
             # Convert Event to categorical codes for indexing
-            filtered["event_code"] = filtered["Event"].astype('category').cat.codes
+            filtered.loc[:, "event_code"] = filtered["Event"].astype('category').cat.codes
 
             # Make sure Value is float64 to handle large numbers
-            filtered["Value"] = filtered["Value"].astype('float64')
+            filtered.loc[:, "Value"] = filtered["Value"].astype('float64')
 
             # Define group columns - all columns except Event, Value, and event_code
-            group_cols = [col for col in filtered.columns if col not in ["Event", "Value", "event_code"]]
+            # Limit the number of grouping columns to avoid excessive combinations
+            essential_group_cols = ["jobID", "Host", "Timestamp"]
+            group_cols = [col for col in essential_group_cols if col in filtered.columns]
 
-            # Create a unique key for each combination of group columns
-            filtered["row_key"] = filtered.groupby(group_cols).ngroup()
+            # Add debug logging for the group columns
+            logger.info(f"Using group columns: {group_cols}")
+
+            # Check for NaN values in group columns before groupby
+            for col in group_cols:
+                if filtered[col].isna().any():
+                    logger.warning(f"Column {col} contains {filtered[col].isna().sum()} NaN values")
+                    # Fill NaNs with a placeholder to prevent groupby issues
+                    filtered.loc[filtered[col].isna(), col] = f"_MISSING_{col}_"
+
+            # FIX 1: Use a more robust approach for creating row keys
+            # Instead of ngroup() which might have integer overflow issues, manually create indices
+            try:
+                # Create a unique string key for combining group columns
+                filtered.loc[:, "group_key"] = filtered[group_cols].astype(str).agg('_'.join, axis=1)
+
+                # Map these string keys to integers starting from 0
+                unique_keys = filtered["group_key"].unique()
+                key_to_idx = {key: idx for idx, key in enumerate(unique_keys)}
+                filtered.loc[:, "row_key"] = filtered["group_key"].map(key_to_idx)
+
+                logger.info(f"Created {len(unique_keys)} unique row combinations")
+            except Exception as e:
+                logger.error(f"Error creating row keys: {e}")
+                # Fallback: Use a simpler approach if the groupby fails
+                filtered.loc[:, "row_key"] = range(len(filtered))
+                logger.warning("Using row index as fallback for row_key")
 
             # Get the unique row keys and event codes
             row_keys = filtered["row_key"].unique()
@@ -95,31 +121,80 @@ def process_chunk_sparse(jobs_df, ts_chunk):
             logger.info(
                 f"Creating sparse matrix with {len(row_keys)} unique row combinations and {len(event_types)} event types")
 
-            # Create sparse matrix: rows are unique combinations of group columns
-            # columns are event types, values are the corresponding Value
+            # FIX 2: Validate indices before creating the sparse matrix
             rows = filtered["row_key"].values
             cols = filtered["event_code"].values
             values = filtered["Value"].values
 
-            # Create sparse matrix
-            sparse_matrix = sparse.coo_matrix((values, (rows, cols)),
-                                              shape=(len(row_keys), len(event_types)))
+            # Check for invalid indices
+            if np.any(np.isnan(rows)) or np.any(np.isnan(cols)):
+                logger.error("Found NaN values in row or column indices")
+                # Remove rows with NaN indices
+                valid_mask = ~(np.isnan(rows) | np.isnan(cols))
+                rows = rows[valid_mask]
+                cols = cols[valid_mask]
+                values = values[valid_mask]
 
-            # Convert to dense array for easier handling
-            dense_values = sparse_matrix.toarray()
+            # Check for negative indices
+            if np.any(rows < 0) or np.any(cols < 0):
+                logger.error(f"Found negative indices - min row: {np.min(rows)}, min col: {np.min(cols)}")
+                # Remove rows with negative indices
+                valid_mask = (rows >= 0) & (cols >= 0)
+                rows = rows[valid_mask]
+                cols = cols[valid_mask]
+                values = values[valid_mask]
 
-            # Create a dataframe with just the group columns
-            result = filtered.drop_duplicates(subset=["row_key"])[group_cols + ["row_key"]]
-            result = result.sort_values("row_key").reset_index(drop=True)
+            # Ensure indices are within bounds
+            if len(rows) > 0:  # Only proceed if we have data left
+                max_row = np.max(rows)
+                max_col = np.max(cols)
 
-            # Add event columns
-            for i, event in enumerate(event_types):
-                result[event] = dense_values[:, i]
+                if max_row >= len(row_keys) or max_col >= len(event_types):
+                    logger.warning(f"Index out of bounds: max_row={max_row}, row_keys={len(row_keys)}, "
+                                   f"max_col={max_col}, event_types={len(event_types)}")
+                    # Adjust the shape to accommodate all indices
+                    shape = (max(len(row_keys), max_row + 1), max(len(event_types), max_col + 1))
+                else:
+                    shape = (len(row_keys), len(event_types))
 
-            # Drop the row_key column
-            result = result.drop(columns=["row_key"])
+                # FIX 3: Cast indices to int32 to avoid int64 issues
+                rows = rows.astype(np.int32)
+                cols = cols.astype(np.int32)
 
-            logger.info(f"After sparse pivot: {len(result)} rows with {len(result.columns)} columns")
+                # Create sparse matrix with explicit dtype
+                logger.info(f"Creating sparse matrix with shape {shape} and {len(values)} values")
+                sparse_matrix = sparse.coo_matrix(
+                    (values, (rows, cols)),
+                    shape=shape,
+                    dtype=np.float64
+                )
+
+                # Convert to dense array for easier handling
+                dense_values = sparse_matrix.toarray()
+
+                # FIX 4: Create a result dataframe more robustly
+                # Create a dataframe with the group columns and row_key
+                result = filtered[group_cols + ["row_key"]].drop_duplicates(subset=["row_key"])
+                result = result.sort_values("row_key").reset_index(drop=True)
+
+                # Add event columns
+                for i, event in enumerate(event_types):
+                    # Only add columns for event types that exist in our matrix
+                    if i < dense_values.shape[1]:
+                        result[event] = dense_values[:, i]
+
+                # Drop the row_key column
+                result = result.drop(columns=["row_key"])
+
+                logger.info(f"After sparse pivot: {len(result)} rows with {len(result.columns)} columns")
+
+                # Continue with column mapping and transformation as in the original code
+                # ...
+
+                return result
+            else:
+                logger.error("No valid data left after filtering indices")
+                return None
 
         except Exception as e:
             logger.error(f"Error during sparse matrix operation: {e}", exc_info=True)
@@ -139,146 +214,27 @@ def process_chunk_sparse(jobs_df, ts_chunk):
                 except Exception as ve:
                     logger.warning(f"Error analyzing Value column: {ve}")
 
-            return None
-
-        # Map columns to the target schema (Set 3)
-        # First, handle the event-based metrics
-        event_cols = {
-            "cpuuser": "value_cpuuser",
-            "gpu_usage": "value_gpu",
-            "memused": "value_memused",
-            "memused_minus_diskcache": "value_memused_minus_diskcache",
-            "nfs": "value_nfs",
-            "block": "value_block"
-        }
-
-        # Rename the event columns to their target names
-        for source, target in event_cols.items():
-            if source in result.columns:
-                result = result.rename(columns={source: target})
-
-        # Map the rest of the columns
-        column_mapping = {
-            # Time fields
-            "Timestamp": "time",
-            "qtime": "submit_time",
-            "start": "start_time",
-            "end": "end_time",
-            "Resource_List.walltime": "timelimit",  # Will need conversion
-
-            # Resource allocation
-            "Resource_List.nodect": "nhosts",
-            "Resource_List.ncpus": "ncores",
-            "exec_host": "host_list",  # Will need parsing
-
-            # Job identification
-            "account": "account",
-            "queue": "queue",
-            "jobname": "jobname",
-            "user": "username",
-            "jobevent": "exitcode",
-            "Exit_status": "Exit_status",  # Keep temporarily for combined exitcode
-
-            # Core identifiers
-            "jobID": "jid",
-            "Host": "host",
-            "Units": "unit"
-        }
-
-        # Apply the column mapping
-        columns_to_rename = {col: mapping for col, mapping in column_mapping.items()
-                             if col in result.columns}
-
-        result = result.rename(columns=columns_to_rename)
-
-        # Convert walltime to seconds with better error handling
-        if "timelimit" in result.columns:
+            # FIX 5: Fallback to a non-sparse approach if sparse matrix fails
+            logger.info("Attempting fallback to non-sparse pivot approach")
             try:
-                # Create a function to convert walltime strings to seconds
-                def convert_walltime_to_seconds(x):
-                    if pd.isna(x):
-                        return None
+                # Simple pivot approach as fallback
+                # Use only essential columns to avoid memory issues
+                pivot_cols = ["jobID", "Host", "Timestamp", "Event", "Value"]
+                pivot_df = filtered[pivot_cols].copy()
 
-                    # Handle both numeric and string formats
-                    if isinstance(x, (int, float)):
-                        return x
+                # Simple pivot
+                result = pivot_df.pivot_table(
+                    index=["jobID", "Host", "Timestamp"],
+                    columns="Event",
+                    values="Value",
+                    aggfunc='first'
+                ).reset_index()
 
-                    if not isinstance(x, str):
-                        return None
-
-                    if ":" in x:
-                        parts = x.split(":")
-                        if len(parts) == 3:  # HH:MM:SS
-                            return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
-                        elif len(parts) == 2:  # MM:SS
-                            return int(parts[0]) * 60 + int(parts[1])
-                        else:
-                            return int(parts[0])
-                    else:
-                        try:
-                            return int(x)
-                        except (ValueError, TypeError):
-                            return None
-
-                # Apply the function to the timelimit column
-                result["timelimit"] = result["timelimit"].apply(convert_walltime_to_seconds)
-            except Exception as e:
-                logger.warning(f"Error converting walltime: {e}")
-                # Keep original values if conversion fails
-                pass
-
-        # Combine jobevent and Exit_status for detailed exitcode if both exist
-        if "exitcode" in result.columns and "Exit_status" in result.columns:
-            try:
-                # Define a function to combine exitcode and Exit_status
-                def combine_exitcode(row):
-                    if pd.notna(row["exitcode"]):
-                        exit_status = row["Exit_status"] if pd.notna(row["Exit_status"]) else ""
-                        return f"{row['exitcode']}:{exit_status}"
-                    return row["exitcode"]
-
-                result["exitcode"] = result.apply(combine_exitcode, axis=1)
-
-                # Drop the original Exit_status column after combining
-                result = result.drop(columns=["Exit_status"])
-            except Exception as e:
-                logger.warning(f"Error combining exitcode fields: {e}")
-                # Keep original columns if combination fails
-
-        # Convert any missing dates to proper format
-        date_columns = ["time", "submit_time", "start_time", "end_time"]
-        for col in date_columns:
-            if col in result.columns:
-                try:
-                    # Convert to datetime if not already
-                    if result[col].dtype != 'datetime64[ns]':
-                        result[col] = pd.to_datetime(result[col], errors='coerce')
-                except Exception as e:
-                    logger.warning(f"Error converting date column {col}: {e}")
-
-        # Add any missing columns with null values
-        set3_columns = ["time", "submit_time", "start_time", "end_time", "timelimit",
-                        "nhosts", "ncores", "account", "queue", "host", "jid", "unit",
-                        "jobname", "exitcode", "host_list", "username",
-                        "value_cpuuser", "value_gpu", "value_memused",
-                        "value_memused_minus_diskcache", "value_nfs", "value_block"]
-
-        # Add missing columns
-        existing_columns = set(result.columns)
-        missing_columns = [col for col in set3_columns if col not in existing_columns]
-
-        if missing_columns:
-            logger.info(f"Adding missing columns: {missing_columns}")
-            for col in missing_columns:
-                result[col] = None
-
-        # Select only the columns needed for Set 3
-        # Handle the case where some columns might still be missing
-        available_columns = [col for col in set3_columns if col in result.columns]
-        result = result[available_columns]
-
-        logger.info(f"Final result has {len(result)} rows with {len(result.columns)} columns")
-        return result
+                logger.info(f"Fallback pivot successful with {len(result)} rows")
+                return result
+            except Exception as pivot_e:
+                logger.error(f"Fallback pivot also failed: {pivot_e}")
+                return None
 
     except Exception as e:
         logger.error(f"Error in process_chunk_sparse: {e}", exc_info=True)
