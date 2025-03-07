@@ -1,3 +1,6 @@
+from scipy import sparse
+import numpy as np
+import pandas as pd
 import re
 from collections import defaultdict
 from pathlib import Path
@@ -27,12 +30,12 @@ def standardize_job_id(id_series):
     return id_series.str.replace(r'^jobID', 'JOB', regex=True)
 
 
-def process_chunk(jobs_df, ts_chunk):
-    """Process a chunk of time series data against all jobs"""
+def process_chunk_sparse(jobs_df, ts_chunk):
+    """Process a chunk of time series data against all jobs using sparse matrices for memory efficiency"""
     try:
         # Check if dataframes are valid
         if jobs_df is None or jobs_df.empty or ts_chunk is None or ts_chunk.empty:
-            logger.warning("Empty dataframe passed to process_chunk")
+            logger.warning("Empty dataframe passed to process_chunk_sparse")
             return None
 
         # Log the initial join attempt
@@ -72,23 +75,70 @@ def process_chunk(jobs_df, ts_chunk):
         unique_events = filtered["Event"].unique().tolist()
         logger.info(f"Unique events: {unique_events}")
 
-        # Pivot the metrics into columns based on Event
         try:
-            # In pandas, we create the pivot table differently
-            group_cols = [col for col in filtered.columns if col not in ["Event", "Value"]]
-            result = filtered.pivot_table(
-                values="Value",
-                index=group_cols,
-                columns="Event",
-                aggfunc="first"
-            ).reset_index()
+            # Convert Event to categorical codes for indexing
+            filtered["event_code"] = filtered["Event"].astype('category').cat.codes
 
-            # Flatten the column names (pandas creates MultiIndex)
-            result.columns = [col[1] if isinstance(col, tuple) and col[0] == 'Value' else col for col in result.columns]
+            # Make sure Value is float64 to handle large numbers
+            filtered["Value"] = filtered["Value"].astype('float64')
 
-            logger.info(f"After pivot: {len(result)} rows with {len(result.columns)} columns")
+            # Define group columns - all columns except Event, Value, and event_code
+            group_cols = [col for col in filtered.columns if col not in ["Event", "Value", "event_code"]]
+
+            # Create a unique key for each combination of group columns
+            filtered["row_key"] = filtered.groupby(group_cols).ngroup()
+
+            # Get the unique row keys and event codes
+            row_keys = filtered["row_key"].unique()
+            event_types = filtered["Event"].unique()
+
+            logger.info(
+                f"Creating sparse matrix with {len(row_keys)} unique row combinations and {len(event_types)} event types")
+
+            # Create sparse matrix: rows are unique combinations of group columns
+            # columns are event types, values are the corresponding Value
+            rows = filtered["row_key"].values
+            cols = filtered["event_code"].values
+            values = filtered["Value"].values
+
+            # Create sparse matrix
+            sparse_matrix = sparse.coo_matrix((values, (rows, cols)),
+                                              shape=(len(row_keys), len(event_types)))
+
+            # Convert to dense array for easier handling
+            dense_values = sparse_matrix.toarray()
+
+            # Create a dataframe with just the group columns
+            result = filtered.drop_duplicates(subset=["row_key"])[group_cols + ["row_key"]]
+            result = result.sort_values("row_key").reset_index(drop=True)
+
+            # Add event columns
+            for i, event in enumerate(event_types):
+                result[event] = dense_values[:, i]
+
+            # Drop the row_key column
+            result = result.drop(columns=["row_key"])
+
+            logger.info(f"After sparse pivot: {len(result)} rows with {len(result.columns)} columns")
+
         except Exception as e:
-            logger.error(f"Error during pivot operation: {e}")
+            logger.error(f"Error during sparse matrix operation: {e}", exc_info=True)
+
+            # Add detailed debugging for the Value column
+            if "Value" in filtered.columns:
+                try:
+                    # Log info about the Value column
+                    value_min = filtered["Value"].min()
+                    value_max = filtered["Value"].max()
+                    value_mean = filtered["Value"].mean()
+                    value_dtype = filtered["Value"].dtype
+                    value_has_nan = filtered["Value"].isna().any()
+
+                    logger.info(f"Value column stats - Min: {value_min}, Max: {value_max}, Mean: {value_mean}, "
+                                f"Dtype: {value_dtype}, Has NaN: {value_has_nan}")
+                except Exception as ve:
+                    logger.warning(f"Error analyzing Value column: {ve}")
+
             return None
 
         # Map columns to the target schema (Set 3)
@@ -231,7 +281,7 @@ def process_chunk(jobs_df, ts_chunk):
         return result
 
     except Exception as e:
-        logger.error(f"Error in process_chunk: {e}", exc_info=True)
+        logger.error(f"Error in process_chunk_sparse: {e}", exc_info=True)
         return None
 
 
@@ -365,7 +415,7 @@ def join_job_timeseries(job_file: str, timeseries_file: str, output_file: str, c
             ts_chunk["Timestamp"] = pd.to_datetime(ts_chunk["Timestamp"], format=TS_DATETIME_FMT, errors='coerce')
 
             # Process the chunk by joining and filtering
-            result_df = process_chunk(jobs_df, ts_chunk)
+            result_df = process_chunk_sparse(jobs_df, ts_chunk)
 
             if result_df is not None and not result_df.empty:
                 # Write results to the output CSV file
