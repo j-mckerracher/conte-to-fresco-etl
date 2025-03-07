@@ -334,7 +334,7 @@ def process_year_month(year, month):
 
         # Read job data
         logger.info(f"Reading job data from {job_file_local}")
-        jobs_df = pd.read_csv(job_file_local)
+        jobs_df = pd.read_csv(job_file_local, low_memory=False)
 
         # Standardize job IDs
         jobs_df["jobID"] = standardize_job_id(jobs_df["jobID"])
