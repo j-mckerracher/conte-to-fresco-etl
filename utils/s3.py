@@ -32,8 +32,8 @@ class S3_Client():
                 retries={'max_attempts': 5, 'mode': 'standard'}
             ))
 
-    def list_s3_files(self):
-        response = self.s3_client.list_objects_v2(Bucket=self.download_bucket)
+    def list_s3_files(self, bucket):
+        response = self.s3_client.list_objects_v2(Bucket=bucket)
         files_in_s3 = []
 
         # Extract files from the initial response
@@ -43,7 +43,7 @@ class S3_Client():
         # Handle pagination if there are more objects
         while response.get('IsTruncated', False):
             response = self.s3_client.list_objects_v2(
-                Bucket=self.download_bucket,
+                Bucket=bucket,
                 ContinuationToken=response.get('NextContinuationToken')
             )
             if 'Contents' in response:

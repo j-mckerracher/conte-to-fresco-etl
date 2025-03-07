@@ -4,10 +4,7 @@ import re
 import json
 import os
 import logging
-from tqdm import tqdm
 from utils.s3 import S3_Client
-import pathlib
-from datetime import datetime
 import shutil
 from pathlib import Path
 import time
@@ -264,8 +261,7 @@ def get_year_month_combinations():
     # Get files from proc metric bucket (data-transform-conte)
     proc_metric_files = []
     try:
-        s3_client.download_bucket_proc_metric = "data-transform-conte"
-        proc_metric_files = s3_client.list_s3_files()
+        proc_metric_files = s3_client.list_s3_files(bucket="data-transform-conte")
         logger.info(f"Found {len(proc_metric_files)} files in proc metric bucket")
     except Exception as e:
         logger.error(f"Error listing proc metric files: {e}")
@@ -273,8 +269,7 @@ def get_year_month_combinations():
     # Get files from job accounting bucket (conte-job-accounting)
     job_accounting_files = []
     try:
-        s3_client.download_bucket = "conte-job-accounting"
-        job_accounting_files = s3_client.list_s3_files()
+        job_accounting_files = s3_client.list_s3_files("conte-job-accounting")
         logger.info(f"Found {len(job_accounting_files)} files in job accounting bucket")
     except Exception as e:
         logger.error(f"Error listing job accounting files: {e}")
