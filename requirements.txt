@@ -8,3 +8,5 @@ psutil>=5.9.0
 pathlib>=1.0.1
 urllib3>=1.25.4,<1.27
 polars~=1.16.0
+tenacity~=9.0.0
+tqdm~=4.67.1
