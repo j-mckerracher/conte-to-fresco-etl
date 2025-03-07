@@ -1,15 +1,13 @@
 import re
 from collections import defaultdict
 from pathlib import Path
-import polars as pl
-from tqdm import tqdm
+import pandas as pd
 import os
 import boto3
 from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
 from botocore.exceptions import BotoCoreError, ClientError
 import logging
 from botocore.config import Config
-
 
 conte_ts_bucket = "data-transform-conte"
 conte_job_bucket = "conte-job-accounting"
@@ -23,49 +21,45 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def standardize_job_id(id_series: pl.Series) -> pl.Series:
+def standardize_job_id(id_series):
     """Convert jobIDxxxxx to JOBxxxxx"""
-    return (
-        pl.when(id_series.str.contains('^jobID'))
-        .then(pl.concat_str([pl.lit('JOB'), id_series.str.slice(5)]))
-        .otherwise(id_series)
-    )
+    # Use pandas string methods for the equivalent operation
+    return id_series.str.replace(r'^jobID', 'JOB', regex=True)
 
 
-def process_chunk(jobs_df: pl.DataFrame, ts_chunk: pl.DataFrame) -> pl.DataFrame:
+def process_chunk(jobs_df, ts_chunk):
     """Process a chunk of time series data against all jobs"""
     try:
         # Check if dataframes are valid
-        if jobs_df is None or jobs_df.height == 0 or ts_chunk is None or ts_chunk.height == 0:
+        if jobs_df is None or jobs_df.empty or ts_chunk is None or ts_chunk.empty:
             logger.warning("Empty dataframe passed to process_chunk")
             return None
 
         # Log the initial join attempt
-        logger.info(f"Joining {ts_chunk.height} time series rows with {jobs_df.height} job rows")
+        logger.info(f"Joining {len(ts_chunk)} time series rows with {len(jobs_df)} job rows")
 
         # Join time series chunk with jobs data on jobID
-        joined = ts_chunk.join(
+        joined = pd.merge(
+            ts_chunk,
             jobs_df,
             left_on="Job Id",
             right_on="jobID",
             how="inner"
         )
 
-        logger.info(f"Join result has {joined.height} rows")
+        logger.info(f"Join result has {len(joined)} rows")
 
         # Filter timestamps that fall between job start and end times
         # Add null handling to prevent filtering issues
-        filtered = joined.filter(
-            pl.col("Timestamp").is_not_null() &
-            pl.col("start").is_not_null() &
-            pl.col("end").is_not_null() &
-            (pl.col("Timestamp") >= pl.col("start")) &
-            (pl.col("Timestamp") <= pl.col("end"))
-        )
+        filtered = joined[(joined["Timestamp"].notna()) &
+                          (joined["start"].notna()) &
+                          (joined["end"].notna()) &
+                          (joined["Timestamp"] >= joined["start"]) &
+                          (joined["Timestamp"] <= joined["end"])]
 
-        logger.info(f"After time filtering: {filtered.height} rows")
+        logger.info(f"After time filtering: {len(filtered)} rows")
 
-        if filtered.height == 0:
+        if filtered.empty:
             logger.warning("No rows remained after time filtering")
             return None
 
@@ -75,21 +69,24 @@ def process_chunk(jobs_df: pl.DataFrame, ts_chunk: pl.DataFrame) -> pl.DataFrame
             return None
 
         # Get unique events for debugging
-        unique_events = filtered.select(pl.col("Event").unique()).to_series().to_list()
+        unique_events = filtered["Event"].unique().tolist()
         logger.info(f"Unique events: {unique_events}")
 
         # Pivot the metrics into columns based on Event
         try:
+            # In pandas, we create the pivot table differently
             group_cols = [col for col in filtered.columns if col not in ["Event", "Value"]]
-
-            result = filtered.pivot(
+            result = filtered.pivot_table(
                 values="Value",
                 index=group_cols,
-                on="Event",
-                aggregate_function="first"
-            )
+                columns="Event",
+                aggfunc="first"
+            ).reset_index()
 
-            logger.info(f"After pivot: {result.height} rows with {len(result.columns)} columns")
+            # Flatten the column names (pandas creates MultiIndex)
+            result.columns = [col[1] if isinstance(col, tuple) and col[0] == 'Value' else col for col in result.columns]
+
+            logger.info(f"After pivot: {len(result)} rows with {len(result.columns)} columns")
         except Exception as e:
             logger.error(f"Error during pivot operation: {e}")
             return None
@@ -108,7 +105,7 @@ def process_chunk(jobs_df: pl.DataFrame, ts_chunk: pl.DataFrame) -> pl.DataFrame
         # Rename the event columns to their target names
         for source, target in event_cols.items():
             if source in result.columns:
-                result = result.rename({source: target})
+                result = result.rename(columns={source: target})
 
         # Map the rest of the columns
         column_mapping = {
@@ -142,16 +139,39 @@ def process_chunk(jobs_df: pl.DataFrame, ts_chunk: pl.DataFrame) -> pl.DataFrame
         columns_to_rename = {col: mapping for col, mapping in column_mapping.items()
                              if col in result.columns}
 
-        result = result.rename(columns_to_rename)
+        result = result.rename(columns=columns_to_rename)
 
         # Convert walltime to seconds with better error handling
         if "timelimit" in result.columns:
             try:
-                result = result.with_columns([
-                    pl.when(pl.col("timelimit").is_not_null())
-                    .then(convert_walltime_to_seconds(pl.col("timelimit")))
-                    .otherwise(None).alias("timelimit")
-                ])
+                # Create a function to convert walltime strings to seconds
+                def convert_walltime_to_seconds(x):
+                    if pd.isna(x):
+                        return None
+
+                    # Handle both numeric and string formats
+                    if isinstance(x, (int, float)):
+                        return x
+
+                    if not isinstance(x, str):
+                        return None
+
+                    if ":" in x:
+                        parts = x.split(":")
+                        if len(parts) == 3:  # HH:MM:SS
+                            return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+                        elif len(parts) == 2:  # MM:SS
+                            return int(parts[0]) * 60 + int(parts[1])
+                        else:
+                            return int(parts[0])
+                    else:
+                        try:
+                            return int(x)
+                        except (ValueError, TypeError):
+                            return None
+
+                # Apply the function to the timelimit column
+                result["timelimit"] = result["timelimit"].apply(convert_walltime_to_seconds)
             except Exception as e:
                 logger.warning(f"Error converting walltime: {e}")
                 # Keep original values if conversion fails
@@ -160,18 +180,17 @@ def process_chunk(jobs_df: pl.DataFrame, ts_chunk: pl.DataFrame) -> pl.DataFrame
         # Combine jobevent and Exit_status for detailed exitcode if both exist
         if "exitcode" in result.columns and "Exit_status" in result.columns:
             try:
-                result = result.with_columns([
-                    pl.concat_str([
-                        pl.col("exitcode"),
-                        pl.lit(":"),
-                        pl.when(pl.col("Exit_status").is_not_null())
-                        .then(pl.col("Exit_status").cast(pl.Utf8))
-                        .otherwise(pl.lit(""))
-                    ]).alias("exitcode")
-                ])
+                # Define a function to combine exitcode and Exit_status
+                def combine_exitcode(row):
+                    if pd.notna(row["exitcode"]):
+                        exit_status = row["Exit_status"] if pd.notna(row["Exit_status"]) else ""
+                        return f"{row['exitcode']}:{exit_status}"
+                    return row["exitcode"]
+
+                result["exitcode"] = result.apply(combine_exitcode, axis=1)
 
                 # Drop the original Exit_status column after combining
-                result = result.drop("Exit_status")
+                result = result.drop(columns=["Exit_status"])
             except Exception as e:
                 logger.warning(f"Error combining exitcode fields: {e}")
                 # Keep original columns if combination fails
@@ -181,15 +200,9 @@ def process_chunk(jobs_df: pl.DataFrame, ts_chunk: pl.DataFrame) -> pl.DataFrame
         for col in date_columns:
             if col in result.columns:
                 try:
-                    result = result.with_columns([
-                        pl.when(
-                            pl.col(col).is_not_null() &
-                            ~pl.col(col).dtype.is_temporal()
-                        )
-                        .then(pl.col(col).cast(pl.Datetime))
-                        .otherwise(pl.col(col))
-                        .alias(col)
-                    ])
+                    # Convert to datetime if not already
+                    if result[col].dtype != 'datetime64[ns]':
+                        result[col] = pd.to_datetime(result[col], errors='coerce')
                 except Exception as e:
                     logger.warning(f"Error converting date column {col}: {e}")
 
@@ -206,19 +219,15 @@ def process_chunk(jobs_df: pl.DataFrame, ts_chunk: pl.DataFrame) -> pl.DataFrame
 
         if missing_columns:
             logger.info(f"Adding missing columns: {missing_columns}")
-            # Create expressions for each missing column
-            exprs = [pl.lit(None).alias(col) for col in missing_columns]
-
-            # Add missing columns to the dataframe
-            if exprs:
-                result = result.with_columns(exprs)
+            for col in missing_columns:
+                result[col] = None
 
         # Select only the columns needed for Set 3
         # Handle the case where some columns might still be missing
         available_columns = [col for col in set3_columns if col in result.columns]
-        result = result.select(available_columns)
+        result = result[available_columns]
 
-        logger.info(f"Final result has {result.height} rows with {len(result.columns)} columns")
+        logger.info(f"Final result has {len(result)} rows with {len(result.columns)} columns")
         return result
 
     except Exception as e:
@@ -226,47 +235,25 @@ def process_chunk(jobs_df: pl.DataFrame, ts_chunk: pl.DataFrame) -> pl.DataFrame
         return None
 
 
-def convert_walltime_to_seconds(walltime_expr):
-    """Convert HH:MM:SS format to seconds"""
-    # For expressions, we can't check the dtype directly
-    # Instead, use conditional logic to handle numeric and string cases
-
-    return (
-        pl.when(walltime_expr.str.contains(":"))
-        .then(
-            walltime_expr.str.split(":")
-            .list.eval(
-                pl.element().cast(pl.Int64) *
-                pl.when(pl.list.len() == 3).then(pl.Int64([3600, 60, 1]))
-                .when(pl.list.len() == 2).then(pl.Int64([60, 1]))
-                .otherwise(pl.Int64([1]))
-            )
-            .list.sum()
-        )
-        # Try to cast directly to Int64 for numeric values
-        .otherwise(walltime_expr.cast(pl.Int64))
-    )
-
-
 def debug_dataframe(df, name, sample_size=5):
     """Helper function to print debug information about a dataframe"""
     logger.info(f"--- Debug info for {name} ---")
     logger.info(f"Shape: {df.shape}")
-    logger.info(f"Columns: {df.columns}")
-    logger.info(f"Schema: {df.schema}")
+    logger.info(f"Columns: {df.columns.tolist()}")
+    logger.info(f"Data types: {df.dtypes}")
 
     # Sample data
-    if df.height > 0:
+    if not df.empty:
         logger.info(f"Sample data:")
         sample = df.head(sample_size)
-        for row in sample.rows(named=True):
-            logger.info(f"  {row}")
+        for _, row in sample.iterrows():
+            logger.info(f"  {row.to_dict()}")
 
     # Check for null values
     for col in df.columns:
-        null_count = df.filter(pl.col(col).is_null()).height
+        null_count = df[col].isna().sum()
         if null_count > 0:
-            logger.info(f"Column '{col}' has {null_count} null values ({null_count / df.height:.2%})")
+            logger.info(f"Column '{col}' has {null_count} null values ({null_count / len(df):.2%})")
 
     logger.info(f"--- End debug info for {name} ---")
 
@@ -285,44 +272,32 @@ def join_job_timeseries(job_file: str, timeseries_file: str, output_file: str, c
         # First approach: Try reading directly with dtype overrides and inference
         jobs_df = None
         try:
-            jobs_df = pl.read_csv(
-                job_file,
-                infer_schema_length=10000,
-                schema_overrides={
-                    "Resource_List.neednodes": pl.Utf8,
-                    "Resource_List.nodes": pl.Utf8,
-                    "Resource_List.nodect": pl.Utf8,
-                    "Resource_List.ncpus": pl.Utf8,
-                    "Resource_List.neednodes.ppn": pl.Utf8,
-                    "Resource_List.nodes.ppn": pl.Utf8,
-                    "Resource_List.mem": pl.Utf8,
-                    "Resource_List.pmem": pl.Utf8,
-                    "Resource_List.walltime": pl.Utf8,
-                }
-            )
+            # Use string dtypes for all problematic columns
+            dtype_overrides = {
+                "Resource_List.neednodes": str,
+                "Resource_List.nodes": str,
+                "Resource_List.nodect": str,
+                "Resource_List.ncpus": str,
+                "Resource_List.neednodes.ppn": str,
+                "Resource_List.nodes.ppn": str,
+                "Resource_List.mem": str,
+                "Resource_List.pmem": str,
+                "Resource_List.walltime": str,
+            }
+
+            jobs_df = pd.read_csv(job_file, dtype=dtype_overrides)
         except Exception as e:
             logger.warning(f"First attempt to read job file failed: {e}")
 
-            # Second approach: Try reading with ignore_errors=True
+            # Second approach: Try reading with error_bad_lines=False (changed to on_bad_lines='skip' in pandas 1.3+)
             try:
-                jobs_df = pl.read_csv(
+                jobs_df = pd.read_csv(
                     job_file,
-                    ignore_errors=True,
-                    infer_schema_length=10000,
-                    schema_overrides={
-                        "Resource_List.neednodes": pl.Utf8,
-                        "Resource_List.nodes": pl.Utf8,
-                        "Resource_List.nodect": pl.Utf8,
-                        "Resource_List.ncpus": pl.Utf8,
-                        "Resource_List.neednodes.ppn": pl.Utf8,
-                        "Resource_List.nodes.ppn": pl.Utf8,
-                        "Resource_List.mem": pl.Utf8,
-                        "Resource_List.pmem": pl.Utf8,
-                        "Resource_List.walltime": pl.Utf8,
-                    }
+                    on_bad_lines='skip',  # Use this for pandas >= 1.3.0
+                    dtype=dtype_overrides
                 )
             except Exception as e:
-                logger.warning(f"Second attempt with ignore_errors failed: {e}")
+                logger.warning(f"Second attempt with on_bad_lines='skip' failed: {e}")
 
                 # Last resort: Try reading with low-level settings to ensure it works
                 try:
@@ -333,40 +308,31 @@ def join_job_timeseries(job_file: str, timeseries_file: str, output_file: str, c
                     column_names = header_line.split(',')
 
                     # Create a schema that forces all columns to strings
-                    schema = {col: pl.Utf8 for col in column_names}
+                    dtype = {col: str for col in column_names}
 
-                    jobs_df = pl.read_csv(
+                    jobs_df = pd.read_csv(
                         job_file,
-                        schema=schema,
-                        ignore_errors=True,
-                        null_values=["", "NULL", "null", "NODE390"]  # Add known problematic values
+                        dtype=dtype,
+                        on_bad_lines='skip',
+                        na_values=["", "NULL", "null", "NODE390"]  # Add known problematic values
                     )
                 except Exception as e:
                     logger.error(f"All attempts to read job file failed: {e}")
                     return
 
-        if jobs_df is None or jobs_df.height == 0:
+        if jobs_df is None or jobs_df.empty:
             logger.error("Failed to read job file or file is empty")
             return
 
-        logger.info(f"Successfully read job file with {jobs_df.height} rows")
+        logger.info(f"Successfully read job file with {len(jobs_df)} rows")
 
         # Standardize job IDs
-        jobs_df = jobs_df.with_columns([
-            standardize_job_id(pl.col("jobID")).alias("jobID")
-        ])
+        jobs_df["jobID"] = standardize_job_id(jobs_df["jobID"])
 
         # Handle datetime columns with explicit null checks
-        # Use str.lengths() > 0 instead of str.len() > 0 for string length
-        jobs_df = jobs_df.with_columns([
-            pl.when(pl.col("start").is_not_null() & (pl.col("start").str.length() > 0))
-            .then(pl.col("start").str.strptime(pl.Datetime, JOB_DATETIME_FMT))
-            .otherwise(None).alias("start"),
-
-            pl.when(pl.col("end").is_not_null() & (pl.col("end").str.length() > 0))
-            .then(pl.col("end").str.strptime(pl.Datetime, JOB_DATETIME_FMT))
-            .otherwise(None).alias("end")
-        ])
+        # Convert "start" and "end" columns to datetime
+        jobs_df["start"] = pd.to_datetime(jobs_df["start"], format=JOB_DATETIME_FMT, errors='coerce')
+        jobs_df["end"] = pd.to_datetime(jobs_df["end"], format=JOB_DATETIME_FMT, errors='coerce')
 
         # Convert numeric columns safely
         numeric_cols = [
@@ -376,60 +342,40 @@ def join_job_timeseries(job_file: str, timeseries_file: str, output_file: str, c
 
         for col in numeric_cols:
             if col in jobs_df.columns:
-                jobs_df = jobs_df.with_columns([
-                    pl.when(
-                        pl.col(col).is_not_null() &
-                        pl.col(col).cast(pl.Utf8).str.contains(r'^[0-9]+$')
-                    )
-                    .then(pl.col(col).cast(pl.Int64))
-                    .otherwise(pl.col(col))
-                    .alias(col)
-                ])
+                # Use pandas numeric conversion with error handling
+                jobs_df[col] = pd.to_numeric(jobs_df[col], errors='coerce')
 
         # Print the job data schema for debugging
-        logger.info(f"Job data schema: {jobs_df.schema}")
+        logger.info(f"Job data columns: {jobs_df.columns.tolist()}")
+        logger.info(f"Job data types: {jobs_df.dtypes}")
 
         print("Processing time series data in chunks...")
 
-        # Read the time series data
-        ts_reader = pl.read_csv(timeseries_file)
-        total_rows = ts_reader.height
-        chunks = range(0, total_rows, chunk_size)
+        # Read the time series data in chunks
+        # Initialize the writer for output
         first_chunk = True
 
-        for chunk_start in tqdm(chunks):
-            chunk_end = min(chunk_start + chunk_size, total_rows)
-            ts_chunk = ts_reader[chunk_start:chunk_end]
+        # Use chunksize for efficient processing of large CSV files
+        for i, ts_chunk in enumerate(pd.read_csv(timeseries_file, chunksize=chunk_size)):
+            chunk_start = i * chunk_size
+            chunk_end = chunk_start + len(ts_chunk)
+            logger.info(f"Processing chunk {i + 1}: rows {chunk_start}-{chunk_end}")
 
             # Convert the Timestamp column to datetime using the timeseries format
-            ts_chunk = ts_chunk.with_columns([
-                pl.col("Timestamp").str.strptime(pl.Datetime, TS_DATETIME_FMT)
-            ])
+            ts_chunk["Timestamp"] = pd.to_datetime(ts_chunk["Timestamp"], format=TS_DATETIME_FMT, errors='coerce')
 
             # Process the chunk by joining and filtering
             result_df = process_chunk(jobs_df, ts_chunk)
 
-            if result_df is not None and result_df.height > 0:
+            if result_df is not None and not result_df.empty:
                 # Write results to the output CSV file
                 if first_chunk:
                     # Write with headers for first chunk
-                    result_df.write_csv(output_file, include_header=True)
+                    result_df.to_csv(output_file, index=False)
                     first_chunk = False
                 else:
-                    # For subsequent chunks, append by writing to a temporary file and concatenating
-                    temp_file = output_file + '.tmp'
-                    result_df.write_csv(temp_file, include_header=False)
-
-                    # Read the temporary file content
-                    with open(temp_file, 'r', encoding='utf-8') as temp:
-                        content = temp.read()
-
-                    # Append to the main file
-                    with open(output_file, 'a', encoding='utf-8') as main:
-                        main.write(content)
-
-                    # Clean up temporary file
-                    os.remove(temp_file)
+                    # For subsequent chunks, append without headers
+                    result_df.to_csv(output_file, mode='a', header=False, index=False)
             else:
                 logger.warning(f"No matching data found for chunk {chunk_start}-{chunk_end}")
 
@@ -464,7 +410,7 @@ def list_s3_files(bucket):
     # Handle pagination if there are more objects
     while response.get('IsTruncated', False):
         response = s3_client.list_objects_v2(
-            Bucket=conte_ts_bucket,
+            Bucket=bucket,
             ContinuationToken=response.get('NextContinuationToken')
         )
         if 'Contents' in response:
@@ -575,9 +521,9 @@ if __name__ == "__main__":
                 for temp_file in os.listdir(cache_dir):
                     try:
                         if not temp_file.startswith("combined_"):  # Skip already combined files
-                            df = pl.read_csv(Path(cache_dir / temp_file))
+                            df = pd.read_csv(cache_dir / temp_file)
                             dfs.append(df)
-                            logger.info(f"Read {temp_file} with {df.height} rows")
+                            logger.info(f"Read {temp_file} with {len(df)} rows")
                     except Exception as e:
                         logger.error(f"Error reading {temp_file}: {e}")
 
@@ -588,9 +534,9 @@ if __name__ == "__main__":
 
                 # Combine and save time series data
                 combined_ts_file = cache_dir / f"combined_{date}.csv"
-                combined_df = pl.concat(dfs)
-                combined_df.write_csv(combined_ts_file)
-                logger.info(f"Combined {len(dfs)} files into {combined_ts_file} with {combined_df.height} rows")
+                combined_df = pd.concat(dfs, ignore_index=True)
+                combined_df.to_csv(combined_ts_file, index=False)
+                logger.info(f"Combined {len(dfs)} files into {combined_ts_file} with {len(combined_df)} rows")
                 del combined_df  # Free memory
 
                 # Clean up individual time series files
