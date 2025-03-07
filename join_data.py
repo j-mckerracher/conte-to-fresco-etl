@@ -319,8 +319,7 @@ def process_year_month(year, month):
 
         # Find all time series files for this year/month
         ts_pattern = f".*_{year}_{month}.*\.csv"
-        s3_client.download_bucket = "data-transform-conte"
-        all_files = s3_client.list_s3_files()
+        all_files = s3_client.list_s3_files("data-transform-conte")
         ts_files = [f for f in all_files if re.match(ts_pattern, f)]
 
         if not ts_files:
