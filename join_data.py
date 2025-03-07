@@ -127,23 +127,53 @@ def process_chunk(jobs_df, ts_chunk):
     if filtered.empty:
         return None
 
-    # Pivot the metrics into columns based on Event
+    # Instead of pivot_table, use groupby and unstack to handle the large integers
     try:
-        pivoted = filtered.pivot_table(
-            values="Value",
-            index=[col for col in filtered.columns if col not in ["Event", "Value"]],
-            columns="Event",
-            aggfunc="first"
-        ).reset_index()
+        # Create a unique index for each row to avoid duplicates during groupby
+        filtered['_row_id'] = range(len(filtered))
 
-        # Flatten the MultiIndex columns if created by pivot_table
-        if isinstance(pivoted.columns, pd.MultiIndex):
-            pivoted.columns = [col[1] if col[1] != '' else col[0] for col in pivoted.columns]
+        # Group by all columns except Event and Value, then pivot manually
+        group_cols = [col for col in filtered.columns if col not in ["Event", "Value", "_row_id"]]
+
+        # First create a series indexed by all groupby columns + Event
+        event_series = filtered.set_index(group_cols + ["Event"])["Value"]
+
+        # Then unstack the Event level to create columns
+        unstacked = event_series.unstack(level="Event")
+
+        # Reset index to convert back to DataFrame
+        pivoted = unstacked.reset_index()
 
         logger.debug(f"Pivoted dataframe has {len(pivoted)} rows and {len(pivoted.columns)} columns")
     except Exception as e:
         logger.error(f"Error during pivot: {e}")
-        return None
+
+        # Alternative approach if the above fails
+        try:
+            logger.info("Trying alternative pivot approach")
+
+            # Convert any problematic integer columns to strings
+            for col in filtered.columns:
+                if pd.api.types.is_integer_dtype(filtered[col]):
+                    filtered[col] = filtered[col].astype(str)
+
+            # Use traditional pivot_table with string-converted columns
+            pivoted = pd.pivot_table(
+                filtered,
+                values="Value",
+                index=group_cols,
+                columns="Event",
+                aggfunc="first"
+            ).reset_index()
+
+            # Flatten the MultiIndex columns
+            if isinstance(pivoted.columns, pd.MultiIndex):
+                pivoted.columns = [col[1] if col[1] != '' else col[0] for col in pivoted.columns]
+
+            logger.info("Alternative pivot approach succeeded")
+        except Exception as e2:
+            logger.error(f"Both pivot approaches failed: {e2}")
+            return None
 
     # Map columns to the target schema (Set 3)
     # First, handle the event-based metrics
@@ -335,6 +365,18 @@ def process_year_month(year, month):
         # Read job data
         logger.info(f"Reading job data from {job_file_local}")
         jobs_df = pd.read_csv(job_file_local, low_memory=False)
+
+        # convert problematic large integers to strings
+        int_columns = jobs_df.select_dtypes(include=['int64']).columns
+        for col in int_columns:
+            # Check if any values exceed C long limit
+            try:
+                if jobs_df[col].max() > 2147483647 or jobs_df[col].min() < -2147483648:
+                    logger.info(f"Converting column {col} to string due to large integer values")
+                    jobs_df[col] = jobs_df[col].astype(str)
+            except (TypeError, ValueError, OverflowError) as e:
+                logger.info(f"Converting column {col} to string due to potential overflow: {e}")
+                jobs_df[col] = jobs_df[col].astype(str)
 
         # Standardize job IDs
         jobs_df["jobID"] = standardize_job_id(jobs_df["jobID"])
