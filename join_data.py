@@ -120,29 +120,45 @@ def process_chunk(jobs_df, ts_chunk):
     filtered = joined[
         (joined["Timestamp"] >= joined["start"]) &
         (joined["Timestamp"] <= joined["end"])
-        ]
+        ].copy()  # Create explicit copy to avoid SettingWithCopyWarning
 
     logger.debug(f"Filtered dataframe has {len(filtered)} rows")
 
     if filtered.empty:
         return None
 
-    # Instead of pivot_table, use groupby and unstack to handle the large integers
+    # Try different pivoting approaches to handle the data
     try:
-        # Create a unique index for each row to avoid duplicates during groupby
-        filtered['_row_id'] = range(len(filtered))
+        # First approach: Use groupby + agg to create a pivot
+        # Add a dummy column to distinguish duplicate rows
+        filtered.loc[:, '_row_id'] = range(len(filtered))
 
-        # Group by all columns except Event and Value, then pivot manually
-        group_cols = [col for col in filtered.columns if col not in ["Event", "Value", "_row_id"]]
+        # Group by Event and all other columns except Value
+        value_cols = ['Value', '_row_id']
+        group_cols = [col for col in filtered.columns if col not in value_cols]
 
-        # First create a series indexed by all groupby columns + Event
-        event_series = filtered.set_index(group_cols + ["Event"])["Value"]
+        # First group to find duplicates in the index
+        grouped = filtered.groupby(group_cols + ['Event'])
 
-        # Then unstack the Event level to create columns
-        unstacked = event_series.unstack(level="Event")
-
-        # Reset index to convert back to DataFrame
-        pivoted = unstacked.reset_index()
+        # If there are no duplicates, use the faster pivot approach
+        if grouped.size().max() == 1:
+            # Use traditional pivot
+            group_cols = [col for col in filtered.columns if col not in ['Event', 'Value']]
+            pivoted = filtered.pivot(
+                index=group_cols,
+                columns='Event',
+                values='Value'
+            ).reset_index()
+        else:
+            # There are duplicates, use the more flexible pivot_table with a first aggregation
+            logger.info("Using pivot_table with first aggregation due to duplicates")
+            pivoted = pd.pivot_table(
+                filtered,
+                values='Value',
+                index=group_cols,
+                columns='Event',
+                aggfunc='first'
+            ).reset_index()
 
         logger.debug(f"Pivoted dataframe has {len(pivoted)} rows and {len(pivoted.columns)} columns")
     except Exception as e:
@@ -152,23 +168,42 @@ def process_chunk(jobs_df, ts_chunk):
         try:
             logger.info("Trying alternative pivot approach")
 
-            # Convert any problematic integer columns to strings
-            for col in filtered.columns:
-                if pd.api.types.is_integer_dtype(filtered[col]):
-                    filtered[col] = filtered[col].astype(str)
+            # Create a fresh copy for the alternative approach
+            filtered_alt = filtered.copy()
 
-            # Use traditional pivot_table with string-converted columns
+            # Create a unique compound key from all group columns
+            # This ensures we have a unique index for the pivot
+            key_cols = [col for col in filtered_alt.columns if col not in ['Event', 'Value']]
+
+            # Convert all columns to strings and concatenate to form a unique key
+            for col in key_cols:
+                if pd.api.types.is_integer_dtype(filtered_alt[col]):
+                    filtered_alt.loc[:, col] = filtered_alt[col].astype(str)
+
+            # Create a unique key by concatenating all columns
+            filtered_alt.loc[:, '_unique_key'] = filtered_alt[key_cols].apply(
+                lambda row: '__'.join([str(v) for v in row.values]), axis=1
+            )
+
+            # Now use the unique key for pivoting
             pivoted = pd.pivot_table(
-                filtered,
-                values="Value",
-                index=group_cols,
-                columns="Event",
-                aggfunc="first"
-            ).reset_index()
+                filtered_alt,
+                values='Value',
+                index='_unique_key',
+                columns='Event',
+                aggfunc='first'
+            )
 
-            # Flatten the MultiIndex columns
-            if isinstance(pivoted.columns, pd.MultiIndex):
-                pivoted.columns = [col[1] if col[1] != '' else col[0] for col in pivoted.columns]
+            # Recover the original columns by splitting the index
+            key_parts = pd.DataFrame(
+                pivoted.index.map(lambda x: x.split('__')).tolist(),
+                columns=key_cols,
+                index=pivoted.index
+            )
+
+            # Join the key parts with the pivoted data
+            result = pd.concat([key_parts, pivoted.reset_index(drop=True)], axis=1)
+            pivoted = result
 
             logger.info("Alternative pivot approach succeeded")
         except Exception as e2:
