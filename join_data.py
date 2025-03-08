@@ -4,9 +4,8 @@ import re
 import json
 import os
 import logging
-from utils.s3 import S3_Client
-import shutil
 from pathlib import Path
+import shutil
 import time
 
 # Configure logging
@@ -16,16 +15,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Initialize S3 client
-s3_client = S3_Client(
-    upload_bucket="conte-transformed",
-    download_bucket_job_accounting="conte-job-accounting",
-    download_bucket_proc_metric="data-transform-conte"
-)
+# Define new file paths
+JOB_ACCOUNTING_PATH = Path("P:/Conte/conte-job-accounting-1")
+PROC_METRIC_PATH = Path("P:/Conte/conte-ts-to-fresco-ts-1")
+OUTPUT_PATH = Path("P:/Conte/conte-transformed-2")
 
 # Create cache directory
 CACHE_DIR = Path("./cache")
 CACHE_DIR.mkdir(exist_ok=True)
+
+# Ensure output directory exists
+OUTPUT_PATH.mkdir(exist_ok=True, parents=True)
 
 
 def standardize_job_id(job_id_series):
@@ -274,34 +274,27 @@ def check_disk_space():
 
 
 def get_year_month_combinations():
-    """Get all year-month combinations from both buckets"""
-    logger.info("Getting list of files from S3 buckets...")
+    """Get all year-month combinations from both local directories"""
+    logger.info("Getting list of files from local directories...")
 
-    # Get files from proc metric bucket (data-transform-conte)
-    proc_metric_files = []
-    try:
-        proc_metric_files = s3_client.list_s3_files(bucket="data-transform-conte")
-        logger.info(f"Found {len(proc_metric_files)} files in proc metric bucket")
-    except Exception as e:
-        logger.error(f"Error listing proc metric files: {e}")
+    # Get files from proc metric directory (parquet files)
+    proc_metric_files = list(PROC_METRIC_PATH.glob("*.parquet"))
+    logger.info(f"Found {len(proc_metric_files)} files in proc metric directory")
 
-    # Get files from job accounting bucket (conte-job-accounting)
-    job_accounting_files = []
-    try:
-        job_accounting_files = s3_client.list_s3_files("conte-job-accounting")
-        logger.info(f"Found {len(job_accounting_files)} files in job accounting bucket")
-    except Exception as e:
-        logger.error(f"Error listing job accounting files: {e}")
+    # Get files from job accounting directory (CSV files)
+    job_accounting_files = list(JOB_ACCOUNTING_PATH.glob("*.csv"))
+    logger.info(f"Found {len(job_accounting_files)} files in job accounting directory")
 
     # Extract year-month from filenames
     proc_metrics_years_months = set()
-    for filename in proc_metric_files:
+    for filepath in proc_metric_files:
+        filename = filepath.name
         if '_ts_' in filename:
-            # Example: FRESCO_Conte_ts_2015_03_v1.csv
+            # Example: FRESCO_Conte_ts_2015_03_v1.parquet
             parts = filename.split('_')
             if len(parts) >= 5 and parts[3].isdigit() and parts[4].isdigit():
                 proc_metrics_years_months.add((parts[3], parts[4]))
-        elif re.match(r'.*_\d{4}_\d{2}.*\.csv', filename):
+        elif re.match(r'.*_\d{4}_\d{2}.*\.parquet', filename):
             # Other filename patterns with year-month
             matches = re.findall(r'_(\d{4})_(\d{2})_', filename)
             if matches:
@@ -309,7 +302,8 @@ def get_year_month_combinations():
                 proc_metrics_years_months.add((year, month))
 
     job_accounting_years_months = set()
-    for filename in job_accounting_files:
+    for filepath in job_accounting_files:
+        filename = filepath.name
         if match := re.match(r'(\d{4})-(\d{2})\.csv', filename):
             year, month = match.groups()
             job_accounting_years_months.add((year, month))
@@ -330,16 +324,12 @@ def process_year_month(year, month):
     temp_dir.mkdir(exist_ok=True)
 
     try:
-        # Download job accounting file
-        job_file_s3 = f"{year}-{month}.csv"
-        job_file_local = temp_dir / job_file_s3
-        logger.info(f"Downloading job file: {job_file_s3}")
-        s3_client.download_file(job_file_s3, temp_dir, "job")
+        # Get job accounting file
+        job_file = JOB_ACCOUNTING_PATH / f"{year}-{month}.csv"
 
         # Find all time series files for this year/month
-        ts_pattern = f".*_{year}_{month}.*\.csv"
-        all_files = s3_client.list_s3_files("data-transform-conte")
-        ts_files = [f for f in all_files if re.match(ts_pattern, f)]
+        ts_pattern = f".*_{year}_{month}.*\.parquet"
+        ts_files = list(PROC_METRIC_PATH.glob(ts_pattern))
 
         if not ts_files:
             logger.warning(f"No time series files found for {year}-{month}")
@@ -347,13 +337,13 @@ def process_year_month(year, month):
             return
 
         # Create output file
-        output_file = temp_dir / f"transformed_{year}_{month}.csv"
+        output_file = OUTPUT_PATH / f"transformed_{year}_{month}.parquet"
         output_file_tmp = temp_dir / f"transformed_{year}_{month}_tmp.csv"
         first_ts_file = True
 
         # Read job data
-        logger.info(f"Reading job data from {job_file_local}")
-        jobs_df = pd.read_csv(job_file_local, low_memory=False)
+        logger.info(f"Reading job data from {job_file}")
+        jobs_df = pd.read_csv(job_file, low_memory=False)
 
         # convert problematic large integers to strings
         int_columns = jobs_df.select_dtypes(include=['int64']).columns
@@ -378,37 +368,34 @@ def process_year_month(year, month):
                 jobs_df[col] = pd.to_datetime(jobs_df[col], format=JOB_DATETIME_FMT, errors='coerce')
 
         # Process each time series file
-        for ts_file_idx, ts_file_s3 in enumerate(ts_files):
-            logger.info(f"Processing TS file {ts_file_idx + 1}/{len(ts_files)}: {ts_file_s3}")
-
-            # Download time series file
-            ts_file_local = temp_dir / os.path.basename(ts_file_s3)
-            try:
-                s3_client.download_file(ts_file_s3, temp_dir, "proc")
-            except Exception as e:
-                logger.error(f"Failed to download {ts_file_s3}: {e}")
-                continue
+        for ts_file_idx, ts_file in enumerate(ts_files):
+            logger.info(f"Processing TS file {ts_file_idx + 1}/{len(ts_files)}: {ts_file}")
 
             # Process time series file in chunks
             chunk_size = 100_000
             first_chunk = first_ts_file
-            logger.info(f"Reading time series data in chunks from {ts_file_local}")
+            logger.info(f"Reading time series data in chunks from {ts_file}")
 
             try:
-                # Read time series file in chunks
-                TS_DATETIME_FMT = "%Y-%m-%d %H:%M:%S"
-                chunk_reader = pd.read_csv(ts_file_local, chunksize=chunk_size)
+                # Read time series file - using pyarrow for parquet files
+                ts_df = pd.read_parquet(ts_file)
 
-                for chunk_idx, ts_chunk in enumerate(chunk_reader):
+                # Process in chunks to maintain memory efficiency
+                for i in range(0, len(ts_df), chunk_size):
+                    # Extract chunk
+                    ts_chunk = ts_df.iloc[i:i + chunk_size].copy()
+
                     # Check disk space periodically
-                    if chunk_idx % 5 == 0:
+                    if i % (5 * chunk_size) == 0:
                         check_disk_space()
 
+                    chunk_idx = i // chunk_size
                     logger.info(f"Processing chunk {chunk_idx + 1} with {len(ts_chunk)} rows")
 
-                    # Convert the Timestamp column to datetime
-                    ts_chunk["Timestamp"] = pd.to_datetime(ts_chunk["Timestamp"], format=TS_DATETIME_FMT,
-                                                           errors='coerce')
+                    # Ensure Timestamp is datetime
+                    if "Timestamp" in ts_chunk.columns and not pd.api.types.is_datetime64_any_dtype(
+                            ts_chunk["Timestamp"]):
+                        ts_chunk["Timestamp"] = pd.to_datetime(ts_chunk["Timestamp"], errors='coerce')
 
                     # Process the chunk
                     result_df = process_chunk(jobs_df, ts_chunk)
@@ -421,23 +408,16 @@ def process_year_month(year, month):
                         else:
                             result_df.to_csv(output_file_tmp, mode='a', header=False, index=False)
 
-                # Remove the time series file after processing
-                ts_file_local.unlink()
-
             except Exception as e:
-                logger.error(f"Error processing {ts_file_local}: {e}")
-                if ts_file_local.exists():
-                    ts_file_local.unlink()
+                logger.error(f"Error processing {ts_file}: {e}")
 
             first_ts_file = False
 
-        # Upload the final output file to S3
+        # Convert final CSV to parquet and save to output directory
         if output_file_tmp.exists() and output_file_tmp.stat().st_size > 0:
-            logger.info(f"Renaming {output_file_tmp} to {output_file}")
-            output_file_tmp.rename(output_file)
-
-            logger.info(f"Uploading processed data for {year}-{month} to S3")
-            s3_client.upload_file_to_s3(str(output_file), s3_client.upload_bucket)
+            logger.info(f"Converting CSV to parquet and saving to {output_file}")
+            final_df = pd.read_csv(output_file_tmp)
+            final_df.to_parquet(output_file, index=False)
         else:
             logger.warning(f"No output generated for {year}-{month}")
 
