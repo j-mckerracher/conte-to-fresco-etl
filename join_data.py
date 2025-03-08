@@ -4,9 +4,15 @@ import re
 import json
 import os
 import logging
+import multiprocessing as mp
 from pathlib import Path
 import shutil
 import time
+import psutil
+import pyarrow as pa
+import pyarrow.parquet as pq
+import gc
+from tqdm import tqdm
 
 # Configure logging
 logging.basicConfig(
@@ -15,7 +21,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Define new file paths
+# Define file paths
 JOB_ACCOUNTING_PATH = Path("P:/Conte/conte-job-accounting-1")
 PROC_METRIC_PATH = Path("P:/Conte/conte-ts-to-fresco-ts-1")
 OUTPUT_PATH = Path("P:/Conte/conte-transformed-2")
@@ -27,6 +33,44 @@ CACHE_DIR.mkdir(exist_ok=True)
 # Ensure output directory exists
 OUTPUT_PATH.mkdir(exist_ok=True, parents=True)
 
+# Configuration
+MAX_WORKERS = max(1, mp.cpu_count() - 1)  # Leave one CPU core free
+MIN_FREE_MEMORY_GB = 2.0  # Minimum free memory to maintain in GB
+MIN_FREE_DISK_GB = 5.0  # Minimum free disk space to maintain in GB
+
+
+def get_memory_usage():
+    """Get current memory usage in GB"""
+    process = psutil.Process(os.getpid())
+    memory_gb = process.memory_info().rss / (1024 * 1024 * 1024)
+    return memory_gb
+
+
+def get_available_memory():
+    """Get available system memory in GB"""
+    return psutil.virtual_memory().available / (1024 * 1024 * 1024)
+
+
+def get_free_disk_space():
+    """Get free disk space in GB"""
+    _, _, free = shutil.disk_usage("/")
+    return free / (1024 * 1024 * 1024)
+
+
+def calculate_chunk_size(current_size=100_000):
+    """Dynamically calculate chunk size based on available memory"""
+    available_memory_gb = get_available_memory()
+
+    # Adjust chunk size based on available memory
+    if available_memory_gb < MIN_FREE_MEMORY_GB:
+        # Reduce chunk size if memory is low
+        return max(10_000, current_size // 2)
+    elif available_memory_gb > MIN_FREE_MEMORY_GB * 3:
+        # Increase chunk size if plenty of memory is available
+        return min(500_000, current_size * 2)
+
+    return current_size
+
 
 def standardize_job_id(job_id_series):
     """Convert jobIDxxxxx to JOBxxxxx"""
@@ -34,76 +78,106 @@ def standardize_job_id(job_id_series):
 
 
 def convert_walltime_to_seconds(walltime_series):
-    """Convert HH:MM:SS format to seconds"""
+    """Vectorized conversion of HH:MM:SS format to seconds"""
+    if walltime_series.empty:
+        return walltime_series
 
-    def parse_time(time_str):
-        if pd.isna(time_str):
-            return np.nan
-        if not isinstance(time_str, str):
-            return float(time_str)
+    # Handle NaN values
+    mask_na = walltime_series.isna()
+    result = pd.Series(index=walltime_series.index, dtype=float)
+    result[mask_na] = np.nan
 
-        parts = time_str.split(':')
-        if len(parts) == 3:  # HH:MM:SS
-            return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
-        elif len(parts) == 2:  # MM:SS
-            return int(parts[0]) * 60 + int(parts[1])
-        else:
-            try:
-                return float(time_str)
-            except (ValueError, TypeError):
-                return np.nan
+    # Only process non-NaN values
+    to_process = walltime_series[~mask_na]
 
-    return walltime_series.apply(parse_time)
+    # Handle numeric values
+    mask_numeric = pd.to_numeric(to_process, errors='coerce').notna()
+    result.loc[to_process[mask_numeric].index] = pd.to_numeric(to_process[mask_numeric])
+
+    # Handle string time formats
+    str_times = to_process[~mask_numeric]
+
+    # Process HH:MM:SS format
+    mask_hhmmss = str_times.str.count(':') == 2
+    if mask_hhmmss.any():
+        hhmmss = str_times[mask_hhmmss].str.split(':', expand=True).astype(float)
+        result.loc[hhmmss.index] = hhmmss[0] * 3600 + hhmmss[1] * 60 + hhmmss[2]
+
+    # Process MM:SS format
+    mask_mmss = (str_times.str.count(':') == 1) & (~mask_hhmmss)
+    if mask_mmss.any():
+        mmss = str_times[mask_mmss].str.split(':', expand=True).astype(float)
+        result.loc[mmss.index] = mmss[0] * 60 + mmss[1]
+
+    return result
 
 
 def parse_host_list(exec_host_series):
     """Parse exec_host into a list of hosts in JSON format"""
+    # Handle empty series
+    if exec_host_series.empty:
+        return exec_host_series
 
-    def extract_hosts(host_str):
-        if pd.isna(host_str):
-            return None
+    # Create a mask for non-null string values
+    mask = exec_host_series.notna() & exec_host_series.apply(lambda x: isinstance(x, str))
 
-        # Example format: "NODE407/0-15+NODE476/0-15"
-        if isinstance(host_str, str):
-            # Extract unique node names using regex
-            nodes = re.findall(r'([^/+]+)/', host_str)
-            unique_nodes = list(set(nodes))
-            # Return as JSON format string to match example
-            return json.dumps(unique_nodes).replace('"', '')
-        return None
+    # Initialize result series with same index and None values
+    result = pd.Series([None] * len(exec_host_series), index=exec_host_series.index)
 
-    return exec_host_series.apply(extract_hosts)
+    if mask.any():
+        # Extract node names using regular expression
+        node_pattern = re.compile(r'([^/+]+)/')
+
+        # Apply the extraction only on valid strings
+        valid_hosts = exec_host_series[mask]
+
+        # Extract all matches for each string
+        extracted = valid_hosts.apply(lambda x: node_pattern.findall(x))
+
+        # Get unique nodes and convert to JSON format
+        unique_nodes = extracted.apply(lambda x: json.dumps(list(set(x))).replace('"', '') if x else None)
+
+        # Update only the processed values
+        result[mask] = unique_nodes
+
+    return result
 
 
-def get_exit_status_description(jobevent_series, exit_status_series):
-    """Convert exit status to descriptive text"""
+def get_exit_status_description(df):
+    """Vectorized conversion of exit status to descriptive text"""
+    # Check if required columns exist
+    if 'jobevent' not in df.columns or 'Exit_status' not in df.columns:
+        return pd.Series([None] * len(df), index=df.index)
 
-    def get_description(row):
-        jobevent = row['jobevent'] if not pd.isna(row['jobevent']) else ''
-        exit_status = row['Exit_status'] if not pd.isna(row['Exit_status']) else ''
+    # Initialize with empty strings
+    jobevent = df['jobevent'].fillna('')
+    exit_status = df['Exit_status'].fillna('')
 
-        if jobevent == 'E' and exit_status == '0':
-            return 'COMPLETED'
-        elif jobevent == 'E':
-            return f'FAILED:{exit_status}'
-        elif jobevent == 'A':
-            return 'ABORTED'
-        elif jobevent == 'S':
-            return 'STARTED'
-        elif jobevent == 'Q':
-            return 'QUEUED'
-        else:
-            return f'{jobevent}:{exit_status}'
+    # Create result series
+    result = pd.Series(index=df.index, dtype='object')
 
-    return pd.DataFrame({
-        'jobevent': jobevent_series,
-        'Exit_status': exit_status_series
-    }).apply(get_description, axis=1)
+    # Apply conditions using vectorized operations
+    result[(jobevent == 'E') & (exit_status == '0')] = 'COMPLETED'
+    result[(jobevent == 'E') & (exit_status != '0')] = 'FAILED:' + exit_status[(jobevent == 'E') & (exit_status != '0')]
+    result[jobevent == 'A'] = 'ABORTED'
+    result[jobevent == 'S'] = 'STARTED'
+    result[jobevent == 'Q'] = 'QUEUED'
+
+    # Handle remaining cases
+    mask_other = ~result.notna()
+    if mask_other.any():
+        result[mask_other] = jobevent[mask_other] + ':' + exit_status[mask_other]
+
+    return result
 
 
 def process_chunk(jobs_df, ts_chunk):
     """Process a chunk of time series data against all jobs"""
     logger.debug(f"Processing chunk with {len(ts_chunk)} rows against {len(jobs_df)} jobs")
+
+    # Ensure Timestamp is datetime
+    if "Timestamp" in ts_chunk.columns and not pd.api.types.is_datetime64_any_dtype(ts_chunk["Timestamp"]):
+        ts_chunk["Timestamp"] = pd.to_datetime(ts_chunk["Timestamp"], errors='coerce')
 
     # Join time series chunk with jobs data on jobID
     joined = pd.merge(
@@ -114,73 +188,50 @@ def process_chunk(jobs_df, ts_chunk):
         how="inner"
     )
 
+    # Release memory from the input chunks since they're no longer needed
+    del ts_chunk
+    gc.collect()
+
     logger.debug(f"Joined dataframe has {len(joined)} rows")
 
+    if joined.empty:
+        return None
+
     # Filter timestamps that fall between job start and end times
-    filtered = joined[
-        (joined["Timestamp"] >= joined["start"]) &
-        (joined["Timestamp"] <= joined["end"])
-        ].copy()  # Create explicit copy to avoid SettingWithCopyWarning
+    mask = (joined["Timestamp"] >= joined["start"]) & (joined["Timestamp"] <= joined["end"])
+    filtered = joined.loc[mask].copy()  # Create explicit copy to avoid SettingWithCopyWarning
+
+    # Release memory from joined dataframe
+    del joined
+    gc.collect()
 
     logger.debug(f"Filtered dataframe has {len(filtered)} rows")
 
     if filtered.empty:
         return None
 
-    # Skip the pivot operation completely and use a different approach
-    try:
-        # Get unique Events
-        events = filtered['Event'].unique()
+    # More efficient event processing
+    events = filtered['Event'].unique()
 
-        # Create a list to hold dataframes for each event
-        event_dfs = []
-
-        # Process each event type separately
-        for event in events:
-            # Filter rows for this event
-            event_data = filtered[filtered['Event'] == event].copy()
-
-            # Rename the Value column to include the event name
-            if event in ["cpuuser", "gpu_usage", "memused", "memused_minus_diskcache", "nfs", "block"]:
-                event_data = event_data.rename(columns={'Value': f'value_{event}'})
-            else:
-                event_data = event_data.rename(columns={'Value': event})
-
-            # Drop the Event column since it's now encoded in the column name
-            event_data = event_data.drop(columns=['Event'])
-
-            event_dfs.append(event_data)
-
-        # If we have any event dataframes
-        if event_dfs:
-            # Start with the first event dataframe
-            result_df = event_dfs[0]
-
-            # Merge in each additional event dataframe
-            for i in range(1, len(event_dfs)):
-                # Get columns to merge on (all except the value columns)
-                value_cols = [col for col in event_dfs[i].columns if col.startswith('value_') or col in events]
-                merge_cols = [col for col in event_dfs[i].columns if col not in value_cols]
-
-                # Merge with the result
-                result_df = pd.merge(result_df, event_dfs[i], on=merge_cols, how='outer', suffixes=('', '_drop'))
-
-                # Drop any duplicate columns from the merge
-                drop_cols = [col for col in result_df.columns if col.endswith('_drop')]
-                if drop_cols:
-                    result_df = result_df.drop(columns=drop_cols)
-
-            pivoted = result_df
-            logger.debug(f"Merged dataframe has {len(pivoted)} rows and {len(pivoted.columns)} columns")
+    # Process directly without creating multiple dataframes
+    # Create all necessary columns first
+    for event in events:
+        if event in ["cpuuser", "gpu_usage", "memused", "memused_minus_diskcache", "nfs", "block"]:
+            col_name = f'value_{event}'
         else:
-            logger.warning("No event dataframes created")
-            return None
+            col_name = event
 
-    except Exception as e:
-        logger.error(f"Error during dataframe merging: {e}")
-        return None
+        # Create the column with NaN values
+        filtered[col_name] = np.nan
 
-    # Map the rest of the columns
+        # Fill values only for matching event rows
+        event_mask = filtered['Event'] == event
+        filtered.loc[event_mask, col_name] = filtered.loc[event_mask, 'Value']
+
+    # Pivot data by dropping Event and Value columns (no longer needed)
+    pivoted = filtered.drop(columns=['Event', 'Value'])
+
+    # Map columns efficiently
     column_mapping = {
         # Time fields
         "Timestamp": "time",
@@ -207,23 +258,20 @@ def process_chunk(jobs_df, ts_chunk):
         "Units": "unit"
     }
 
-    # Apply the column mapping
-    pivoted = pivoted.rename(columns={col: mapping for col, mapping in column_mapping.items()
-                                      if col in pivoted.columns})
+    # Only rename columns that exist
+    existing_cols = {col: mapping for col, mapping in column_mapping.items() if col in pivoted.columns}
+    pivoted = pivoted.rename(columns=existing_cols)
 
-    # Process special cases that need calculation or parsing
+    # Process special cases
     if "timelimit" in pivoted.columns:
         pivoted["timelimit"] = convert_walltime_to_seconds(pivoted["timelimit"])
 
     if "host_list" in pivoted.columns:
         pivoted["host_list"] = parse_host_list(pivoted["host_list"])
 
-    # Generate exitcode from jobevent and Exit_status
+    # Generate exitcode from jobevent and Exit_status using vectorized approach
     if "jobevent" in pivoted.columns:
-        pivoted["exitcode"] = get_exit_status_description(
-            pivoted["jobevent"],
-            pivoted["Exit_status"] if "Exit_status" in pivoted.columns else pd.Series([None] * len(pivoted))
-        )
+        pivoted["exitcode"] = get_exit_status_description(pivoted)
 
         # Remove the source columns after processing
         columns_to_drop = [col for col in ["jobevent", "Exit_status"] if col in pivoted.columns]
@@ -234,43 +282,61 @@ def process_chunk(jobs_df, ts_chunk):
     set3_columns = ["time", "submit_time", "start_time", "end_time", "timelimit",
                     "nhosts", "ncores", "account", "queue", "host", "jid", "unit",
                     "jobname", "exitcode", "host_list", "username",
-                    "value_cpuuser", "value_gpu", "value_memused",
+                    "value_cpuuser", "value_gpu_usage", "value_memused",
                     "value_memused_minus_diskcache", "value_nfs", "value_block"]
 
+    # Add missing columns
     for col in set3_columns:
         if col not in pivoted.columns:
             pivoted[col] = np.nan
 
-    # Convert datetime columns to the expected timezone format
+    # Convert datetime columns to UTC timezone
     datetime_cols = ["time", "submit_time", "start_time", "end_time"]
     for col in datetime_cols:
-        if col in pivoted.columns and not pd.isna(pivoted[col]).all():
+        if col in pivoted.columns and pivoted[col].notna().any():
             try:
-                pivoted[col] = pivoted[col].dt.tz_localize('UTC')
+                # Check if timezone info already exists
+                sample_dt = pivoted.loc[pivoted[col].first_valid_index(), col]
+                if hasattr(sample_dt, 'tzinfo') and sample_dt.tzinfo is None:
+                    pivoted[col] = pivoted[col].dt.tz_localize('UTC')
             except (TypeError, AttributeError):
                 logger.warning(f"Failed to localize timezone for {col}. Skipping.")
 
-    # Select only the columns needed for Set 3 and ensure correct order
-    result = pivoted[set3_columns]
+    # Select only the columns needed for output and ensure correct order
+    # Use a list comprehension to ensure we only include columns that exist
+    available_columns = [col for col in set3_columns if col in pivoted.columns]
+    result = pivoted[available_columns]
 
     return result
 
 
-def check_disk_space():
-    """Check available disk space and clean up if less than 5GB available"""
-    _, _, free = shutil.disk_usage("/")
-    free_gb = free / (1024 * 1024 * 1024)
-
-    if free_gb < 5:
-        logger.warning(f"Low disk space: {free_gb:.2f}GB free. Cleaning up cache...")
-        try:
-            # Remove all files from cache directory
+def clean_up_cache():
+    """Clean up the cache directory"""
+    try:
+        if CACHE_DIR.exists():
+            logger.info("Cleaning up cache directory...")
             for file_path in CACHE_DIR.glob("*"):
                 if file_path.is_file():
                     file_path.unlink()
-            logger.info("Cache directory cleaned.")
-        except Exception as e:
-            logger.error(f"Error cleaning cache: {e}")
+                elif file_path.is_dir():
+                    shutil.rmtree(file_path)
+    except Exception as e:
+        logger.error(f"Error cleaning cache: {e}")
+
+
+def check_and_optimize_resources():
+    """Check resources and optimize if needed"""
+    # Check disk space
+    free_disk_gb = get_free_disk_space()
+    if free_disk_gb < MIN_FREE_DISK_GB:
+        logger.warning(f"Low disk space: {free_disk_gb:.2f}GB free. Cleaning up cache...")
+        clean_up_cache()
+
+    # Check memory
+    free_memory_gb = get_available_memory()
+    if free_memory_gb < MIN_FREE_MEMORY_GB:
+        logger.warning(f"Low memory: {free_memory_gb:.2f}GB free. Forcing garbage collection...")
+        gc.collect()
 
 
 def get_year_month_combinations():
@@ -279,32 +345,42 @@ def get_year_month_combinations():
 
     # Get files from proc metric directory (parquet files)
     proc_metric_files = list(PROC_METRIC_PATH.glob("*.parquet"))
-    logger.info(f"Found {len(proc_metric_files)} files in proc metric directory")
+    logger.info(f"Found {len(proc_metric_files)} files in proc metric directory (parquet)")
 
     # Get files from job accounting directory (CSV files)
     job_accounting_files = list(JOB_ACCOUNTING_PATH.glob("*.csv"))
-    logger.info(f"Found {len(job_accounting_files)} files in job accounting directory")
+    logger.info(f"Found {len(job_accounting_files)} files in job accounting directory (CSV)")
 
-    # Extract year-month from filenames
+    # Extract year-month from filenames more efficiently
     proc_metrics_years_months = set()
+
+    # Compile regex patterns once for better performance
+    fresco_pattern = re.compile(r'FRESCO_Conte_ts_(\d{4})_(\d{2})_v\d+\.parquet')
+    other_pattern = re.compile(r'_(\d{4})_(\d{2})_')
+
     for filepath in proc_metric_files:
         filename = filepath.name
-        if '_ts_' in filename:
-            # Example: FRESCO_Conte_ts_2015_03_v1.parquet
-            parts = filename.split('_')
-            if len(parts) >= 5 and parts[3].isdigit() and parts[4].isdigit():
-                proc_metrics_years_months.add((parts[3], parts[4]))
-        elif re.match(r'.*_\d{4}_\d{2}.*\.parquet', filename):
-            # Other filename patterns with year-month
-            matches = re.findall(r'_(\d{4})_(\d{2})_', filename)
-            if matches:
-                year, month = matches[0]
-                proc_metrics_years_months.add((year, month))
+
+        # Try the FRESCO pattern first
+        match = fresco_pattern.search(filename)
+        if match:
+            year, month = match.groups()
+            proc_metrics_years_months.add((year, month))
+            continue
+
+        # Try the other pattern
+        matches = other_pattern.findall(filename)
+        if matches:
+            year, month = matches[0]
+            proc_metrics_years_months.add((year, month))
+
+    # Compile job accounting pattern
+    job_pattern = re.compile(r'(\d{4})-(\d{2})\.csv')
 
     job_accounting_years_months = set()
     for filepath in job_accounting_files:
-        filename = filepath.name
-        if match := re.match(r'(\d{4})-(\d{2})\.csv', filename):
+        match = job_pattern.match(filepath.name)
+        if match:
             year, month = match.groups()
             job_accounting_years_months.add((year, month))
 
@@ -315,127 +391,199 @@ def get_year_month_combinations():
     return common_years_months
 
 
+def optimize_dataframe_dtypes(df):
+    """Optimize DataFrame memory usage by changing data types"""
+    # Convert object columns that are mostly numeric to appropriate numeric types
+    for col in df.select_dtypes(include=['object']).columns:
+        # Try to convert to numeric if appropriate
+        try:
+            num_values = pd.to_numeric(df[col], errors='coerce')
+            # If most values can be converted to numeric, convert the column
+            if num_values.notna().sum() / len(df) > 0.8:
+                df[col] = num_values
+                # Downcast to the smallest possible numeric type
+                if df[col].notna().any():
+                    if (df[col].dropna() % 1 == 0).all():
+                        # It's an integer
+                        df[col] = pd.to_numeric(df[col], downcast='integer')
+                    else:
+                        # It's a float
+                        df[col] = pd.to_numeric(df[col], downcast='float')
+        except (TypeError, ValueError):
+            pass
+
+    # Convert string columns with low cardinality to category type
+    for col in df.select_dtypes(include=['object']).columns:
+        # Check for string columns
+        if df[col].apply(lambda x: isinstance(x, str)).all():
+            # If less than 50% unique values, convert to category
+            if df[col].nunique() / len(df) < 0.5:
+                df[col] = df[col].astype('category')
+
+    return df
+
+
+def process_ts_file(ts_file, jobs_df, output_writer, first_file=False):
+    """Process a single time series file"""
+    logger.info(f"Processing TS file: {ts_file}")
+
+    try:
+        # Read time series file using pyarrow for better performance
+        # Make sure we're reading a parquet file
+        ts_df = pq.read_table(ts_file).to_pandas()
+
+        # Free some memory for the processing
+        check_and_optimize_resources()
+
+        # Initial chunk size
+        chunk_size = 100_000
+
+        # Process in chunks
+        for i in range(0, len(ts_df), chunk_size):
+            # Dynamically adjust chunk size based on available memory
+            chunk_size = calculate_chunk_size(chunk_size)
+
+            # Extract chunk
+            ts_chunk = ts_df.iloc[i:i + chunk_size].copy()
+
+            chunk_idx = i // chunk_size
+            logger.info(f"Processing chunk {chunk_idx + 1} with {len(ts_chunk)} rows")
+
+            # Process the chunk
+            result_df = process_chunk(jobs_df, ts_chunk)
+
+            # Free memory
+            del ts_chunk
+            gc.collect()
+
+            if result_df is not None and not result_df.empty:
+                # Optimize the result dataframe
+                result_df = optimize_dataframe_dtypes(result_df)
+
+                # Convert to pyarrow table and write to parquet
+                table = pa.Table.from_pandas(result_df)
+                output_writer.write_table(table)
+
+                # Release memory
+                del result_df, table
+                gc.collect()
+
+        # Release memory from the dataframe
+        del ts_df
+        gc.collect()
+
+        return True
+    except Exception as e:
+        logger.error(f"Error processing {ts_file}: {e}")
+        return False
+
+
 def process_year_month(year, month):
     """Process a specific year-month combination"""
     logger.info(f"Processing year: {year}, month: {month}")
 
-    # Create temp directory for this year-month
-    temp_dir = CACHE_DIR / f"{year}_{month}"
-    temp_dir.mkdir(exist_ok=True)
+    # Check resources before starting
+    check_and_optimize_resources()
 
     try:
-        # Get job accounting file
+        # Get job accounting file (CSV)
         job_file = JOB_ACCOUNTING_PATH / f"{year}-{month}.csv"
 
-        # Find all time series files for this year/month
+        # Find all time series files (Parquet) for this year/month
         ts_pattern = f".*_{year}_{month}.*\.parquet"
         ts_files = list(PROC_METRIC_PATH.glob(ts_pattern))
 
         if not ts_files:
             logger.warning(f"No time series files found for {year}-{month}")
-            shutil.rmtree(temp_dir)
             return
 
-        # Create output file
+        # Create output file path (will be Parquet)
         output_file = OUTPUT_PATH / f"transformed_{year}_{month}.parquet"
-        output_file_tmp = temp_dir / f"transformed_{year}_{month}_tmp.csv"
-        first_ts_file = True
 
-        # Read job data
-        logger.info(f"Reading job data from {job_file}")
+        # Read job data from CSV file
+        logger.info(f"Reading job data from CSV file: {job_file}")
+
+        # Read with optimized dtypes
         jobs_df = pd.read_csv(job_file, low_memory=False)
 
-        # convert problematic large integers to strings
-        int_columns = jobs_df.select_dtypes(include=['int64']).columns
-        for col in int_columns:
+        # Optimize datatypes for memory efficiency
+        jobs_df = optimize_dataframe_dtypes(jobs_df)
+
+        # Handle problematic large integers
+        for col in jobs_df.select_dtypes(include=['int64']).columns:
             # Check if any values exceed C long limit
             try:
                 if jobs_df[col].max() > 2147483647 or jobs_df[col].min() < -2147483648:
-                    logger.info(f"Converting column {col} to string due to large integer values")
                     jobs_df[col] = jobs_df[col].astype(str)
-            except (TypeError, ValueError, OverflowError) as e:
-                logger.info(f"Converting column {col} to string due to potential overflow: {e}")
+            except (TypeError, ValueError, OverflowError):
                 jobs_df[col] = jobs_df[col].astype(str)
 
         # Standardize job IDs
         jobs_df["jobID"] = standardize_job_id(jobs_df["jobID"])
 
-        # Convert datetime columns using the job data format
-        JOB_DATETIME_FMT = "%m/%d/%Y %H:%M:%S"
+        # Convert datetime columns
         datetime_cols = ["ctime", "qtime", "etime", "start", "end", "timestamp"]
         for col in datetime_cols:
             if col in jobs_df.columns:
-                jobs_df[col] = pd.to_datetime(jobs_df[col], format=JOB_DATETIME_FMT, errors='coerce')
+                jobs_df[col] = pd.to_datetime(jobs_df[col], format="%m/%d/%Y %H:%M:%S", errors='coerce')
 
-        # Process each time series file
-        for ts_file_idx, ts_file in enumerate(ts_files):
-            logger.info(f"Processing TS file {ts_file_idx + 1}/{len(ts_files)}: {ts_file}")
+        # Create parquet schema for output file
+        schema = pa.schema([
+            ('time', pa.timestamp('ns', tz='UTC')),
+            ('submit_time', pa.timestamp('ns', tz='UTC')),
+            ('start_time', pa.timestamp('ns', tz='UTC')),
+            ('end_time', pa.timestamp('ns', tz='UTC')),
+            ('timelimit', pa.float64()),
+            ('nhosts', pa.float64()),
+            ('ncores', pa.float64()),
+            ('account', pa.string()),
+            ('queue', pa.string()),
+            ('host', pa.string()),
+            ('jid', pa.string()),
+            ('unit', pa.string()),
+            ('jobname', pa.string()),
+            ('exitcode', pa.string()),
+            ('host_list', pa.string()),
+            ('username', pa.string()),
+            ('value_cpuuser', pa.float64()),
+            ('value_gpu_usage', pa.float64()),
+            ('value_memused', pa.float64()),
+            ('value_memused_minus_diskcache', pa.float64()),
+            ('value_nfs', pa.float64()),
+            ('value_block', pa.float64())
+        ])
 
-            # Process time series file in chunks
-            chunk_size = 100_000
-            first_chunk = first_ts_file
-            logger.info(f"Reading time series data in chunks from {ts_file}")
+        # Create PyArrow ParquetWriter for better performance
+        with pq.ParquetWriter(str(output_file), schema, compression='snappy') as writer:
+            # Process the files sequentially with a shared writer
+            # ParquetWriter can't be shared across processes safely
+            for i, ts_file in enumerate(ts_files):
+                logger.info(f"Processing file {i + 1}/{len(ts_files)}: {ts_file.name}")
+                process_ts_file(ts_file, jobs_df, writer, i == 0)
 
-            try:
-                # Read time series file - using pyarrow for parquet files
-                ts_df = pd.read_parquet(ts_file)
-
-                # Process in chunks to maintain memory efficiency
-                for i in range(0, len(ts_df), chunk_size):
-                    # Extract chunk
-                    ts_chunk = ts_df.iloc[i:i + chunk_size].copy()
-
-                    # Check disk space periodically
-                    if i % (5 * chunk_size) == 0:
-                        check_disk_space()
-
-                    chunk_idx = i // chunk_size
-                    logger.info(f"Processing chunk {chunk_idx + 1} with {len(ts_chunk)} rows")
-
-                    # Ensure Timestamp is datetime
-                    if "Timestamp" in ts_chunk.columns and not pd.api.types.is_datetime64_any_dtype(
-                            ts_chunk["Timestamp"]):
-                        ts_chunk["Timestamp"] = pd.to_datetime(ts_chunk["Timestamp"], errors='coerce')
-
-                    # Process the chunk
-                    result_df = process_chunk(jobs_df, ts_chunk)
-
-                    if result_df is not None and not result_df.empty:
-                        # Write results to the output CSV file
-                        if first_chunk:
-                            result_df.to_csv(output_file_tmp, index=False)
-                            first_chunk = False
-                        else:
-                            result_df.to_csv(output_file_tmp, mode='a', header=False, index=False)
-
-            except Exception as e:
-                logger.error(f"Error processing {ts_file}: {e}")
-
-            first_ts_file = False
-
-        # Convert final CSV to parquet and save to output directory
-        if output_file_tmp.exists() and output_file_tmp.stat().st_size > 0:
-            logger.info(f"Converting CSV to parquet and saving to {output_file}")
-            final_df = pd.read_csv(output_file_tmp)
-            final_df.to_parquet(output_file, index=False)
+        # Check if the output file was created properly
+        if output_file.exists() and output_file.stat().st_size > 0:
+            logger.info(f"Successfully created {output_file}")
         else:
             logger.warning(f"No output generated for {year}-{month}")
 
-        # Clean up
-        logger.info(f"Cleaning up temporary files for {year}-{month}")
-        shutil.rmtree(temp_dir)
+        # Clear memory
+        del jobs_df
+        gc.collect()
 
     except Exception as e:
         logger.error(f"Error processing {year}-{month}: {e}")
-        if temp_dir.exists():
-            shutil.rmtree(temp_dir)
 
 
 def main():
     """Main function to process all year-month combinations"""
     logger.info("Starting data transformation process")
+    start_time = time.time()
 
     try:
+        # Initial cleanup
+        clean_up_cache()
+
         # Get all year-month combinations
         year_month_combinations = get_year_month_combinations()
 
@@ -443,35 +591,42 @@ def main():
             logger.warning("No common year-month combinations found to process")
             return
 
-        # Process each year-month combination
-        for idx, (year, month) in enumerate(sorted(year_month_combinations)):
-            logger.info(f"Processing combination {idx + 1}/{len(year_month_combinations)}: {year}-{month}")
-            process_year_month(year, month)
+        # Sort combinations for ordered processing
+        sorted_combinations = sorted(year_month_combinations)
 
-            # Check disk space after each combination
-            check_disk_space()
+        # Determine if we can use multiprocessing for year-month combinations
+        if MAX_WORKERS > 1 and len(sorted_combinations) > 1:
+            logger.info(f"Processing {len(sorted_combinations)} combinations in parallel with {MAX_WORKERS} workers")
 
-        logger.info("Data transformation process completed successfully")
+            # Create a pool of workers
+            with mp.Pool(min(MAX_WORKERS, len(sorted_combinations))) as pool:
+                # Map the year-month combinations to the process_year_month function
+                pool.starmap(process_year_month, sorted_combinations)
+        else:
+            logger.info(f"Processing {len(sorted_combinations)} combinations sequentially")
 
+            # Process each year-month combination sequentially with a progress bar
+            for idx, (year, month) in enumerate(tqdm(sorted_combinations, desc="Processing year-month combinations")):
+                logger.info(f"Processing combination {idx + 1}/{len(sorted_combinations)}: {year}-{month}")
+                process_year_month(year, month)
+
+                # Check resources after each combination
+                check_and_optimize_resources()
+
+        # Final cleanup
+        clean_up_cache()
+
+        elapsed_time = time.time() - start_time
+        logger.info(f"Data transformation process completed successfully in {elapsed_time:.2f} seconds")
+
+    except KeyboardInterrupt:
+        logger.info("Process interrupted by user")
     except Exception as e:
         logger.error(f"Error in main process: {e}")
     finally:
         # Final cleanup
-        if CACHE_DIR.exists():
-            logger.info("Performing final cleanup")
-            try:
-                for file_path in CACHE_DIR.glob("*"):
-                    if file_path.is_file():
-                        file_path.unlink()
-                    elif file_path.is_dir():
-                        shutil.rmtree(file_path)
-                logger.info("Final cleanup completed")
-            except Exception as e:
-                logger.error(f"Error during final cleanup: {e}")
+        clean_up_cache()
 
 
 if __name__ == "__main__":
-    start_time = time.time()
     main()
-    elapsed_time = time.time() - start_time
-    logger.info(f"Total execution time: {elapsed_time:.2f} seconds")
