@@ -745,3 +745,5 @@ def main():
             logger.info(f"Data transformation process completed successfully in {elapsed_time:.2f} seconds")
         else:
             logger.warning("No data was processed. Please check your input directories and file patterns.")
+    except Exception as e:
+        logger.error(f"Error: {e}")
