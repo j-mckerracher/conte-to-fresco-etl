@@ -5,6 +5,7 @@ import json
 import os
 import logging
 import multiprocessing as mp
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import shutil
 import time
@@ -13,6 +14,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import gc
 from tqdm import tqdm
+from queue import Queue
+import threading
 
 # Configure logging
 logging.basicConfig(
@@ -21,14 +24,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Define file paths
-JOB_ACCOUNTING_PATH = Path("./cache/input/accounting")
-PROC_METRIC_PATH = Path("./cache/input/metrics")
-OUTPUT_PATH = Path("./cache/output")
-
 # Create cache directory
 CACHE_DIR = Path("./cache")
 CACHE_DIR.mkdir(exist_ok=True)
+
+# Define file paths
+JOB_ACCOUNTING_PATH = Path(CACHE_DIR / 'input/accounting')
+PROC_METRIC_PATH = Path(CACHE_DIR / 'input/metrics')
+OUTPUT_PATH = Path(CACHE_DIR / 'output')
 
 # Ensure output directory exists
 OUTPUT_PATH.mkdir(exist_ok=True, parents=True)
@@ -37,6 +40,7 @@ OUTPUT_PATH.mkdir(exist_ok=True, parents=True)
 MAX_WORKERS = max(1, mp.cpu_count() - 1)  # Leave one CPU core free
 MIN_FREE_MEMORY_GB = 2.0  # Minimum free memory to maintain in GB
 MIN_FREE_DISK_GB = 5.0  # Minimum free disk space to maintain in GB
+BASE_CHUNK_SIZE = 100_000  # Base chunk size for processing
 
 
 def get_memory_usage():
@@ -57,7 +61,7 @@ def get_free_disk_space():
     return free / (1024 * 1024 * 1024)
 
 
-def calculate_chunk_size(current_size=100_000):
+def calculate_chunk_size(current_size=BASE_CHUNK_SIZE):
     """Dynamically calculate chunk size based on available memory"""
     available_memory_gb = get_available_memory()
 
@@ -171,9 +175,10 @@ def get_exit_status_description(df):
     return result
 
 
-def process_chunk(jobs_df, ts_chunk):
+def process_chunk(jobs_df, ts_chunk, chunk_id):
     """Process a chunk of time series data against all jobs"""
-    logger.debug(f"Processing chunk with {len(ts_chunk)} rows against {len(jobs_df)} jobs")
+    thread_id = threading.get_ident()
+    logger.debug(f"Thread {thread_id}: Processing chunk {chunk_id} with {len(ts_chunk)} rows")
 
     # Ensure Timestamp is datetime
     if "Timestamp" in ts_chunk.columns and not pd.api.types.is_datetime64_any_dtype(ts_chunk["Timestamp"]):
@@ -192,7 +197,7 @@ def process_chunk(jobs_df, ts_chunk):
     del ts_chunk
     gc.collect()
 
-    logger.debug(f"Joined dataframe has {len(joined)} rows")
+    logger.debug(f"Thread {thread_id}: Joined dataframe has {len(joined)} rows")
 
     if joined.empty:
         return None
@@ -205,7 +210,7 @@ def process_chunk(jobs_df, ts_chunk):
     del joined
     gc.collect()
 
-    logger.debug(f"Filtered dataframe has {len(filtered)} rows")
+    logger.debug(f"Thread {thread_id}: Filtered dataframe has {len(filtered)} rows")
 
     if filtered.empty:
         return None
@@ -307,6 +312,10 @@ def process_chunk(jobs_df, ts_chunk):
     available_columns = [col for col in set3_columns if col in pivoted.columns]
     result = pivoted[available_columns]
 
+    # Optimize the result dataframe
+    result = optimize_dataframe_dtypes(result)
+
+    logger.info(f"Thread {thread_id}: Completed processing chunk {chunk_id} - produced {len(result)} rows")
     return result
 
 
@@ -423,63 +432,92 @@ def optimize_dataframe_dtypes(df):
     return df
 
 
-def process_ts_file(ts_file, jobs_df, output_writer, first_file=False):
-    """Process a single time series file"""
-    logger.info(f"Processing TS file: {ts_file}")
+def process_ts_file_in_parallel(ts_file, jobs_df, output_writer):
+    """Process a single time series file with multiple threads"""
+    logger.info(f"Processing TS file in parallel: {ts_file}")
 
     try:
-        # Read time series file using pyarrow for better performance
-        # Make sure we're reading a parquet file
-        ts_df = pq.read_table(ts_file).to_pandas()
+        # Get file size to estimate appropriate chunk count
+        file_size = os.path.getsize(ts_file)
 
-        # Free some memory for the processing
-        check_and_optimize_resources()
+        # Read the time series file metadata to get row count without loading all data
+        parquet_file = pq.ParquetFile(ts_file)
+        total_rows = parquet_file.metadata.num_rows
 
-        # Initial chunk size
-        chunk_size = 100_000
+        # Determine optimal chunk size based on available memory and cores
+        available_memory_gb = get_available_memory()
+        max_chunk_size = int(total_rows * (MIN_FREE_MEMORY_GB / available_memory_gb) / MAX_WORKERS)
+        chunk_size = min(max(BASE_CHUNK_SIZE, max_chunk_size), 500_000)
 
-        # Process in chunks
-        for i in range(0, len(ts_df), chunk_size):
-            # Dynamically adjust chunk size based on available memory
-            chunk_size = calculate_chunk_size(chunk_size)
+        # Calculate number of chunks
+        num_chunks = (total_rows + chunk_size - 1) // chunk_size  # Ceiling division
 
-            # Extract chunk
-            ts_chunk = ts_df.iloc[i:i + chunk_size].copy()
+        # Adjust number of workers based on number of chunks
+        num_workers = min(MAX_WORKERS, num_chunks)
 
-            chunk_idx = i // chunk_size
-            logger.info(f"Processing chunk {chunk_idx + 1} with {len(ts_chunk)} rows")
+        logger.info(f"File has {total_rows} rows, processing with {num_workers} threads in {num_chunks} chunks")
 
-            # Process the chunk
-            result_df = process_chunk(jobs_df, ts_chunk)
+        # Create a thread-safe queue for results
+        result_queue = Queue()
 
-            # Free memory
-            del ts_chunk
-            gc.collect()
+        # Create a list to keep track of futures
+        futures = []
 
-            if result_df is not None and not result_df.empty:
-                # Optimize the result dataframe
-                result_df = optimize_dataframe_dtypes(result_df)
+        # Process file in chunks using a thread pool
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            # For each chunk, create a pandas DataFrame and submit to the thread pool
+            for chunk_idx in range(num_chunks):
+                # Calculate row range for this chunk
+                start_row = chunk_idx * chunk_size
+                end_row = min(start_row + chunk_size, total_rows)
 
-                # Convert to pyarrow table and write to parquet
-                table = pa.Table.from_pandas(result_df)
-                output_writer.write_table(table)
+                # Read just this chunk of rows
+                chunk_df = parquet_file.read_row_group_slow(
+                    chunk_idx).to_pandas() if chunk_idx < parquet_file.metadata.num_row_groups else None
 
-                # Release memory
-                del result_df, table
-                gc.collect()
+                # If chunk reading failed, try reading with row ranges
+                if chunk_df is None or len(chunk_df) == 0:
+                    # Alternative approach: read the entire file and slice it
+                    # This is less efficient but more robust
+                    logger.info(f"Reading chunk {chunk_idx + 1}/{num_chunks} with range {start_row}-{end_row}")
 
-        # Release memory from the dataframe
-        del ts_df
-        gc.collect()
+                    # Read the specific row range
+                    # Note: This needs to be optimized further for very large files
+                    chunk_df = next(pq.read_table(ts_file, use_threads=True).to_batches(chunk_size))
+                    chunk_df = chunk_df.slice(start_row % chunk_size, min(chunk_size, end_row - start_row)).to_pandas()
+
+                # Process the chunk in a separate thread
+                if chunk_df is not None and not chunk_df.empty:
+                    future = executor.submit(process_chunk, jobs_df, chunk_df, chunk_idx + 1)
+                    futures.append(future)
+
+                    # Clean up chunk dataframe to free memory
+                    del chunk_df
+                    gc.collect()
+
+            # Process results as they complete
+            for future in tqdm(futures, desc=f"Processing chunks of {ts_file.name}"):
+                try:
+                    result_df = future.result()
+                    if result_df is not None and not result_df.empty:
+                        # Convert to PyArrow table and write to output
+                        table = pa.Table.from_pandas(result_df)
+                        output_writer.write_table(table)
+
+                        # Release memory
+                        del result_df, table
+                        gc.collect()
+                except Exception as e:
+                    logger.error(f"Error processing chunk: {e}")
 
         return True
     except Exception as e:
-        logger.error(f"Error processing {ts_file}: {e}")
+        logger.error(f"Error processing file {ts_file}: {e}")
         return False
 
 
 def process_year_month(year, month):
-    """Process a specific year-month combination"""
+    """Process a specific year-month combination with intra-file parallelism"""
     logger.info(f"Processing year: {year}, month: {month}")
 
     # Check resources before starting
@@ -553,13 +591,16 @@ def process_year_month(year, month):
             ('value_block', pa.float64())
         ])
 
-        # Create PyArrow ParquetWriter for better performance
+        # Create a single writer for the output file
         with pq.ParquetWriter(str(output_file), schema, compression='snappy') as writer:
-            # Process the files sequentially with a shared writer
-            # ParquetWriter can't be shared across processes safely
+            # Process each file sequentially, but with internal parallelism
             for i, ts_file in enumerate(ts_files):
                 logger.info(f"Processing file {i + 1}/{len(ts_files)}: {ts_file.name}")
-                process_ts_file(ts_file, jobs_df, writer, i == 0)
+                process_ts_file_in_parallel(ts_file, jobs_df, writer)
+
+                # Force garbage collection between files
+                gc.collect()
+                check_and_optimize_resources()
 
         # Check if the output file was created properly
         if output_file.exists() and output_file.stat().st_size > 0:
@@ -594,24 +635,13 @@ def main():
         # Sort combinations for ordered processing
         sorted_combinations = sorted(year_month_combinations)
 
-        # Determine if we can use multiprocessing for year-month combinations
-        if MAX_WORKERS > 1 and len(sorted_combinations) > 1:
-            logger.info(f"Processing {len(sorted_combinations)} combinations in parallel with {MAX_WORKERS} workers")
+        # Process one year-month combination at a time (as requested)
+        for idx, (year, month) in enumerate(tqdm(sorted_combinations, desc="Processing year-month combinations")):
+            logger.info(f"Processing combination {idx + 1}/{len(sorted_combinations)}: {year}-{month}")
+            process_year_month(year, month)
 
-            # Create a pool of workers
-            with mp.Pool(min(MAX_WORKERS, len(sorted_combinations))) as pool:
-                # Map the year-month combinations to the process_year_month function
-                pool.starmap(process_year_month, sorted_combinations)
-        else:
-            logger.info(f"Processing {len(sorted_combinations)} combinations sequentially")
-
-            # Process each year-month combination sequentially with a progress bar
-            for idx, (year, month) in enumerate(tqdm(sorted_combinations, desc="Processing year-month combinations")):
-                logger.info(f"Processing combination {idx + 1}/{len(sorted_combinations)}: {year}-{month}")
-                process_year_month(year, month)
-
-                # Check resources after each combination
-                check_and_optimize_resources()
+            # Check resources after each combination
+            check_and_optimize_resources()
 
         # Final cleanup
         clean_up_cache()
