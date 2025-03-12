@@ -1,3 +1,8 @@
+# The key fixes
+# 1. Fix the path to job accounting files
+# 2. Make sure directories are created
+# 3. Fix the file matching pattern
+
 import pandas as pd
 import numpy as np
 import re
@@ -26,15 +31,14 @@ logger = logging.getLogger(__name__)
 
 # Define file paths
 CACHE_DIR = Path("./cache")
-JOB_ACCOUNTING_PATH = Path(CACHE_DIR / 'input/accounting')
+JOB_ACCOUNTING_PATH = Path(CACHE_DIR / 'accounting')  # FIXED: Removed 'input/' prefix
 PROC_METRIC_PATH = Path(CACHE_DIR / 'input/metrics')
 OUTPUT_PATH = Path(CACHE_DIR / 'output')
 
 # Ensure directories exists
-# CACHE_DIR.mkdir(exist_ok=True)
-# OUTPUT_PATH.mkdir(exist_ok=True)
-# PROC_METRIC_PATH.mkdir(exist_ok=True)
-# JOB_ACCOUNTING_PATH.mkdir(exist_ok=True)
+CACHE_DIR.mkdir(exist_ok=True)
+OUTPUT_PATH.mkdir(exist_ok=True, parents=True)
+# We don't create input directories as they should already exist with data
 
 # Configuration
 MAX_WORKERS = max(1, mp.cpu_count() - 1)  # Leave one CPU core free
@@ -322,15 +326,14 @@ def process_chunk(jobs_df, ts_chunk, chunk_id):
 def clean_up_cache():
     """Clean up the cache directory"""
     try:
-        dirs = [JOB_ACCOUNTING_PATH, PROC_METRIC_PATH]
-        for folder in dirs:
-            if folder.exists():
-                logger.info(f"Cleaning up {folder} directory...")
-                for file_path in folder.glob("*"):
-                    if file_path.is_file():
-                        file_path.unlink()
-                    elif file_path.is_dir():
-                        shutil.rmtree(file_path)
+        # Don't clean up input directories - that's where our data is!
+        if OUTPUT_PATH.exists():
+            logger.info(f"Cleaning up {OUTPUT_PATH} directory...")
+            for file_path in OUTPUT_PATH.glob("*"):
+                if file_path.is_file():
+                    file_path.unlink()
+                elif file_path.is_dir():
+                    shutil.rmtree(file_path)
     except Exception as e:
         logger.error(f"Error cleaning cache: {e}")
 
@@ -354,13 +357,27 @@ def get_year_month_combinations():
     """Get all year-month combinations from both local directories"""
     logger.info("Getting list of files from local directories...")
 
+    # Print the paths we're checking to help with debugging
+    logger.info(f"Job accounting path: {JOB_ACCOUNTING_PATH}")
+    logger.info(f"Process metric path: {PROC_METRIC_PATH}")
+
+    # Check if directories exist
+    if not JOB_ACCOUNTING_PATH.exists():
+        logger.warning(f"Job accounting directory does not exist: {JOB_ACCOUNTING_PATH}")
+    if not PROC_METRIC_PATH.exists():
+        logger.warning(f"Process metric directory does not exist: {PROC_METRIC_PATH}")
+
     # Get files from proc metric directory (parquet files)
     proc_metric_files = list(PROC_METRIC_PATH.glob("*.parquet"))
     logger.info(f"Found {len(proc_metric_files)} files in proc metric directory (parquet)")
+    for f in proc_metric_files:
+        logger.info(f"  Found parquet file: {f.name}")
 
     # Get files from job accounting directory (CSV files)
     job_accounting_files = list(JOB_ACCOUNTING_PATH.glob("*.csv"))
     logger.info(f"Found {len(job_accounting_files)} files in job accounting directory (CSV)")
+    for f in job_accounting_files:
+        logger.info(f"  Found CSV file: {f.name}")
 
     # Extract year-month from filenames more efficiently
     proc_metrics_years_months = set()
@@ -371,12 +388,14 @@ def get_year_month_combinations():
 
     for filepath in proc_metric_files:
         filename = filepath.name
+        logger.debug(f"Processing parquet filename: {filename}")
 
         # Try the FRESCO pattern first
         match = fresco_pattern.search(filename)
         if match:
             year, month = match.groups()
             proc_metrics_years_months.add((year, month))
+            logger.info(f"Matched FRESCO pattern: {year}-{month} from {filename}")
             continue
 
         # Try the other pattern
@@ -384,20 +403,25 @@ def get_year_month_combinations():
         if matches:
             year, month = matches[0]
             proc_metrics_years_months.add((year, month))
+            logger.info(f"Matched other pattern: {year}-{month} from {filename}")
 
     # Compile job accounting pattern
     job_pattern = re.compile(r'(\d{4})-(\d{2})\.csv')
 
     job_accounting_years_months = set()
     for filepath in job_accounting_files:
-        match = job_pattern.match(filepath.name)
+        filename = filepath.name
+        logger.debug(f"Processing CSV filename: {filename}")
+
+        match = job_pattern.match(filename)
         if match:
             year, month = match.groups()
             job_accounting_years_months.add((year, month))
+            logger.info(f"Matched job pattern: {year}-{month} from {filename}")
 
     # Find common year-month combinations
     common_years_months = proc_metrics_years_months.intersection(job_accounting_years_months)
-    logger.info(f"Found {len(common_years_months)} common year-month combinations")
+    logger.info(f"Found {len(common_years_months)} common year-month combinations: {common_years_months}")
 
     return common_years_months
 
@@ -473,20 +497,27 @@ def process_ts_file_in_parallel(ts_file, jobs_df, output_writer):
                 start_row = chunk_idx * chunk_size
                 end_row = min(start_row + chunk_size, total_rows)
 
-                # Read just this chunk of rows
-                chunk_df = parquet_file.read_row_group_slow(
-                    chunk_idx).to_pandas() if chunk_idx < parquet_file.metadata.num_row_groups else None
-
-                # If chunk reading failed, try reading with row ranges
-                if chunk_df is None or len(chunk_df) == 0:
-                    # Alternative approach: read the entire file and slice it
-                    # This is less efficient but more robust
-                    logger.info(f"Reading chunk {chunk_idx + 1}/{num_chunks} with range {start_row}-{end_row}")
-
-                    # Read the specific row range
-                    # Note: This needs to be optimized further for very large files
-                    chunk_df = next(pq.read_table(ts_file, use_threads=True).to_batches(chunk_size))
-                    chunk_df = chunk_df.slice(start_row % chunk_size, min(chunk_size, end_row - start_row)).to_pandas()
+                try:
+                    # Try to read a row group if possible
+                    if chunk_idx < parquet_file.metadata.num_row_groups:
+                        chunk_df = parquet_file.read_row_group(chunk_idx).to_pandas()
+                    else:
+                        # Fall back to reading a slice
+                        chunk_df = pq.read_table(ts_file,
+                                                 use_threads=True,
+                                                 filters=[('Timestamp', '>=', start_row),
+                                                          ('Timestamp', '<', end_row)]).to_pandas()
+                except Exception as e:
+                    logger.warning(f"Standard read methods failed, trying alternative: {e}")
+                    try:
+                        # Alternative approach for very large files
+                        full_table = pq.read_table(ts_file, use_threads=True)
+                        chunk_df = full_table.slice(start_row, min(chunk_size, end_row - start_row)).to_pandas()
+                        del full_table
+                        gc.collect()
+                    except Exception as e2:
+                        logger.error(f"Failed to read chunk {chunk_idx}: {e2}")
+                        continue
 
                 # Process the chunk in a separate thread
                 if chunk_df is not None and not chunk_df.empty:
@@ -529,13 +560,38 @@ def process_year_month(year, month):
         # Get job accounting file (CSV)
         job_file = JOB_ACCOUNTING_PATH / f"{year}-{month}.csv"
 
+        # Check if job file exists
+        if not job_file.exists():
+            logger.error(f"Job file not found: {job_file}")
+            return
+
         # Find all time series files (Parquet) for this year/month
-        ts_pattern = f".*_{year}_{month}.*\.parquet"
-        ts_files = list(PROC_METRIC_PATH.glob(ts_pattern))
+        # Modified pattern to match FRESCO_Conte_ts_2015_07_v5.parquet format
+        ts_files = []
+
+        # Try the FRESCO pattern first
+        fresco_files = list(PROC_METRIC_PATH.glob(f"FRESCO_Conte_ts_{year}_{month}_*.parquet"))
+        if fresco_files:
+            ts_files.extend(fresco_files)
+            logger.info(f"Found {len(fresco_files)} FRESCO pattern files")
+
+        # Try other pattern as backup
+        other_files = list(PROC_METRIC_PATH.glob(f"*_{year}_{month}_*.parquet"))
+        new_files = [f for f in other_files if f not in ts_files]
+        if new_files:
+            ts_files.extend(new_files)
+            logger.info(f"Found {len(new_files)} additional files with other pattern")
 
         if not ts_files:
             logger.warning(f"No time series files found for {year}-{month}")
+            # List all files in directory to help debug
+            all_files = list(PROC_METRIC_PATH.glob("*.parquet"))
+            logger.info(f"Available parquet files in directory: {[f.name for f in all_files]}")
             return
+
+        # Log the files we found
+        for ts_file in ts_files:
+            logger.info(f"Found time series file: {ts_file}")
 
         # Create output file path (will be Parquet)
         output_file = OUTPUT_PATH / f"transformed_{year}_{month}.parquet"
@@ -559,7 +615,10 @@ def process_year_month(year, month):
                 jobs_df[col] = jobs_df[col].astype(str)
 
         # Standardize job IDs
-        jobs_df["jobID"] = standardize_job_id(jobs_df["jobID"])
+        if "jobID" in jobs_df.columns:
+            jobs_df["jobID"] = standardize_job_id(jobs_df["jobID"])
+        else:
+            logger.warning("jobID column not found in CSV file")
 
         # Convert datetime columns
         datetime_cols = ["ctime", "qtime", "etime", "start", "end", "timestamp"]
@@ -615,7 +674,7 @@ def process_year_month(year, month):
         gc.collect()
 
     except Exception as e:
-        logger.error(f"Error processing {year}-{month}: {e}")
+        logger.error(f"Error processing {year}-{month}: {e}", exc_info=True)
 
 
 def main():
@@ -624,41 +683,65 @@ def main():
     start_time = time.time()
 
     try:
-        # Initial cleanup
-        clean_up_cache()
+        # Initial cleanup - don't clean input data
+        # clean_up_cache()  
 
         # Get all year-month combinations
         year_month_combinations = get_year_month_combinations()
+        processed_something = False
 
-        if not year_month_combinations:
+        if year_month_combinations:
+            # Sort combinations for ordered processing
+            sorted_combinations = sorted(year_month_combinations)
+
+            # Process one year-month combination at a time (as requested)
+            for idx, (year, month) in enumerate(tqdm(sorted_combinations, desc="Processing year-month combinations")):
+                logger.info(f"Processing combination {idx + 1}/{len(sorted_combinations)}: {year}-{month}")
+                process_year_month(year, month)
+                processed_something = True
+
+                # Check resources after each combination
+                check_and_optimize_resources()
+        else:
             logger.warning("No common year-month combinations found to process")
-            return
 
-        # Sort combinations for ordered processing
-        sorted_combinations = sorted(year_month_combinations)
+            # Check if files exist but patterns don't match
+            logger.info("Attempting manual check for 2015-07 data...")
 
-        # Process one year-month combination at a time (as requested)
-        for idx, (year, month) in enumerate(tqdm(sorted_combinations, desc="Processing year-month combinations")):
-            logger.info(f"Processing combination {idx + 1}/{len(sorted_combinations)}: {year}-{month}")
-            process_year_month(year, month)
+            # Check for specific files mentioned
+            job_file = JOB_ACCOUNTING_PATH / "2015-07.csv"
+            ts_file1 = PROC_METRIC_PATH / "FRESCO_Conte_ts_2015_07_v5.parquet"
+            ts_file2 = PROC_METRIC_PATH / "FRESCO_Conte_ts_2015_07_v6.parquet"
 
-            # Check resources after each combination
-            check_and_optimize_resources()
+            logger.info(f"Checking if job file exists: {job_file}")
+            if job_file.exists():
+                logger.info(f"Job file exists: {job_file}")
+            else:
+                logger.warning(f"Job file does not exist: {job_file}")
 
-        # Final cleanup
-        clean_up_cache()
+            logger.info(f"Checking if TS file 1 exists: {ts_file1}")
+            if ts_file1.exists():
+                logger.info(f"TS file 1 exists: {ts_file1}")
+            else:
+                logger.warning(f"TS file 1 does not exist: {ts_file1}")
 
-        elapsed_time = time.time() - start_time
-        logger.info(f"Data transformation process completed successfully in {elapsed_time:.2f} seconds")
+            logger.info(f"Checking if TS file 2 exists: {ts_file2}")
+            if ts_file2.exists():
+                logger.info(f"TS file 2 exists: {ts_file2}")
+            else:
+                logger.warning(f"TS file 2 does not exist: {ts_file2}")
 
-    except KeyboardInterrupt:
-        logger.info("Process interrupted by user")
-    except Exception as e:
-        logger.error(f"Error in main process: {e}")
-    finally:
-        # Final cleanup
-        clean_up_cache()
+            # If files exist but weren't detected by pattern matching, manually add them
+            if job_file.exists() and (ts_file1.exists() or ts_file2.exists()):
+                logger.info("Files exist but weren't detected by pattern matching. Processing 2015-07 manually.")
+                process_year_month("2015", "07")
+                processed_something = True
 
+        # Don't clean up input data
+        # clean_up_cache()
 
-if __name__ == "__main__":
-    main()
+        if processed_something:
+            elapsed_time = time.time() - start_time
+            logger.info(f"Data transformation process completed successfully in {elapsed_time:.2f} seconds")
+        else:
+            logger.warning("No data was processed. Please check your input directories and file patterns.")
