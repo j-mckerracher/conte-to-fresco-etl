@@ -106,9 +106,7 @@ def calculate_chunk_size(current_size=BASE_CHUNK_SIZE):
     return current_size
 
 
-def standardize_job_id(job_id_series):
-    """Convert jobIDxxxxx to JOBxxxxx"""
-    return job_id_series.str.replace(r'^jobID', 'JOB', regex=True)
+
 
 
 def convert_walltime_to_seconds(walltime_series):
@@ -146,35 +144,7 @@ def convert_walltime_to_seconds(walltime_series):
     return result
 
 
-def parse_host_list(exec_host_series):
-    """Parse exec_host into a list of hosts in JSON format"""
-    # Handle empty series
-    if exec_host_series.empty:
-        return exec_host_series
 
-    # Create a mask for non-null string values
-    mask = exec_host_series.notna() & exec_host_series.apply(lambda x: isinstance(x, str))
-
-    # Initialize result series with same index and None values
-    result = pd.Series([None] * len(exec_host_series), index=exec_host_series.index)
-
-    if mask.any():
-        # Extract node names using regular expression
-        node_pattern = re.compile(r'([^/+]+)/')
-
-        # Apply the extraction only on valid strings
-        valid_hosts = exec_host_series[mask]
-
-        # Extract all matches for each string
-        extracted = valid_hosts.apply(lambda x: node_pattern.findall(x))
-
-        # Get unique nodes and convert to JSON format
-        unique_nodes = extracted.apply(lambda x: json.dumps(list(set(x))).replace('"', '') if x else None)
-
-        # Update only the processed values
-        result[mask] = unique_nodes
-
-    return result
 
 
 def get_exit_status_description(df):
@@ -285,6 +255,75 @@ def optimize_dataframe_dtypes(df):
     return df
 
 
+def standardize_job_id(job_id_series):
+    """Convert jobIDxxxxx to JOBxxxxx with better type handling"""
+    # First check if we have a datetime series (which would cause .str accessor to fail)
+    if pd.api.types.is_datetime64_any_dtype(job_id_series):
+        logger.warning("Cannot standardize job IDs: series is datetime type")
+        return job_id_series
+
+    # Handle non-string types by converting to string first
+    if not pd.api.types.is_string_dtype(job_id_series):
+        # Convert to string type first
+        job_id_series = job_id_series.astype(str)
+
+    # Now we can safely use the .str accessor
+    return job_id_series.str.replace(r'^jobID', 'JOB', regex=True)
+
+
+def parse_host_list(exec_host_series):
+    """Parse exec_host into a list of hosts in JSON format with better type handling"""
+    # Handle empty series
+    if exec_host_series.empty:
+        return exec_host_series
+
+    # Initialize result series with same index and None values
+    result = pd.Series([None] * len(exec_host_series), index=exec_host_series.index)
+
+    # Check for datetime type (which would cause .str accessor to fail)
+    if pd.api.types.is_datetime64_any_dtype(exec_host_series):
+        logger.warning("Cannot parse host list: series is datetime type")
+        return result
+
+    # Force conversion to string if needed
+    if not pd.api.types.is_string_dtype(exec_host_series):
+        # Convert non-null values to string
+        mask = exec_host_series.notna()
+        if mask.any():
+            # Convert carefully
+            try:
+                string_series = exec_host_series[mask].astype(str)
+                exec_host_series = exec_host_series.copy()
+                exec_host_series[mask] = string_series
+            except Exception as e:
+                logger.warning(f"Error converting exec_host series to string: {e}")
+                return result
+
+    # Create a mask for non-null string values
+    mask = exec_host_series.notna()
+
+    if mask.any():
+        # Extract node names using regular expression
+        node_pattern = re.compile(r'([^/+]+)/')
+
+        # Apply the extraction only on valid strings
+        valid_hosts = exec_host_series[mask]
+
+        try:
+            # Extract all matches for each string
+            extracted = valid_hosts.apply(lambda x: node_pattern.findall(x) if isinstance(x, str) else [])
+
+            # Get unique nodes and convert to JSON format
+            unique_nodes = extracted.apply(lambda x: json.dumps(list(set(x))).replace('"', '') if x else None)
+
+            # Update only the processed values
+            result[mask] = unique_nodes
+        except Exception as e:
+            logger.warning(f"Error extracting host names: {e}")
+
+    return result
+
+
 def process_chunk(jobs_df, ts_chunk, chunk_id):
     """Process a chunk of time series data against all jobs with reduced memory usage"""
     thread_id = threading.get_ident()
@@ -292,9 +331,15 @@ def process_chunk(jobs_df, ts_chunk, chunk_id):
 
     # Ensure we're only keeping the columns we'll actually need from ts_chunk
     required_ts_columns = ["Timestamp", "Job Id", "Event", "Value", "Host", "Units"]
-    ts_columns_to_drop = [col for col in ts_chunk.columns if col not in required_ts_columns]
-    if ts_columns_to_drop:
-        ts_chunk.drop(columns=ts_columns_to_drop, inplace=True)
+    ts_columns_to_keep = [col for col in required_ts_columns if col in ts_chunk.columns]
+
+    # Check if we have the minimum required columns
+    if not all(col in ts_chunk.columns for col in ["Timestamp", "Job Id", "Event", "Value"]):
+        logger.error(f"Chunk is missing required columns. Available columns: {ts_chunk.columns.tolist()}")
+        return None
+
+    # Keep only needed columns
+    ts_chunk = ts_chunk[ts_columns_to_keep]
 
     # CRITICAL FIX: Ensure Timestamp is datetime type and not categorical
     if "Timestamp" in ts_chunk.columns:
@@ -317,7 +362,7 @@ def process_chunk(jobs_df, ts_chunk, chunk_id):
 
     # Only keep columns that actually exist in jobs_df
     job_columns_to_use = [col for col in required_job_columns if col in jobs_df.columns]
-    jobs_subset = jobs_df[job_columns_to_use].copy()
+    jobs_subset = jobs_df[job_columns_to_use]
 
     # CRITICAL FIX: Ensure datetime columns in jobs_df are proper datetime
     datetime_cols = ["start", "end", "qtime"]
@@ -333,23 +378,32 @@ def process_chunk(jobs_df, ts_chunk, chunk_id):
                 jobs_subset[col] = pd.to_datetime(jobs_subset[col], errors='coerce')
 
     # Join time series chunk with jobs data on jobID
-    joined = pd.merge(
-        ts_chunk,
-        jobs_subset,
-        left_on="Job Id",
-        right_on="jobID",
-        how="inner"
-    )
+    try:
+        joined = pd.merge(
+            ts_chunk,
+            jobs_subset,
+            left_on="Job Id",
+            right_on="jobID",
+            how="inner"
+        )
+
+        # Log join results
+        logger.debug(f"Thread {thread_id}: Joined dataframe has {len(joined)} rows")
+
+        if joined.empty:
+            return None
+
+    except Exception as e:
+        logger.error(f"Error joining dataframes: {e}")
+        # Log column types to help diagnose issues
+        logger.error(f"ts_chunk Job Id dtype: {ts_chunk['Job Id'].dtype}")
+        logger.error(f"jobs_subset jobID dtype: {jobs_subset['jobID'].dtype}")
+        return None
 
     # Release memory from the input chunks since they're no longer needed
     del ts_chunk
     del jobs_subset
     gc.collect()  # Force garbage collection
-
-    logger.debug(f"Thread {thread_id}: Joined dataframe has {len(joined)} rows")
-
-    if joined.empty:
-        return None
 
     # Double-check datetime types before filtering to avoid the categorical error
     for col in ["Timestamp", "start", "end"]:
@@ -376,7 +430,7 @@ def process_chunk(jobs_df, ts_chunk, chunk_id):
             if col in joined.columns:
                 logger.error(f"Column {col} dtype: {joined[col].dtype}")
                 logger.error(f"Sample values: {joined[col].head(3)}")
-        raise
+        return None
 
     # Release memory from joined dataframe
     del joined
@@ -527,7 +581,7 @@ def check_and_optimize_resources():
 
 
 def get_year_month_combinations():
-    """Get all year-month combinations from both local directories"""
+    """Get all year-month combinations from both local directories with support for chunked files"""
     logger.info("Getting list of files from local directories...")
 
     # Print the paths we're checking to help with debugging
@@ -556,7 +610,7 @@ def get_year_month_combinations():
     proc_metrics_years_months = set()
 
     # Compile regex patterns once for better performance
-    fresco_pattern = re.compile(r'FRESCO_Conte_ts_(\d{4})_(\d{2})_v\d+\.parquet')
+    fresco_pattern = re.compile(r'FRESCO_Conte_ts_(\d{4})_(\d{2})(?:_v\d+)?(?:_chunk\d+)?\.parquet')
     other_pattern = re.compile(r'_(\d{4})_(\d{2})_')
 
     for filepath in proc_metric_files:
@@ -853,7 +907,7 @@ def process_ts_file_in_parallel(ts_file, jobs_df, output_writer):
 
 
 def process_year_month(year, month):
-    """Process a specific year-month combination with reduced memory usage"""
+    """Process a specific year-month combination with better support for chunked files"""
     global terminate_requested
 
     logger.info(f"Processing year: {year}, month: {month}")
@@ -875,104 +929,97 @@ def process_year_month(year, month):
             logger.error(f"Job file not found: {job_file}")
             return
 
-        # Find all time series files (Parquet) for this year/month
+        # Find all time series files (Parquet) for this year/month with support for chunked files
         ts_files = []
 
-        # Try the FRESCO pattern first
-        fresco_files = list(PROC_METRIC_PATH.glob(f"FRESCO_Conte_ts_{year}_{month}_*.parquet"))
-        if fresco_files:
-            ts_files.extend(fresco_files)
-            logger.info(f"Found {len(fresco_files)} FRESCO pattern files")
+        # UPDATED: Pattern to match both original files and chunked files
+        fresco_pattern = f"FRESCO_Conte_ts_{year}_{month}"
 
-        # Try other pattern as backup (only if needed)
-        if not ts_files:
-            other_files = list(PROC_METRIC_PATH.glob(f"*_{year}_{month}_*.parquet"))
-            new_files = [f for f in other_files if f not in ts_files]
-            if new_files:
-                ts_files.extend(new_files)
-                logger.info(f"Found {len(new_files)} additional files with other pattern")
+        # Find all files that match our patterns
+        all_files = []
+
+        # Look for files with the basic pattern
+        basic_files = list(PROC_METRIC_PATH.glob(f"{fresco_pattern}*.parquet"))
+        all_files.extend(basic_files)
+
+        # If we found too few files, check for chunked versions
+        if not all_files:
+            # Try backup pattern
+            backup_files = list(PROC_METRIC_PATH.glob(f"*_{year}_{month}_*.parquet"))
+            all_files.extend(backup_files)
+
+        if all_files:
+            # Sort files logically - original files first, then chunked files
+            for f in sorted(all_files, key=lambda x: (
+                    # Sort by original vs chunked (original files first)
+                    1 if "_chunk" in x.name else 0,
+                    # Then by version number
+                    int(re.search(r'v(\d+)', x.name).group(1)) if re.search(r'v(\d+)', x.name) else 0,
+                    # Then by chunk number if it exists
+                    int(re.search(r'chunk(\d+)', x.name).group(1)) if re.search(r'chunk(\d+)', x.name) else 0,
+                    # Finally by name
+                    x.name
+            )):
+                ts_files.append(f)
+
+        # Log what we found
+        logger.info(f"Found {len(ts_files)} files for {year}-{month}")
+        for ts_file in ts_files:
+            logger.info(f"Found time series file: {ts_file}")
 
         if not ts_files:
             logger.warning(f"No time series files found for {year}-{month}")
-            # List all files in directory to help debug
-            all_files = list(PROC_METRIC_PATH.glob("*.parquet"))
-            logger.info(f"Available parquet files in directory: {[f.name for f in all_files]}")
             return
-
-        # Log the files we found
-        for ts_file in ts_files:
-            logger.info(f"Found time series file: {ts_file}")
 
         # Create output file path (will be Parquet)
         output_file = OUTPUT_PATH / f"transformed_{year}_{month}.parquet"
 
-        # Read job data from CSV file with memory optimization
+        # Read job data from CSV file with improved memory handling
         logger.info(f"Reading job data from file: {job_file}")
 
-        # Use our optimized function to read CSV
-        try:
-            # Try to determine column types from sample
-            sample_df = pd.read_csv(job_file, nrows=1000)
+        # First scan to determine data types
+        sample_df = pd.read_csv(job_file, nrows=1000)
+        dtypes = {}
+        date_columns = ["ctime", "qtime", "etime", "start", "end", "timestamp"]
 
-            # Create dtypes dictionary for numeric columns to save memory
-            dtypes = {}
-            for col in sample_df.columns:
-                if pd.api.types.is_integer_dtype(sample_df[col]):
-                    # Use smaller int types when possible
-                    max_val = sample_df[col].max()
-                    min_val = sample_df[col].min()
+        # Determine column types to minimize memory usage
+        for col in sample_df.columns:
+            if col in date_columns:
+                continue  # Handle date columns separately
+            elif sample_df[col].dtype == 'int64':
+                # Use smaller integer types when possible
+                max_val = sample_df[col].max()
+                min_val = sample_df[col].min()
+                if pd.notna(max_val) and pd.notna(min_val):
                     if max_val < 32767 and min_val > -32768:
                         dtypes[col] = 'int16'
                     elif max_val < 2147483647 and min_val > -2147483648:
                         dtypes[col] = 'int32'
-                elif pd.api.types.is_float_dtype(sample_df[col]):
-                    dtypes[col] = 'float32'  # Use float32 to save memory
+            elif sample_df[col].dtype == 'float64':
+                dtypes[col] = 'float32'  # Use float32 to save memory
 
-            # Read with memory-optimized settings
-            jobs_df = pd.read_csv(
-                job_file,
-                dtype=dtypes,
-                low_memory=True,
-                memory_map=True  # Memory map the file for more efficient I/O
-            )
+        # Read with optimized settings
+        jobs_df = pd.read_csv(
+            job_file,
+            dtype=dtypes,
+            parse_dates=date_columns,  # More efficient date parsing
+            low_memory=True,
+            memory_map=True  # Memory map the file for more efficient I/O
+        )
 
-            # Log memory usage
-            mem_usage = jobs_df.memory_usage(deep=True).sum() / (1024 * 1024 * 1024)
-            logger.info(f"Job data loaded into dataframe with {len(jobs_df)} rows - Memory usage: {mem_usage:.2f} GB")
+        # Log memory usage
+        mem_usage = jobs_df.memory_usage(deep=True).sum() / (1024 * 1024 * 1024)
+        logger.info(f"Job data loaded into dataframe with {len(jobs_df)} rows - Memory usage: {mem_usage:.2f} GB")
 
-        except Exception as e:
-            logger.warning(f"Memory-optimized reading failed: {e}. Falling back to standard reading.")
-            jobs_df = pd.read_csv(job_file, low_memory=False)
-
-        # Run garbage collection to free memory
-        gc.collect()
-
-        # Optimize datatypes for memory efficiency
-        jobs_df = optimize_dataframe_dtypes(jobs_df)
-
-        # Handle problematic large integers
-        for col in jobs_df.select_dtypes(include=['int64']).columns:
-            # Check if any values exceed C long limit
-            try:
-                if jobs_df[col].max() > 2147483647 or jobs_df[col].min() < -2147483648:
-                    jobs_df[col] = jobs_df[col].astype(str)
-            except (TypeError, ValueError, OverflowError):
-                jobs_df[col] = jobs_df[col].astype(str)
-
-        # Standardize job IDs
+        # Standardize job IDs - make sure it's done before datetime conversion to avoid
+        # the str accessor on datetime error
         if "jobID" in jobs_df.columns:
-            jobs_df["jobID"] = standardize_job_id(jobs_df["jobID"])
+            if not pd.api.types.is_datetime64_any_dtype(jobs_df["jobID"]):
+                jobs_df["jobID"] = standardize_job_id(jobs_df["jobID"])
+            else:
+                logger.warning("jobID column is datetime type, skipping standardization")
         else:
             logger.warning("jobID column not found in CSV file")
-
-        # Convert datetime columns - and ensure they're datetime type, not categorical
-        datetime_cols = ["ctime", "qtime", "etime", "start", "end", "timestamp"]
-        for col in datetime_cols:
-            if col in jobs_df.columns:
-                try:
-                    jobs_df[col] = pd.to_datetime(jobs_df[col], format="%m/%d/%Y %H:%M:%S", errors='coerce')
-                except Exception as e:
-                    logger.warning(f"Error converting {col} to datetime: {e}")
 
         # Create parquet schema for output file
         schema = pa.schema([
@@ -1002,7 +1049,7 @@ def process_year_month(year, month):
 
         # Create a single writer for the output file
         with pq.ParquetWriter(str(output_file), schema, compression='snappy') as writer:
-            # Process each file sequentially, but with internal optimizations
+            # Process each file sequentially
             for i, ts_file in enumerate(ts_files):
                 # Check if termination was requested
                 if terminate_requested:
@@ -1010,11 +1057,26 @@ def process_year_month(year, month):
                     break
 
                 logger.info(f"Processing file {i + 1}/{len(ts_files)}: {ts_file.name}")
-                process_ts_file_in_parallel(ts_file, jobs_df, writer)
+
+                # Use more aggressive memory management for very large files
+                file_size_gb = os.path.getsize(ts_file) / (1024 * 1024 * 1024)
+
+                # For smaller files, we can just process the entire file at once
+                # For larger files, we use our chunking approach
+                if file_size_gb < 0.1:  # Less than 100MB
+                    logger.info(f"Small file ({file_size_gb:.2f} GB), processing in one go")
+                    success = process_entire_file(ts_file, jobs_df, writer)
+                else:
+                    # Use our chunking approach for larger files
+                    success = process_ts_file_in_parallel(ts_file, jobs_df, writer)
 
                 # Force garbage collection between files
                 gc.collect()
                 check_and_optimize_resources()
+
+                # Break if processing was not successful
+                if not success:
+                    logger.warning(f"Processing of {ts_file} was not successful, moving to next file")
 
         # Check if the output file was created properly
         if output_file.exists() and output_file.stat().st_size > 0 and not terminate_requested:
@@ -1030,6 +1092,43 @@ def process_year_month(year, month):
 
     except Exception as e:
         logger.error(f"Error processing {year}-{month}: {e}", exc_info=True)
+
+
+def process_entire_file(ts_file, jobs_df, output_writer):
+    """Process a small file in its entirety without chunking"""
+    global terminate_requested
+
+    try:
+        logger.info(f"Processing entire file: {ts_file}")
+
+        # Read the entire file
+        ts_df = pd.read_parquet(ts_file)
+
+        # Log information about the loaded dataframe
+        mem_usage = ts_df.memory_usage(deep=True).sum() / (1024 * 1024)
+        logger.info(f"Loaded entire file with {len(ts_df)} rows - Memory usage: {mem_usage:.2f} MB")
+
+        # Process the dataframe
+        result_df = process_chunk(jobs_df, ts_df, 1)
+
+        # Free memory
+        del ts_df
+        gc.collect()
+
+        # Write the result if we have one
+        if result_df is not None and not result_df.empty:
+            # Convert to PyArrow table and write to output
+            table = pa.Table.from_pandas(result_df)
+            output_writer.write_table(table)
+
+            # Release memory
+            del result_df, table
+            gc.collect()
+
+        return True
+    except Exception as e:
+        logger.error(f"Error processing file {ts_file}: {e}")
+        return False
 
 
 def signal_handler(sig, frame):
