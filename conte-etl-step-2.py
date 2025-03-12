@@ -33,8 +33,10 @@ JOB_ACCOUNTING_PATH = Path(CACHE_DIR / 'input/accounting')
 PROC_METRIC_PATH = Path(CACHE_DIR / 'input/metrics')
 OUTPUT_PATH = Path(CACHE_DIR / 'output')
 
-# Ensure output directory exists
+# Ensure directories exists
 OUTPUT_PATH.mkdir(exist_ok=True, parents=True)
+PROC_METRIC_PATH.mkdir(exist_ok=True, parents=True)
+JOB_ACCOUNTING_PATH.mkdir(exist_ok=True, parents=True)
 
 # Configuration
 MAX_WORKERS = max(1, mp.cpu_count() - 1)  # Leave one CPU core free
