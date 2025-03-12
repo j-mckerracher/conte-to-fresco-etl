@@ -325,8 +325,8 @@ def clean_up_cache():
         dirs = [JOB_ACCOUNTING_PATH, PROC_METRIC_PATH]
         for folder in dirs:
             if folder.exists():
-                logger.info("Cleaning up cache directory...")
-                for file_path in CACHE_DIR.glob("*"):
+                logger.info(f"Cleaning up {folder} directory...")
+                for file_path in folder.glob("*"):
                     if file_path.is_file():
                         file_path.unlink()
                     elif file_path.is_dir():
