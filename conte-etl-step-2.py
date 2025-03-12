@@ -747,3 +747,7 @@ def main():
             logger.warning("No data was processed. Please check your input directories and file patterns.")
     except Exception as e:
         logger.error(f"Error: {e}")
+
+
+if __name__ == "__main__":
+    main()
