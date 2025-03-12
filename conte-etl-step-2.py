@@ -2,7 +2,8 @@
 # 1. Fix the path to job accounting files
 # 2. Make sure directories are created
 # 3. Fix the file matching pattern
-
+import signal
+import sys
 import pandas as pd
 import numpy as np
 import re
@@ -29,6 +30,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Global flag to indicate termination
+terminate_requested = False
+
 # Define file paths
 CACHE_DIR = Path("./cache")
 JOB_ACCOUNTING_PATH = Path(CACHE_DIR / 'accounting')  # FIXED: Removed 'input/' prefix
@@ -46,6 +50,11 @@ MIN_FREE_MEMORY_GB = 2.0  # Minimum free memory to maintain in GB
 MIN_FREE_DISK_GB = 5.0  # Minimum free disk space to maintain in GB
 BASE_CHUNK_SIZE = 100_000  # Base chunk size for processing
 
+
+# Register the signal handler for various signals
+def setup_signal_handlers():
+    signal.signal(signal.SIGINT, signal_handler)  # Ctrl+C
+    signal.signal(signal.SIGTERM, signal_handler)  # Termination request
 
 def get_memory_usage():
     """Get current memory usage in GB"""
@@ -460,6 +469,7 @@ def optimize_dataframe_dtypes(df):
 
 def process_ts_file_in_parallel(ts_file, jobs_df, output_writer):
     """Process a single time series file with multiple threads"""
+    global terminate_requested
     logger.info(f"Processing TS file in parallel: {ts_file}")
 
     try:
@@ -493,28 +503,40 @@ def process_ts_file_in_parallel(ts_file, jobs_df, output_writer):
         with ThreadPoolExecutor(max_workers=num_workers) as executor:
             # For each chunk, create a pandas DataFrame and submit to the thread pool
             for chunk_idx in range(num_chunks):
+                # Check if termination was requested
+                if terminate_requested:
+                    logger.info("Termination requested, stopping processing of new chunks")
+                    break
+
                 # Calculate row range for this chunk
                 start_row = chunk_idx * chunk_size
                 end_row = min(start_row + chunk_size, total_rows)
 
                 try:
-                    # Try to read a row group if possible
+                    # Use row groups if possible - this is more efficient and avoids filter issues
                     if chunk_idx < parquet_file.metadata.num_row_groups:
                         chunk_df = parquet_file.read_row_group(chunk_idx).to_pandas()
                     else:
-                        # Fall back to reading a slice
-                        chunk_df = pq.read_table(ts_file,
-                                                 use_threads=True,
-                                                 filters=[('Timestamp', '>=', start_row),
-                                                          ('Timestamp', '<', end_row)]).to_pandas()
+                        # If row_groups are exhausted, read by row index instead of filtering by timestamp
+                        chunk_df = pq.read_table(
+                            ts_file,
+                            use_threads=True,
+                            columns=None,  # Read all columns
+                            row_groups=[i for i in range(
+                                chunk_idx,
+                                min(chunk_idx + 1, parquet_file.metadata.num_row_groups)
+                            )]
+                        ).to_pandas()
                 except Exception as e:
                     logger.warning(f"Standard read methods failed, trying alternative: {e}")
                     try:
-                        # Alternative approach for very large files
-                        full_table = pq.read_table(ts_file, use_threads=True)
-                        chunk_df = full_table.slice(start_row, min(chunk_size, end_row - start_row)).to_pandas()
-                        del full_table
-                        gc.collect()
+                        # Alternative approach - read just a slice of rows
+                        # Use skip and take instead of filters which can cause data type issues
+                        chunk_df = pq.read_table(
+                            ts_file,
+                            use_threads=True,
+                            columns=None,  # Read all columns
+                        ).slice(start_row, min(chunk_size, end_row - start_row)).to_pandas()
                     except Exception as e2:
                         logger.error(f"Failed to read chunk {chunk_idx}: {e2}")
                         continue
@@ -529,8 +551,13 @@ def process_ts_file_in_parallel(ts_file, jobs_df, output_writer):
                     gc.collect()
 
             # Process results as they complete
-            for future in tqdm(futures, desc=f"Processing chunks of {ts_file.name}"):
+            for future in tqdm(futures, desc=f"Processing chunks of {ts_file.name}", disable=terminate_requested):
                 try:
+                    # If termination requested, try to cancel not-started futures
+                    if terminate_requested and not future.running():
+                        future.cancel()
+                        continue
+
                     result_df = future.result()
                     if result_df is not None and not result_df.empty:
                         # Convert to PyArrow table and write to output
@@ -543,7 +570,7 @@ def process_ts_file_in_parallel(ts_file, jobs_df, output_writer):
                 except Exception as e:
                     logger.error(f"Error processing chunk: {e}")
 
-        return True
+        return not terminate_requested
     except Exception as e:
         logger.error(f"Error processing file {ts_file}: {e}")
         return False
@@ -677,32 +704,55 @@ def process_year_month(year, month):
         logger.error(f"Error processing {year}-{month}: {e}", exc_info=True)
 
 
+def signal_handler(sig, frame):
+    """Handle Ctrl+C and other termination signals"""
+    global terminate_requested
+    print("\nTermination requested. Cleaning up and exiting gracefully...")
+    terminate_requested = True
+
+    # In case of second Ctrl+C, exit immediately
+    signal.signal(signal.SIGINT, lambda sig, frame: sys.exit(1))
+
+    # Give the script a bit of time to clean up
+    logger.info("Please wait while current operations complete...")
+
+
 def main():
     """Main function to process all year-month combinations"""
+    global terminate_requested
+
+    # Set up signal handlers for graceful termination
+    setup_signal_handlers()
+
     logger.info("Starting data transformation process")
     start_time = time.time()
 
     try:
         # Initial cleanup - don't clean input data
-        # clean_up_cache()  
+        # clean_up_cache()
 
         # Get all year-month combinations
         year_month_combinations = get_year_month_combinations()
         processed_something = False
 
-        if year_month_combinations:
+        if year_month_combinations and not terminate_requested:
             # Sort combinations for ordered processing
             sorted_combinations = sorted(year_month_combinations)
 
             # Process one year-month combination at a time (as requested)
             for idx, (year, month) in enumerate(tqdm(sorted_combinations, desc="Processing year-month combinations")):
+                # Check if termination was requested
+                if terminate_requested:
+                    logger.info("Termination requested, stopping processing")
+                    break
+
                 logger.info(f"Processing combination {idx + 1}/{len(sorted_combinations)}: {year}-{month}")
                 process_year_month(year, month)
                 processed_something = True
 
                 # Check resources after each combination
                 check_and_optimize_resources()
-        else:
+        elif not terminate_requested:
             logger.warning("No common year-month combinations found to process")
 
             # Check if files exist but patterns don't match
@@ -732,7 +782,7 @@ def main():
                 logger.warning(f"TS file 2 does not exist: {ts_file2}")
 
             # If files exist but weren't detected by pattern matching, manually add them
-            if job_file.exists() and (ts_file1.exists() or ts_file2.exists()):
+            if job_file.exists() and (ts_file1.exists() or ts_file2.exists()) and not terminate_requested:
                 logger.info("Files exist but weren't detected by pattern matching. Processing 2015-07 manually.")
                 process_year_month("2015", "07")
                 processed_something = True
@@ -740,13 +790,162 @@ def main():
         # Don't clean up input data
         # clean_up_cache()
 
-        if processed_something:
+        if processed_something and not terminate_requested:
             elapsed_time = time.time() - start_time
             logger.info(f"Data transformation process completed successfully in {elapsed_time:.2f} seconds")
+        elif terminate_requested:
+            elapsed_time = time.time() - start_time
+            logger.info(f"Data transformation process was terminated after {elapsed_time:.2f} seconds")
         else:
             logger.warning("No data was processed. Please check your input directories and file patterns.")
     except Exception as e:
         logger.error(f"Error: {e}")
+
+    if terminate_requested:
+        logger.info("Clean exit after termination request")
+        sys.exit(0)
+
+
+def process_year_month(year, month):
+    """Process a specific year-month combination with intra-file parallelism"""
+    global terminate_requested
+
+    logger.info(f"Processing year: {year}, month: {month}")
+
+    # Check resources before starting
+    check_and_optimize_resources()
+
+    # Check if termination was requested
+    if terminate_requested:
+        logger.info("Termination requested, skipping processing")
+        return
+
+    try:
+        # Get job accounting file (CSV)
+        job_file = JOB_ACCOUNTING_PATH / f"{year}-{month}.csv"
+
+        # Check if job file exists
+        if not job_file.exists():
+            logger.error(f"Job file not found: {job_file}")
+            return
+
+        # Find all time series files (Parquet) for this year/month
+        # Modified pattern to match FRESCO_Conte_ts_2015_07_v5.parquet format
+        ts_files = []
+
+        # Try the FRESCO pattern first
+        fresco_files = list(PROC_METRIC_PATH.glob(f"FRESCO_Conte_ts_{year}_{month}_*.parquet"))
+        if fresco_files:
+            ts_files.extend(fresco_files)
+            logger.info(f"Found {len(fresco_files)} FRESCO pattern files")
+
+        # Try other pattern as backup
+        other_files = list(PROC_METRIC_PATH.glob(f"*_{year}_{month}_*.parquet"))
+        new_files = [f for f in other_files if f not in ts_files]
+        if new_files:
+            ts_files.extend(new_files)
+            logger.info(f"Found {len(new_files)} additional files with other pattern")
+
+        if not ts_files:
+            logger.warning(f"No time series files found for {year}-{month}")
+            # List all files in directory to help debug
+            all_files = list(PROC_METRIC_PATH.glob("*.parquet"))
+            logger.info(f"Available parquet files in directory: {[f.name for f in all_files]}")
+            return
+
+        # Log the files we found
+        for ts_file in ts_files:
+            logger.info(f"Found time series file: {ts_file}")
+
+        # Create output file path (will be Parquet)
+        output_file = OUTPUT_PATH / f"transformed_{year}_{month}.parquet"
+
+        # Read job data from CSV file
+        logger.info(f"Reading job data from file: {job_file}")
+
+        # Read with optimized dtypes
+        jobs_df = pd.read_csv(job_file, low_memory=False)
+
+        # Optimize datatypes for memory efficiency
+        jobs_df = optimize_dataframe_dtypes(jobs_df)
+
+        # Handle problematic large integers
+        for col in jobs_df.select_dtypes(include=['int64']).columns:
+            # Check if any values exceed C long limit
+            try:
+                if jobs_df[col].max() > 2147483647 or jobs_df[col].min() < -2147483648:
+                    jobs_df[col] = jobs_df[col].astype(str)
+            except (TypeError, ValueError, OverflowError):
+                jobs_df[col] = jobs_df[col].astype(str)
+
+        # Standardize job IDs
+        if "jobID" in jobs_df.columns:
+            jobs_df["jobID"] = standardize_job_id(jobs_df["jobID"])
+        else:
+            logger.warning("jobID column not found in CSV file")
+
+        # Convert datetime columns
+        datetime_cols = ["ctime", "qtime", "etime", "start", "end", "timestamp"]
+        for col in datetime_cols:
+            if col in jobs_df.columns:
+                jobs_df[col] = pd.to_datetime(jobs_df[col], format="%m/%d/%Y %H:%M:%S", errors='coerce')
+
+        # Create parquet schema for output file
+        schema = pa.schema([
+            ('time', pa.timestamp('ns', tz='UTC')),
+            ('submit_time', pa.timestamp('ns', tz='UTC')),
+            ('start_time', pa.timestamp('ns', tz='UTC')),
+            ('end_time', pa.timestamp('ns', tz='UTC')),
+            ('timelimit', pa.float64()),
+            ('nhosts', pa.float64()),
+            ('ncores', pa.float64()),
+            ('account', pa.string()),
+            ('queue', pa.string()),
+            ('host', pa.string()),
+            ('jid', pa.string()),
+            ('unit', pa.string()),
+            ('jobname', pa.string()),
+            ('exitcode', pa.string()),
+            ('host_list', pa.string()),
+            ('username', pa.string()),
+            ('value_cpuuser', pa.float64()),
+            ('value_gpu_usage', pa.float64()),
+            ('value_memused', pa.float64()),
+            ('value_memused_minus_diskcache', pa.float64()),
+            ('value_nfs', pa.float64()),
+            ('value_block', pa.float64())
+        ])
+
+        # Create a single writer for the output file
+        with pq.ParquetWriter(str(output_file), schema, compression='snappy') as writer:
+            # Process each file sequentially, but with internal parallelism
+            for i, ts_file in enumerate(ts_files):
+                # Check if termination was requested
+                if terminate_requested:
+                    logger.info("Termination requested, stopping file processing")
+                    break
+
+                logger.info(f"Processing file {i + 1}/{len(ts_files)}: {ts_file.name}")
+                process_ts_file_in_parallel(ts_file, jobs_df, writer)
+
+                # Force garbage collection between files
+                gc.collect()
+                check_and_optimize_resources()
+
+        # Check if the output file was created properly
+        if output_file.exists() and output_file.stat().st_size > 0 and not terminate_requested:
+            logger.info(f"Successfully created {output_file}")
+        elif terminate_requested:
+            logger.info(f"Processing of {year}-{month} was interrupted")
+        else:
+            logger.warning(f"No output generated for {year}-{month}")
+
+        # Clear memory
+        del jobs_df
+        gc.collect()
+
+    except Exception as e:
+        logger.error(f"Error processing {year}-{month}: {e}", exc_info=True)
 
 
 if __name__ == "__main__":
