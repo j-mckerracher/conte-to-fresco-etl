@@ -31,10 +31,10 @@ PROC_METRIC_PATH = Path(CACHE_DIR / 'input/metrics')
 OUTPUT_PATH = Path(CACHE_DIR / 'output')
 
 # Ensure directories exists
-CACHE_DIR.mkdir(exist_ok=True)
-OUTPUT_PATH.mkdir(exist_ok=True)
-PROC_METRIC_PATH.mkdir(exist_ok=True)
-JOB_ACCOUNTING_PATH.mkdir(exist_ok=True)
+# CACHE_DIR.mkdir(exist_ok=True)
+# OUTPUT_PATH.mkdir(exist_ok=True)
+# PROC_METRIC_PATH.mkdir(exist_ok=True)
+# JOB_ACCOUNTING_PATH.mkdir(exist_ok=True)
 
 # Configuration
 MAX_WORKERS = max(1, mp.cpu_count() - 1)  # Leave one CPU core free
