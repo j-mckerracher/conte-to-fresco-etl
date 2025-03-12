@@ -45,8 +45,8 @@ OUTPUT_PATH.mkdir(exist_ok=True, parents=True)
 # We don't create input directories as they should already exist with data
 
 # Configuration
-MAX_WORKERS = max(1, mp.cpu_count() - 1)  # Leave one CPU core free
-MIN_FREE_MEMORY_GB = 2.0  # Minimum free memory to maintain in GB
+MAX_WORKERS = 10  # Leave one CPU core free
+MIN_FREE_MEMORY_GB = 30.0  # Minimum free memory to maintain in GB
 MIN_FREE_DISK_GB = 5.0  # Minimum free disk space to maintain in GB
 BASE_CHUNK_SIZE = 100_000  # Base chunk size for processing
 
@@ -55,6 +55,7 @@ BASE_CHUNK_SIZE = 100_000  # Base chunk size for processing
 def setup_signal_handlers():
     signal.signal(signal.SIGINT, signal_handler)  # Ctrl+C
     signal.signal(signal.SIGTERM, signal_handler)  # Termination request
+
 
 def get_memory_usage():
     """Get current memory usage in GB"""
@@ -493,7 +494,7 @@ def process_ts_file_in_parallel(ts_file, jobs_df, output_writer):
 
         logger.info(f"File has {total_rows} rows, processing with {num_workers} threads in {num_chunks} chunks")
 
-        # Create a thread-safe queue for results
+        # Create a thread-safe queue for results (if needed)
         result_queue = Queue()
 
         # Create a list to keep track of futures
@@ -513,25 +514,21 @@ def process_ts_file_in_parallel(ts_file, jobs_df, output_writer):
                 end_row = min(start_row + chunk_size, total_rows)
 
                 try:
-                    # Use row groups if possible - this is more efficient and avoids filter issues
+                    # Use row groups if available
                     if chunk_idx < parquet_file.metadata.num_row_groups:
                         chunk_df = parquet_file.read_row_group(chunk_idx).to_pandas()
                     else:
-                        # If row_groups are exhausted, read by row index instead of filtering by timestamp
-                        chunk_df = pq.read_table(
+                        # Fallback: read the entire table and slice the rows needed
+                        full_table = pq.read_table(
                             ts_file,
                             use_threads=True,
-                            columns=None,  # Read all columns
-                            row_groups=[i for i in range(
-                                chunk_idx,
-                                min(chunk_idx + 1, parquet_file.metadata.num_row_groups)
-                            )]
-                        ).to_pandas()
+                            columns=None  # Read all columns
+                        )
+                        chunk_df = full_table.slice(start_row, min(chunk_size, end_row - start_row)).to_pandas()
                 except Exception as e:
                     logger.warning(f"Standard read methods failed, trying alternative: {e}")
                     try:
                         # Alternative approach - read just a slice of rows
-                        # Use skip and take instead of filters which can cause data type issues
                         chunk_df = pq.read_table(
                             ts_file,
                             use_threads=True,
