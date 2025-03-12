@@ -45,7 +45,7 @@ OUTPUT_PATH.mkdir(exist_ok=True, parents=True)
 # We don't create input directories as they should already exist with data
 
 # Configuration
-MAX_WORKERS = 10  # Leave one CPU core free
+MAX_WORKERS = 1
 MIN_FREE_MEMORY_GB = 30.0  # Minimum free memory to maintain in GB
 MIN_FREE_DISK_GB = 5.0  # Minimum free disk space to maintain in GB
 BASE_CHUNK_SIZE = 100_000  # Base chunk size for processing
