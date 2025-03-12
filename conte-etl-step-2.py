@@ -24,19 +24,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Create cache directory
-CACHE_DIR = Path("./cache")
-CACHE_DIR.mkdir(exist_ok=True)
-
 # Define file paths
+CACHE_DIR = Path("./cache")
 JOB_ACCOUNTING_PATH = Path(CACHE_DIR / 'input/accounting')
 PROC_METRIC_PATH = Path(CACHE_DIR / 'input/metrics')
 OUTPUT_PATH = Path(CACHE_DIR / 'output')
 
 # Ensure directories exists
-OUTPUT_PATH.mkdir(exist_ok=True, parents=True)
-PROC_METRIC_PATH.mkdir(exist_ok=True, parents=True)
-JOB_ACCOUNTING_PATH.mkdir(exist_ok=True, parents=True)
+CACHE_DIR.mkdir(exist_ok=True)
+OUTPUT_PATH.mkdir(exist_ok=True)
+PROC_METRIC_PATH.mkdir(exist_ok=True)
+JOB_ACCOUNTING_PATH.mkdir(exist_ok=True)
 
 # Configuration
 MAX_WORKERS = max(1, mp.cpu_count() - 1)  # Leave one CPU core free
