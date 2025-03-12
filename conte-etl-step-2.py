@@ -322,13 +322,15 @@ def process_chunk(jobs_df, ts_chunk, chunk_id):
 def clean_up_cache():
     """Clean up the cache directory"""
     try:
-        if CACHE_DIR.exists():
-            logger.info("Cleaning up cache directory...")
-            for file_path in CACHE_DIR.glob("*"):
-                if file_path.is_file():
-                    file_path.unlink()
-                elif file_path.is_dir():
-                    shutil.rmtree(file_path)
+        dirs = [JOB_ACCOUNTING_PATH, PROC_METRIC_PATH]
+        for folder in dirs:
+            if folder.exists():
+                logger.info("Cleaning up cache directory...")
+                for file_path in CACHE_DIR.glob("*"):
+                    if file_path.is_file():
+                        file_path.unlink()
+                    elif file_path.is_dir():
+                        shutil.rmtree(file_path)
     except Exception as e:
         logger.error(f"Error cleaning cache: {e}")
 
