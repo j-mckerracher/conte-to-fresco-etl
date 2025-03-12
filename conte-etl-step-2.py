@@ -226,43 +226,47 @@ def get_exit_status_description(df):
 
 
 def optimize_dataframe_dtypes(df):
-    """More aggressively optimize DataFrame memory usage by changing data types"""
-    # First, optimize object columns to categorical for significant memory savings
-    object_columns = df.select_dtypes(include=['object']).columns
+    """Optimize DataFrame memory usage by changing data types, but be careful with datetime columns"""
+    # Get list of datetime columns to be careful with
+    datetime_cols = []
+    for col in df.columns:
+        if pd.api.types.is_datetime64_any_dtype(df[col]):
+            datetime_cols.append(col)
 
-    for col in object_columns:
-        n_unique = df[col].nunique()
+    # Convert object columns that are mostly numeric to appropriate numeric types
+    for col in df.select_dtypes(include=['object']).columns:
+        # Skip datetime columns or columns with datetime in name
+        if col in datetime_cols or any(dt_term in col.lower() for dt_term in ["time", "date", "timestamp"]):
+            continue
 
-        # Check if this column is a good candidate for categorical
-        if n_unique is not None:  # Avoid NaN issues
-            # More aggressive categorical conversion - use 70% threshold instead of 50%
-            if n_unique < 0.7 * len(df):
-                df[col] = df[col].astype('category')
-                continue
-
-        # For strings, try to convert to numeric when possible
+        # Try to convert to numeric if appropriate
         try:
             num_values = pd.to_numeric(df[col], errors='coerce')
             # If most values can be converted to numeric, convert the column
-            if num_values.notna().sum() / len(df) > 0.7:  # More aggressive threshold
-                # Attempt integer conversion first as it uses less memory
-                if (num_values.dropna() % 1 == 0).all():
-                    # It's an integer
-                    df[col] = pd.to_numeric(df[col], downcast='integer')
-                else:
-                    # It's a float
-                    df[col] = pd.to_numeric(df[col], downcast='float')
+            if num_values.notna().sum() / len(df) > 0.8:
+                df[col] = num_values
+                # Downcast to the smallest possible numeric type
+                if df[col].notna().any():
+                    if (df[col].dropna() % 1 == 0).all():
+                        # It's an integer
+                        df[col] = pd.to_numeric(df[col], downcast='integer')
+                    else:
+                        # It's a float
+                        df[col] = pd.to_numeric(df[col], downcast='float')
         except (TypeError, ValueError):
             pass
 
-    # Optimize numeric columns
-    for col in df.select_dtypes(include=['number']).columns:
-        if df[col].notna().all() and (df[col] % 1 == 0).all():
-            # For integers, use the smallest possible integer type
-            df[col] = pd.to_numeric(df[col], downcast='integer')
-        else:
-            # For floats, use the smallest possible float type
-            df[col] = pd.to_numeric(df[col], downcast='float')
+    # Convert string columns with low cardinality to category type
+    for col in df.select_dtypes(include=['object']).columns:
+        # Skip datetime columns or columns with datetime in name
+        if col in datetime_cols or any(dt_term in col.lower() for dt_term in ["time", "date", "timestamp"]):
+            continue
+
+        # Check for string columns
+        if df[col].apply(lambda x: isinstance(x, str)).all():
+            # If less than 50% unique values, convert to category
+            if df[col].nunique() / len(df) < 0.5:
+                df[col] = df[col].astype('category')
 
     return df
 
@@ -278,9 +282,16 @@ def process_chunk(jobs_df, ts_chunk, chunk_id):
     if ts_columns_to_drop:
         ts_chunk.drop(columns=ts_columns_to_drop, inplace=True)
 
-    # Ensure Timestamp is datetime
-    if "Timestamp" in ts_chunk.columns and not pd.api.types.is_datetime64_any_dtype(ts_chunk["Timestamp"]):
-        ts_chunk["Timestamp"] = pd.to_datetime(ts_chunk["Timestamp"], errors='coerce')
+    # CRITICAL FIX: Ensure Timestamp is datetime type and not categorical
+    if "Timestamp" in ts_chunk.columns:
+        # Check if it's categorical first
+        if pd.api.types.is_categorical_dtype(ts_chunk["Timestamp"]):
+            logger.info("Converting Timestamp from categorical to datetime")
+            temp_values = ts_chunk["Timestamp"].astype(str)
+            ts_chunk["Timestamp"] = pd.to_datetime(temp_values, errors='coerce')
+        # Make sure it's datetime regardless
+        elif not pd.api.types.is_datetime64_any_dtype(ts_chunk["Timestamp"]):
+            ts_chunk["Timestamp"] = pd.to_datetime(ts_chunk["Timestamp"], errors='coerce')
 
     # Keep only necessary columns from jobs_df for this join
     required_job_columns = ["jobID", "start", "end", "qtime", "Resource_List.walltime",
@@ -292,7 +303,18 @@ def process_chunk(jobs_df, ts_chunk, chunk_id):
     job_columns_to_use = [col for col in required_job_columns if col in jobs_df.columns]
     jobs_subset = jobs_df[job_columns_to_use]
 
-    # Join time series chunk with jobs data on jobID - do this in-place to save memory
+    # CRITICAL FIX: Ensure datetime columns in jobs_df are proper datetime
+    datetime_cols = ["start", "end", "qtime"]
+    for col in datetime_cols:
+        if col in jobs_subset.columns:
+            if pd.api.types.is_categorical_dtype(jobs_subset[col]):
+                logger.info(f"Converting {col} from categorical to datetime")
+                temp_values = jobs_subset[col].astype(str)
+                jobs_subset[col] = pd.to_datetime(temp_values, errors='coerce')
+            elif not pd.api.types.is_datetime64_any_dtype(jobs_subset[col]):
+                jobs_subset[col] = pd.to_datetime(jobs_subset[col], errors='coerce')
+
+    # Join time series chunk with jobs data on jobID
     joined = pd.merge(
         ts_chunk,
         jobs_subset,
@@ -301,7 +323,7 @@ def process_chunk(jobs_df, ts_chunk, chunk_id):
         how="inner"
     )
 
-    # Release memory from unnecessary dataframes
+    # Release memory from the input chunks since they're no longer needed
     del ts_chunk
     del jobs_subset
     gc.collect()  # Force garbage collection
@@ -311,19 +333,43 @@ def process_chunk(jobs_df, ts_chunk, chunk_id):
     if joined.empty:
         return None
 
-    # Filter timestamps that fall between job start and end times
-    mask = (joined["Timestamp"] >= joined["start"]) & (joined["Timestamp"] <= joined["end"])
+    # Double-check datetime types before filtering to avoid the categorical error
+    for col in ["Timestamp", "start", "end"]:
+        if col in joined.columns:
+            # Ensure it's not categorical
+            if pd.api.types.is_categorical_dtype(joined[col]):
+                # Convert to datetime for safe comparison
+                logger.info(f"Converting {col} from categorical to datetime for comparison")
+                temp_values = joined[col].astype(str)
+                joined[col] = pd.to_datetime(temp_values, errors='coerce')
+            elif not pd.api.types.is_datetime64_any_dtype(joined[col]):
+                joined[col] = pd.to_datetime(joined[col], errors='coerce')
 
-    # Apply the filter in-place instead of creating a copy
-    joined = joined.loc[mask]
+    try:
+        # Filter timestamps that fall between job start and end times
+        mask = (joined["Timestamp"] >= joined["start"]) & (joined["Timestamp"] <= joined["end"])
+        # Apply the filter in-place instead of creating a copy to save memory
+        filtered = joined.loc[mask]
+    except Exception as e:
+        logger.error(f"Comparison failed with error: {str(e)}")
+        # Log detailed information about column types
+        for col in ["Timestamp", "start", "end"]:
+            if col in joined.columns:
+                logger.error(f"Column {col} dtype: {joined[col].dtype}")
+                logger.error(f"Sample values: {joined[col].head(3)}")
+        raise
 
-    logger.debug(f"Thread {thread_id}: Filtered dataframe has {len(joined)} rows")
+    # Release memory from joined dataframe
+    del joined
+    gc.collect()
 
-    if joined.empty:
+    logger.debug(f"Thread {thread_id}: Filtered dataframe has {len(filtered)} rows")
+
+    if filtered.empty:
         return None
 
     # Process events more efficiently to reduce memory usage
-    events = joined['Event'].unique()
+    events = filtered['Event'].unique()
 
     # Create only the necessary columns with NaN values
     for event in events:
@@ -333,14 +379,14 @@ def process_chunk(jobs_df, ts_chunk, chunk_id):
             col_name = event
 
         # Create the column with NaN values
-        joined[col_name] = np.nan
+        filtered[col_name] = np.nan
 
-        # Fill values only for matching event rows (in-place)
-        event_mask = joined['Event'] == event
-        joined.loc[event_mask, col_name] = joined.loc[event_mask, 'Value']
+        # Fill values only for matching event rows
+        event_mask = filtered['Event'] == event
+        filtered.loc[event_mask, col_name] = filtered.loc[event_mask, 'Value']
 
     # Drop Event and Value columns to save memory
-    joined.drop(columns=['Event', 'Value'], inplace=True)
+    filtered.drop(columns=['Event', 'Value'], inplace=True)
 
     # Map columns efficiently
     column_mapping = {
@@ -370,24 +416,24 @@ def process_chunk(jobs_df, ts_chunk, chunk_id):
     }
 
     # Only rename columns that exist
-    existing_cols = {col: mapping for col, mapping in column_mapping.items() if col in joined.columns}
-    joined.rename(columns=existing_cols, inplace=True)  # Rename in-place
+    existing_cols = {col: mapping for col, mapping in column_mapping.items() if col in filtered.columns}
+    filtered.rename(columns=existing_cols, inplace=True)  # Rename in-place
 
     # Process special cases
-    if "timelimit" in joined.columns:
-        joined["timelimit"] = convert_walltime_to_seconds(joined["timelimit"])
+    if "timelimit" in filtered.columns:
+        filtered["timelimit"] = convert_walltime_to_seconds(filtered["timelimit"])
 
-    if "host_list" in joined.columns:
-        joined["host_list"] = parse_host_list(joined["host_list"])
+    if "host_list" in filtered.columns:
+        filtered["host_list"] = parse_host_list(filtered["host_list"])
 
     # Generate exitcode from jobevent and Exit_status using vectorized approach
-    if "jobevent" in joined.columns:
-        joined["exitcode"] = get_exit_status_description(joined)
+    if "jobevent" in filtered.columns:
+        filtered["exitcode"] = get_exit_status_description(filtered)
 
         # Remove the source columns after processing
-        columns_to_drop = [col for col in ["jobevent", "Exit_status"] if col in joined.columns]
+        columns_to_drop = [col for col in ["jobevent", "Exit_status"] if col in filtered.columns]
         if columns_to_drop:
-            joined.drop(columns=columns_to_drop, inplace=True)
+            filtered.drop(columns=columns_to_drop, inplace=True)
 
     # Ensure all required columns exist in the output
     set3_columns = ["time", "submit_time", "start_time", "end_time", "timelimit",
@@ -398,26 +444,26 @@ def process_chunk(jobs_df, ts_chunk, chunk_id):
 
     # Add missing columns
     for col in set3_columns:
-        if col not in joined.columns:
-            joined[col] = np.nan
+        if col not in filtered.columns:
+            filtered[col] = np.nan
 
-    # Convert datetime columns to UTC timezone
+    # Convert datetime columns to UTC timezone - doing this carefully to prevent errors
     datetime_cols = ["time", "submit_time", "start_time", "end_time"]
     for col in datetime_cols:
-        if col in joined.columns and joined[col].notna().any():
+        if col in filtered.columns and filtered[col].notna().any():
             try:
                 # Check if timezone info already exists
-                sample_dt = joined.loc[joined[col].first_valid_index(), col]
+                sample_dt = filtered.loc[filtered[col].first_valid_index(), col]
                 if hasattr(sample_dt, 'tzinfo') and sample_dt.tzinfo is None:
-                    joined[col] = joined[col].dt.tz_localize('UTC')
-            except (TypeError, AttributeError):
-                logger.warning(f"Failed to localize timezone for {col}. Skipping.")
+                    filtered[col] = filtered[col].dt.tz_localize('UTC')
+            except (TypeError, AttributeError) as e:
+                logger.warning(f"Failed to localize timezone for {col}: {e}. Skipping.")
 
     # Select only the columns needed for output and ensure correct order
-    available_columns = [col for col in set3_columns if col in joined.columns]
-    result = joined[available_columns]
+    available_columns = [col for col in set3_columns if col in filtered.columns]
+    result = filtered[available_columns]
 
-    # Optimize the result dataframe
+    # Optimize the result dataframe, being careful not to convert datetime columns to categorical
     result = optimize_dataframe_dtypes(result)
 
     logger.info(f"Thread {thread_id}: Completed processing chunk {chunk_id} - produced {len(result)} rows")
@@ -668,8 +714,13 @@ def read_jobs_df(job_file):
     # Analyze column types in sample
     dtypes = {}
     categorical_columns = []
+    datetime_columns = ["ctime", "qtime", "etime", "start", "end", "timestamp", "Timestamp"]
 
     for col in sample_df.columns:
+        # Skip datetime columns
+        if col in datetime_columns or any(dt_term in col.lower() for dt_term in ["time", "date", "timestamp"]):
+            continue
+
         nunique = sample_df[col].nunique()
 
         # Handle column type assignment
@@ -708,11 +759,10 @@ def read_jobs_df(job_file):
     else:
         logger.warning("jobID column not found in CSV file")
 
-    # Convert datetime columns - but use optimized approach
-    datetime_cols = ["ctime", "qtime", "etime", "start", "end", "timestamp"]
-    for col in datetime_cols:
+    # Convert datetime columns explicitly
+    for col in datetime_columns:
         if col in jobs_df.columns:
-            jobs_df[col] = pd.to_datetime(jobs_df[col], format="%m/%d/%Y %H:%M:%S", errors='coerce', cache=True)
+            jobs_df[col] = pd.to_datetime(jobs_df[col], format="%m/%d/%Y %H:%M:%S", errors='coerce')
 
     return jobs_df
 
