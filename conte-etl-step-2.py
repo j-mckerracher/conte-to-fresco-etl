@@ -1,7 +1,3 @@
-# The key fixes
-# 1. Fix the path to job accounting files
-# 2. Make sure directories are created
-# 3. Fix the file matching pattern
 import signal
 import sys
 import pandas as pd
@@ -44,15 +40,20 @@ CACHE_DIR.mkdir(exist_ok=True)
 OUTPUT_PATH.mkdir(exist_ok=True, parents=True)
 # We don't create input directories as they should already exist with data
 
-# 1. Adjust these global settings to be more memory-conservative
-MAX_WORKERS = 1  # Reduce from whatever it is currently set to
-MIN_FREE_MEMORY_GB = 2.0  # Lower minimum free memory threshold to be more aggressive
+# Configuration
+MAX_WORKERS = 1  # Keep at 1 for better memory management
+MIN_FREE_MEMORY_GB = 2.0  # Lower this to be more aggressive with memory management
 MIN_FREE_DISK_GB = 5.0  # Keep as is
-BASE_CHUNK_SIZE = 50_000  # Reduce from 100,000 to 50,000
+BASE_CHUNK_SIZE = 50_000  # Reduce from 100,000 to 50,000 for smaller chunks
+MAX_MEMORY_USAGE_GB = 25.0  # Lower the limit from 30GB to 25GB for more headroom
+MEMORY_CHECK_INTERVAL = 0.1  # Check memory usage frequently
 
-# Adjust constants and add memory management controls
-MAX_MEMORY_USAGE_GB = 30.0  # Set maximum allowed memory usage
-MEMORY_CHECK_INTERVAL = 0.1  # Check memory usage every 10% of chunks
+# Force pandas to use specific memory optimization settings
+pd.options.mode.use_inf_as_na = True  # Convert inf to NaN (saves memory in some cases)
+pd.options.mode.string_storage = 'python'  # Use Python's memory-efficient string storage
+
+# Disable the SettingWithCopyWarning which can slow things down
+pd.options.mode.chained_assignment = None
 
 
 # Register the signal handler for various signals
@@ -79,28 +80,7 @@ def get_free_disk_space():
     return free / (1024 * 1024 * 1024)
 
 
-def memory_monitor():
-    """Thread to monitor memory usage and set terminate flag if needed"""
-    global terminate_requested
 
-    while not terminate_requested:
-        current_memory = get_memory_usage()
-        available_memory = get_available_memory()
-
-        if current_memory > MAX_MEMORY_USAGE_GB:
-            logger.warning(f"Memory usage exceeded limit: {current_memory:.2f}GB > {MAX_MEMORY_USAGE_GB}GB")
-            logger.warning("Requesting graceful termination")
-            terminate_requested = True
-            break
-
-        if available_memory < 1.0:  # Critical memory situation - less than 1GB free
-            logger.warning(f"Critical memory situation: only {available_memory:.2f}GB available")
-            logger.warning("Requesting graceful termination")
-            terminate_requested = True
-            break
-
-        # Sleep to avoid constant CPU usage
-        time.sleep(5)
 
 
 def calculate_chunk_size(current_size=BASE_CHUNK_SIZE):
@@ -232,41 +212,75 @@ def optimize_dataframe_dtypes(df):
     for col in df.columns:
         if pd.api.types.is_datetime64_any_dtype(df[col]):
             datetime_cols.append(col)
+        # Also identify columns with datetime-related names
+        elif col in ["time", "date", "timestamp", "start_time", "end_time", "submit_time"] or any(
+                dt_term in col.lower() for dt_term in ["time", "date", "timestamp"]):
+            datetime_cols.append(col)
 
     # Convert object columns that are mostly numeric to appropriate numeric types
     for col in df.select_dtypes(include=['object']).columns:
-        # Skip datetime columns or columns with datetime in name
-        if col in datetime_cols or any(dt_term in col.lower() for dt_term in ["time", "date", "timestamp"]):
+        # Skip datetime columns
+        if col in datetime_cols:
             continue
 
         # Try to convert to numeric if appropriate
         try:
-            num_values = pd.to_numeric(df[col], errors='coerce')
-            # If most values can be converted to numeric, convert the column
-            if num_values.notna().sum() / len(df) > 0.8:
-                df[col] = num_values
-                # Downcast to the smallest possible numeric type
-                if df[col].notna().any():
-                    if (df[col].dropna() % 1 == 0).all():
-                        # It's an integer
-                        df[col] = pd.to_numeric(df[col], downcast='integer')
-                    else:
-                        # It's a float
-                        df[col] = pd.to_numeric(df[col], downcast='float')
-        except (TypeError, ValueError):
+            # Only convert if most values are numeric to avoid unnecessary work
+            sample = df[col].dropna().head(100)
+            if len(sample) > 0 and pd.to_numeric(sample, errors='coerce').notna().mean() > 0.8:
+                # Convert just numeric values
+                num_values = pd.to_numeric(df[col], errors='coerce')
+                # If most values can be converted to numeric, convert the column
+                if num_values.notna().sum() / len(df) > 0.8:
+                    df[col] = num_values
+                    # Downcast to the smallest possible numeric type
+                    if df[col].notna().any():
+                        if (df[col].dropna() % 1 == 0).all():
+                            # It's an integer
+                            df[col] = pd.to_numeric(df[col], downcast='integer')
+                        else:
+                            # It's a float
+                            df[col] = pd.to_numeric(df[col], downcast='float')
+        except (TypeError, ValueError) as e:
+            # Just continue if there's an error
             pass
 
-    # Convert string columns with low cardinality to category type
+    # Convert string columns with low cardinality to category type - but be careful
     for col in df.select_dtypes(include=['object']).columns:
-        # Skip datetime columns or columns with datetime in name
-        if col in datetime_cols or any(dt_term in col.lower() for dt_term in ["time", "date", "timestamp"]):
+        # Skip datetime columns
+        if col in datetime_cols:
             continue
 
-        # Check for string columns
-        if df[col].apply(lambda x: isinstance(x, str)).all():
-            # If less than 50% unique values, convert to category
-            if df[col].nunique() / len(df) < 0.5:
-                df[col] = df[col].astype('category')
+        # Check for string columns, but do it safely
+        try:
+            # Count strings in a sample
+            sample = df[col].dropna().head(1000)
+            if len(sample) > 0:
+                string_count = sum(isinstance(x, str) for x in sample)
+                # If most values are strings
+                if string_count / len(sample) > 0.9:
+                    # Only convert if there's a reasonable number of unique values
+                    nunique = df[col].nunique()
+                    if nunique is not None and nunique < len(df) * 0.5 and nunique < 10000:
+                        df[col] = df[col].astype('category')
+        except Exception as e:
+            # Just continue if there's an error
+            pass
+
+    # Downcast numeric columns to save memory
+    for col in df.select_dtypes(include=['number']).columns:
+        # Skip datetime columns
+        if col in datetime_cols:
+            continue
+
+        try:
+            if pd.api.types.is_float_dtype(df[col]):
+                df[col] = pd.to_numeric(df[col], downcast='float')
+            elif pd.api.types.is_integer_dtype(df[col]):
+                df[col] = pd.to_numeric(df[col], downcast='integer')
+        except Exception as e:
+            # Just continue if there's an error
+            pass
 
     return df
 
@@ -284,11 +298,13 @@ def process_chunk(jobs_df, ts_chunk, chunk_id):
 
     # CRITICAL FIX: Ensure Timestamp is datetime type and not categorical
     if "Timestamp" in ts_chunk.columns:
-        # Check if it's categorical first
-        if pd.api.types.is_categorical_dtype(ts_chunk["Timestamp"]):
+        # Check if it's categorical first (using the non-deprecated method)
+        if isinstance(ts_chunk["Timestamp"].dtype, pd.CategoricalDtype):
             logger.info("Converting Timestamp from categorical to datetime")
-            temp_values = ts_chunk["Timestamp"].astype(str)
-            ts_chunk["Timestamp"] = pd.to_datetime(temp_values, errors='coerce')
+            # Convert to objects first to avoid .str accessor errors with non-string values
+            ts_chunk["Timestamp"] = ts_chunk["Timestamp"].astype(object)
+            # Then convert to datetime
+            ts_chunk["Timestamp"] = pd.to_datetime(ts_chunk["Timestamp"], errors='coerce')
         # Make sure it's datetime regardless
         elif not pd.api.types.is_datetime64_any_dtype(ts_chunk["Timestamp"]):
             ts_chunk["Timestamp"] = pd.to_datetime(ts_chunk["Timestamp"], errors='coerce')
@@ -301,16 +317,18 @@ def process_chunk(jobs_df, ts_chunk, chunk_id):
 
     # Only keep columns that actually exist in jobs_df
     job_columns_to_use = [col for col in required_job_columns if col in jobs_df.columns]
-    jobs_subset = jobs_df[job_columns_to_use]
+    jobs_subset = jobs_df[job_columns_to_use].copy()
 
     # CRITICAL FIX: Ensure datetime columns in jobs_df are proper datetime
     datetime_cols = ["start", "end", "qtime"]
     for col in datetime_cols:
         if col in jobs_subset.columns:
-            if pd.api.types.is_categorical_dtype(jobs_subset[col]):
+            if isinstance(jobs_subset[col].dtype, pd.CategoricalDtype):
                 logger.info(f"Converting {col} from categorical to datetime")
-                temp_values = jobs_subset[col].astype(str)
-                jobs_subset[col] = pd.to_datetime(temp_values, errors='coerce')
+                # Convert to objects first
+                jobs_subset[col] = jobs_subset[col].astype(object)
+                # Then convert to datetime
+                jobs_subset[col] = pd.to_datetime(jobs_subset[col], errors='coerce')
             elif not pd.api.types.is_datetime64_any_dtype(jobs_subset[col]):
                 jobs_subset[col] = pd.to_datetime(jobs_subset[col], errors='coerce')
 
@@ -336,19 +354,20 @@ def process_chunk(jobs_df, ts_chunk, chunk_id):
     # Double-check datetime types before filtering to avoid the categorical error
     for col in ["Timestamp", "start", "end"]:
         if col in joined.columns:
-            # Ensure it's not categorical
-            if pd.api.types.is_categorical_dtype(joined[col]):
-                # Convert to datetime for safe comparison
+            # Ensure it's not categorical (using non-deprecated method)
+            if isinstance(joined[col].dtype, pd.CategoricalDtype):
+                # Convert to objects first
                 logger.info(f"Converting {col} from categorical to datetime for comparison")
-                temp_values = joined[col].astype(str)
-                joined[col] = pd.to_datetime(temp_values, errors='coerce')
+                joined[col] = joined[col].astype(object)
+                # Then convert to datetime
+                joined[col] = pd.to_datetime(joined[col], errors='coerce')
             elif not pd.api.types.is_datetime64_any_dtype(joined[col]):
                 joined[col] = pd.to_datetime(joined[col], errors='coerce')
 
     try:
         # Filter timestamps that fall between job start and end times
         mask = (joined["Timestamp"] >= joined["start"]) & (joined["Timestamp"] <= joined["end"])
-        # Apply the filter in-place instead of creating a copy to save memory
+        # Apply the filter in-place to reduce memory usage
         filtered = joined.loc[mask]
     except Exception as e:
         logger.error(f"Comparison failed with error: {str(e)}")
@@ -452,10 +471,13 @@ def process_chunk(jobs_df, ts_chunk, chunk_id):
     for col in datetime_cols:
         if col in filtered.columns and filtered[col].notna().any():
             try:
-                # Check if timezone info already exists
-                sample_dt = filtered.loc[filtered[col].first_valid_index(), col]
-                if hasattr(sample_dt, 'tzinfo') and sample_dt.tzinfo is None:
-                    filtered[col] = filtered[col].dt.tz_localize('UTC')
+                # Get the first valid index carefully
+                valid_idx = filtered[filtered[col].notna()].index
+                if len(valid_idx) > 0:
+                    first_valid = valid_idx[0]
+                    sample_dt = filtered.loc[first_valid, col]
+                    if hasattr(sample_dt, 'tzinfo') and sample_dt.tzinfo is None:
+                        filtered[col] = filtered[col].dt.tz_localize('UTC')
             except (TypeError, AttributeError) as e:
                 logger.warning(f"Failed to localize timezone for {col}: {e}. Skipping.")
 
@@ -466,7 +488,11 @@ def process_chunk(jobs_df, ts_chunk, chunk_id):
     # Optimize the result dataframe, being careful not to convert datetime columns to categorical
     result = optimize_dataframe_dtypes(result)
 
-    logger.info(f"Thread {thread_id}: Completed processing chunk {chunk_id} - produced {len(result)} rows")
+    # Add memory usage logging
+    mem_usage = result.memory_usage(deep=True).sum() / (1024 * 1024)
+    logger.info(
+        f"Thread {thread_id}: Completed processing chunk {chunk_id} - produced {len(result)} rows - Memory usage: {mem_usage:.2f} MB")
+
     return result
 
 
@@ -573,138 +599,6 @@ def get_year_month_combinations():
     return common_years_months
 
 
-def process_ts_file_in_parallel(ts_file, jobs_df, output_writer):
-    """Process a single time series file with reduced memory usage"""
-    global terminate_requested
-    logger.info(f"Processing TS file: {ts_file}")
-
-    try:
-        # Get the file size to estimate appropriate chunk count
-        file_size = os.path.getsize(ts_file)
-
-        # Try to read just the file metadata without loading everything
-        parquet_file = pq.ParquetFile(ts_file)
-        total_rows = parquet_file.metadata.num_rows
-
-        # Use more conservative chunk sizing
-        available_memory_gb = get_available_memory()
-        current_memory_gb = get_memory_usage()
-
-        # Dynamic chunk sizing based on current memory situation
-        max_allowed_increase = min(2.0, available_memory_gb / 4)  # At most 2GB increase or 1/4 of available
-        estimated_bytes_per_row = file_size / total_rows if total_rows > 0 else 1000
-
-        # Calculate how many rows we can safely process in one chunk
-        safe_rows = int((max_allowed_increase * 1024 * 1024 * 1024) / estimated_bytes_per_row / 2)
-
-        # Clamp chunk size between more conservative bounds
-        chunk_size = max(10_000, min(safe_rows, 200_000))
-
-        # Calculate number of chunks
-        num_chunks = (total_rows + chunk_size - 1) // chunk_size  # Ceiling division
-
-        # Use just 1 worker for more predictable memory usage
-        num_workers = 1
-
-        logger.info(
-            f"File has {total_rows} rows, processing with {num_workers} thread in {num_chunks} chunks of {chunk_size} rows")
-
-        # Process file in chunks sequentially to better control memory
-        # Only submit one chunk at a time to executor
-        with ThreadPoolExecutor(max_workers=num_workers) as executor:
-            futures = []
-
-            # For each chunk, process sequentially
-            for chunk_idx in range(num_chunks):
-                # Check if termination was requested
-                if terminate_requested:
-                    logger.info("Termination requested, stopping processing of new chunks")
-                    break
-
-                # Check memory before processing each chunk
-                current_memory = get_memory_usage()
-                available_memory = get_available_memory()
-
-                if current_memory > MAX_MEMORY_USAGE_GB:
-                    logger.warning(f"Memory usage too high: {current_memory:.2f}GB. Pausing chunk processing.")
-                    # Force garbage collection
-                    gc.collect()
-                    time.sleep(5)  # Wait for memory to be freed
-
-                    # If still too high, terminate
-                    if get_memory_usage() > MAX_MEMORY_USAGE_GB:
-                        logger.warning("Memory still too high after cleanup. Requesting termination.")
-                        terminate_requested = True
-                        break
-
-                # Calculate row range for this chunk
-                start_row = chunk_idx * chunk_size
-                end_row = min(start_row + chunk_size, total_rows)
-
-                try:
-                    # Use row groups if possible for more efficient reading
-                    chunk_df = None
-                    try:
-                        if chunk_idx < parquet_file.metadata.num_row_groups:
-                            chunk_df = parquet_file.read_row_group(chunk_idx).to_pandas()
-                        else:
-                            # Read slice using PyArrow for better memory efficiency
-                            table_slice = pq.read_table(
-                                ts_file,
-                                use_threads=False,  # Disable threads for more predictable memory usage
-                                columns=None,  # Read all columns
-                                filters=[('row_index', '>=', start_row), ('row_index', '<', end_row)]
-                            )
-                            chunk_df = table_slice.to_pandas()
-                    except Exception as e:
-                        logger.warning(f"First approach failed: {e}, trying alternative")
-                        # Fall back to reading slice from disk in a different way
-                        table = pq.read_table(
-                            ts_file,
-                            use_threads=False,
-                            columns=None,
-                        )
-                        chunk_df = table.slice(start_row, min(chunk_size, end_row - start_row)).to_pandas()
-                        del table  # Free memory immediately
-                        gc.collect()  # Force garbage collection
-
-                    # Optimize chunk data types immediately to reduce memory
-                    if chunk_df is not None and not chunk_df.empty:
-                        # Apply memory optimizations immediately
-                        chunk_df = optimize_dataframe_dtypes(chunk_df)
-
-                        # Process one chunk at a time and wait for it
-                        future = executor.submit(process_chunk, jobs_df, chunk_df, chunk_idx + 1)
-                        futures.append(future)
-
-                        # Clean up chunk dataframe to free memory
-                        del chunk_df
-                        gc.collect()
-
-                        # Wait for this chunk to complete before starting next one
-                        result_df = future.result()
-                        if result_df is not None and not result_df.empty:
-                            # Convert to PyArrow table and write to output
-                            table = pa.Table.from_pandas(result_df)
-                            output_writer.write_table(table)
-
-                            # Release memory
-                            del result_df, table
-                            futures = []  # Clear processed future
-                            gc.collect()
-                except Exception as e:
-                    logger.error(f"Error processing chunk {chunk_idx}: {e}")
-                    continue
-
-                # Check and optimize resources after each chunk
-                check_and_optimize_resources()
-
-        return not terminate_requested
-    except Exception as e:
-        logger.error(f"Error processing file {ts_file}: {e}")
-        return False
-
-
 def read_jobs_df(job_file):
     """Read job data from CSV with optimized memory usage from the start"""
     # First, determine column data types by scanning sample
@@ -767,12 +661,210 @@ def read_jobs_df(job_file):
     return jobs_df
 
 
+def memory_monitor():
+    """Thread to monitor memory usage and set terminate flag if needed"""
+    global terminate_requested
+
+    while not terminate_requested:
+        current_memory = get_memory_usage()
+        available_memory = get_available_memory()
+
+        # Log memory status periodically
+        logger.debug(f"Memory monitor: Usage {current_memory:.2f}GB, Available {available_memory:.2f}GB")
+
+        # Alert when approaching limit
+        if current_memory > MAX_MEMORY_USAGE_GB * 0.8 and current_memory < MAX_MEMORY_USAGE_GB:
+            logger.warning(f"Memory usage approaching limit: {current_memory:.2f}GB / {MAX_MEMORY_USAGE_GB}GB")
+            # Try to free some memory
+            gc.collect()
+
+        if current_memory > MAX_MEMORY_USAGE_GB:
+            logger.warning(f"Memory usage exceeded limit: {current_memory:.2f}GB > {MAX_MEMORY_USAGE_GB}GB")
+            logger.warning("Requesting graceful termination")
+            terminate_requested = True
+            break
+
+        if available_memory < 1.0:  # Critical memory situation - less than 1GB free
+            logger.warning(f"Critical memory situation: only {available_memory:.2f}GB available")
+            logger.warning("Requesting graceful termination")
+            terminate_requested = True
+            break
+
+        # Sleep to avoid constant CPU usage
+        time.sleep(5)
+
+
+def process_ts_file_in_parallel(ts_file, jobs_df, output_writer):
+    """Process a single time series file with reduced memory usage"""
+    global terminate_requested
+    logger.info(f"Processing TS file: {ts_file}")
+
+    try:
+        # Get the file size to estimate appropriate chunk count
+        file_size = os.path.getsize(ts_file)
+
+        # Try to read just the file metadata without loading everything
+        parquet_file = pq.ParquetFile(ts_file)
+        total_rows = parquet_file.metadata.num_rows
+
+        # Use more conservative chunk sizing
+        available_memory_gb = get_available_memory()
+        current_memory_gb = get_memory_usage()
+
+        # Dynamic chunk sizing based on current memory situation
+        # Much more conservative approach here - aim for less than 2GB per chunk
+        max_allowed_chunk_gb = 2.0
+        estimated_bytes_per_row = file_size / total_rows if total_rows > 0 else 1000
+
+        # Calculate how many rows we can safely process in one chunk
+        safe_rows = int((max_allowed_chunk_gb * 1024 * 1024 * 1024) / estimated_bytes_per_row / 2)
+
+        # Clamp chunk size between more conservative bounds
+        chunk_size = max(10_000, min(safe_rows, 200_000))
+
+        # Calculate number of chunks
+        num_chunks = (total_rows + chunk_size - 1) // chunk_size  # Ceiling division
+
+        # Use just 1 worker for more predictable memory usage
+        num_workers = 1
+
+        logger.info(
+            f"File has {total_rows} rows, processing with {num_workers} thread in {num_chunks} chunks of {chunk_size} rows")
+
+        # Process file in chunks sequentially to better control memory
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            # For each chunk, process sequentially
+            for chunk_idx in range(num_chunks):
+                # Check if termination was requested
+                if terminate_requested:
+                    logger.info("Termination requested, stopping processing of new chunks")
+                    break
+
+                # Check memory before processing each chunk
+                current_memory = get_memory_usage()
+                available_memory = get_available_memory()
+
+                # If memory is high, wait for it to decrease before processing the next chunk
+                while current_memory > MAX_MEMORY_USAGE_GB * 0.9 and not terminate_requested:
+                    logger.warning(f"Memory usage too high: {current_memory:.2f}GB. Pausing chunk processing.")
+                    # Force garbage collection
+                    gc.collect()
+                    time.sleep(5)  # Wait for memory to be freed
+
+                    # Check again
+                    current_memory = get_memory_usage()
+
+                    # If we've waited and memory is still too high, terminate
+                    if current_memory > MAX_MEMORY_USAGE_GB:
+                        logger.warning("Memory still too high after cleanup. Requesting termination.")
+                        terminate_requested = True
+                        break
+
+                # Skip this chunk if termination was requested during the memory wait
+                if terminate_requested:
+                    break
+
+                # Calculate row range for this chunk
+                start_row = chunk_idx * chunk_size
+                end_row = min(start_row + chunk_size, total_rows)
+
+                try:
+                    # Use row groups if possible for more efficient reading
+                    chunk_df = None
+
+                    # Try different approaches to read the chunk
+                    try:
+                        # First approach: read row group directly if available
+                        if chunk_idx < parquet_file.metadata.num_row_groups:
+                            chunk_df = parquet_file.read_row_group(chunk_idx).to_pandas()
+                        else:
+                            # Use PyArrow for better memory efficiency
+                            # Try filtering by row index if available
+                            try:
+                                table_slice = pq.read_table(
+                                    ts_file,
+                                    use_threads=False,  # Disable threads for more predictable memory usage
+                                    filters=[('row_index', '>=', start_row), ('row_index', '<', end_row)]
+                                )
+                                chunk_df = table_slice.to_pandas()
+                            except Exception as e_filter:
+                                logger.warning(f"Filter approach failed: {e_filter}, trying slice")
+                                # Read the entire parquet file and slice it
+                                table = pq.read_table(ts_file, use_threads=False)
+                                chunk_df = table.slice(start_row, min(chunk_size, end_row - start_row)).to_pandas()
+                                del table  # Free memory immediately
+                    except Exception as e:
+                        logger.warning(f"First approach failed: {e}, trying alternative")
+                        # Final fallback: read the file directly with pandas
+                        try:
+                            # Use pyarrow engine for better memory efficiency
+                            chunk_df = pd.read_parquet(
+                                ts_file,
+                                engine='pyarrow',
+                                use_threads=False,
+                                # Read just this chunk of rows
+                                skiprows=range(0, start_row),
+                                nrows=min(chunk_size, end_row - start_row)
+                            )
+                        except Exception as e2:
+                            logger.error(f"All reading methods failed for chunk {chunk_idx}: {e2}")
+                            continue
+
+                    # Force garbage collection after reading
+                    gc.collect()
+
+                    # Optimize chunk data types immediately to reduce memory
+                    if chunk_df is not None and not chunk_df.empty:
+                        # Log chunk read success with memory usage
+                        mem_usage = chunk_df.memory_usage(deep=True).sum() / (1024 * 1024)
+                        logger.info(
+                            f"Successfully read chunk {chunk_idx + 1}/{num_chunks} with {len(chunk_df)} rows - Memory: {mem_usage:.2f} MB")
+
+                        # Apply memory optimizations immediately
+                        chunk_df = optimize_dataframe_dtypes(chunk_df)
+
+                        # Process the chunk
+                        result_df = process_chunk(jobs_df, chunk_df, chunk_idx + 1)
+
+                        # Clean up chunk dataframe to free memory
+                        del chunk_df
+                        gc.collect()
+
+                        # Write results if we have any
+                        if result_df is not None and not result_df.empty:
+                            # Convert to PyArrow table and write to output
+                            table = pa.Table.from_pandas(result_df)
+                            output_writer.write_table(table)
+
+                            # Release memory
+                            del result_df, table
+                            gc.collect()
+                except Exception as e:
+                    logger.error(f"Error processing chunk {chunk_idx}: {e}")
+                    continue
+
+                # Check and optimize resources after each chunk
+                check_and_optimize_resources()
+
+        return not terminate_requested
+    except Exception as e:
+        logger.error(f"Error processing file {ts_file}: {e}")
+        return False
+
+
 def process_year_month(year, month):
-    """Process a specific year-month combination with intra-file parallelism"""
+    """Process a specific year-month combination with reduced memory usage"""
+    global terminate_requested
+
     logger.info(f"Processing year: {year}, month: {month}")
 
     # Check resources before starting
     check_and_optimize_resources()
+
+    # Check if termination was requested
+    if terminate_requested:
+        logger.info("Termination requested, skipping processing")
+        return
 
     try:
         # Get job accounting file (CSV)
@@ -784,7 +876,6 @@ def process_year_month(year, month):
             return
 
         # Find all time series files (Parquet) for this year/month
-        # Modified pattern to match FRESCO_Conte_ts_2015_07_v5.parquet format
         ts_files = []
 
         # Try the FRESCO pattern first
@@ -793,12 +884,13 @@ def process_year_month(year, month):
             ts_files.extend(fresco_files)
             logger.info(f"Found {len(fresco_files)} FRESCO pattern files")
 
-        # Try other pattern as backup
-        other_files = list(PROC_METRIC_PATH.glob(f"*_{year}_{month}_*.parquet"))
-        new_files = [f for f in other_files if f not in ts_files]
-        if new_files:
-            ts_files.extend(new_files)
-            logger.info(f"Found {len(new_files)} additional files with other pattern")
+        # Try other pattern as backup (only if needed)
+        if not ts_files:
+            other_files = list(PROC_METRIC_PATH.glob(f"*_{year}_{month}_*.parquet"))
+            new_files = [f for f in other_files if f not in ts_files]
+            if new_files:
+                ts_files.extend(new_files)
+                logger.info(f"Found {len(new_files)} additional files with other pattern")
 
         if not ts_files:
             logger.warning(f"No time series files found for {year}-{month}")
@@ -814,11 +906,46 @@ def process_year_month(year, month):
         # Create output file path (will be Parquet)
         output_file = OUTPUT_PATH / f"transformed_{year}_{month}.parquet"
 
-        # Read job data from CSV file
+        # Read job data from CSV file with memory optimization
         logger.info(f"Reading job data from file: {job_file}")
 
-        # Read with optimized dtypes
-        jobs_df = pd.read_csv(job_file, low_memory=False)
+        # Use our optimized function to read CSV
+        try:
+            # Try to determine column types from sample
+            sample_df = pd.read_csv(job_file, nrows=1000)
+
+            # Create dtypes dictionary for numeric columns to save memory
+            dtypes = {}
+            for col in sample_df.columns:
+                if pd.api.types.is_integer_dtype(sample_df[col]):
+                    # Use smaller int types when possible
+                    max_val = sample_df[col].max()
+                    min_val = sample_df[col].min()
+                    if max_val < 32767 and min_val > -32768:
+                        dtypes[col] = 'int16'
+                    elif max_val < 2147483647 and min_val > -2147483648:
+                        dtypes[col] = 'int32'
+                elif pd.api.types.is_float_dtype(sample_df[col]):
+                    dtypes[col] = 'float32'  # Use float32 to save memory
+
+            # Read with memory-optimized settings
+            jobs_df = pd.read_csv(
+                job_file,
+                dtype=dtypes,
+                low_memory=True,
+                memory_map=True  # Memory map the file for more efficient I/O
+            )
+
+            # Log memory usage
+            mem_usage = jobs_df.memory_usage(deep=True).sum() / (1024 * 1024 * 1024)
+            logger.info(f"Job data loaded into dataframe with {len(jobs_df)} rows - Memory usage: {mem_usage:.2f} GB")
+
+        except Exception as e:
+            logger.warning(f"Memory-optimized reading failed: {e}. Falling back to standard reading.")
+            jobs_df = pd.read_csv(job_file, low_memory=False)
+
+        # Run garbage collection to free memory
+        gc.collect()
 
         # Optimize datatypes for memory efficiency
         jobs_df = optimize_dataframe_dtypes(jobs_df)
@@ -838,11 +965,14 @@ def process_year_month(year, month):
         else:
             logger.warning("jobID column not found in CSV file")
 
-        # Convert datetime columns
+        # Convert datetime columns - and ensure they're datetime type, not categorical
         datetime_cols = ["ctime", "qtime", "etime", "start", "end", "timestamp"]
         for col in datetime_cols:
             if col in jobs_df.columns:
-                jobs_df[col] = pd.to_datetime(jobs_df[col], format="%m/%d/%Y %H:%M:%S", errors='coerce')
+                try:
+                    jobs_df[col] = pd.to_datetime(jobs_df[col], format="%m/%d/%Y %H:%M:%S", errors='coerce')
+                except Exception as e:
+                    logger.warning(f"Error converting {col} to datetime: {e}")
 
         # Create parquet schema for output file
         schema = pa.schema([
@@ -872,8 +1002,13 @@ def process_year_month(year, month):
 
         # Create a single writer for the output file
         with pq.ParquetWriter(str(output_file), schema, compression='snappy') as writer:
-            # Process each file sequentially, but with internal parallelism
+            # Process each file sequentially, but with internal optimizations
             for i, ts_file in enumerate(ts_files):
+                # Check if termination was requested
+                if terminate_requested:
+                    logger.info("Termination requested, stopping file processing")
+                    break
+
                 logger.info(f"Processing file {i + 1}/{len(ts_files)}: {ts_file.name}")
                 process_ts_file_in_parallel(ts_file, jobs_df, writer)
 
@@ -882,8 +1017,10 @@ def process_year_month(year, month):
                 check_and_optimize_resources()
 
         # Check if the output file was created properly
-        if output_file.exists() and output_file.stat().st_size > 0:
+        if output_file.exists() and output_file.stat().st_size > 0 and not terminate_requested:
             logger.info(f"Successfully created {output_file}")
+        elif terminate_requested:
+            logger.info(f"Processing of {year}-{month} was interrupted")
         else:
             logger.warning(f"No output generated for {year}-{month}")
 
