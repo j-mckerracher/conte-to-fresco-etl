@@ -22,9 +22,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Define file paths
-JOB_ACCOUNTING_PATH = Path("P:/Conte/conte-job-accounting-1")
-PROC_METRIC_PATH = Path("P:/Conte/conte-ts-to-fresco-ts-1")
-OUTPUT_PATH = Path("P:/Conte/conte-transformed-2")
+JOB_ACCOUNTING_PATH = Path("./cache/input/accounting")
+PROC_METRIC_PATH = Path("./cache/input/metrics")
+OUTPUT_PATH = Path("./cache/output")
 
 # Create cache directory
 CACHE_DIR = Path("./cache")
@@ -501,7 +501,7 @@ def process_year_month(year, month):
         output_file = OUTPUT_PATH / f"transformed_{year}_{month}.parquet"
 
         # Read job data from CSV file
-        logger.info(f"Reading job data from CSV file: {job_file}")
+        logger.info(f"Reading job data from file: {job_file}")
 
         # Read with optimized dtypes
         jobs_df = pd.read_csv(job_file, low_memory=False)
