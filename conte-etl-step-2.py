@@ -758,90 +758,110 @@ def process_chunk(jobs_df, ts_chunk, chunk_id):
 
 
 def read_parquet_chunk(file_path, start_row, chunk_size):
-    """Read a chunk from a parquet file with better error handling"""
+    """Read a chunk from a parquet file with improved row group handling"""
     logger.debug(f"Reading chunk from {start_row} to {start_row + chunk_size}")
 
     try:
-        # First try the simplest approach
-        chunk_df = pd.read_parquet(
-            file_path,
-            engine='pyarrow',
-            use_threads=False,
-            offset=start_row,
-            rows=chunk_size
-        )
-        return chunk_df
-    except Exception as e1:
-        logger.warning(f"Offset/rows approach failed: {e1}, trying normal read with skip/nrows")
-        try:
-            # Try pandas read_parquet with skip/nrows
-            chunk_df = pd.read_parquet(
-                file_path,
-                engine='pyarrow',
-                use_threads=False,
-                skiprows=range(start_row),
-                nrows=chunk_size
-            )
-            return chunk_df
-        except Exception as e2:
-            logger.warning(f"Skip/nrows approach failed: {e2}, trying row groups")
+        # Use PyArrow's ParquetFile API to get metadata
+        pf = pq.ParquetFile(file_path)
+        total_rows = pf.metadata.num_rows
+
+        # Check if the start_row is valid
+        if start_row >= total_rows:
+            logger.error(f"Start row {start_row} exceeds file length {total_rows}")
+            return pd.DataFrame()
+
+        # Calculate the actual end row
+        end_row = min(start_row + chunk_size, total_rows)
+        actual_chunk_size = end_row - start_row
+
+        # Calculate row group boundaries
+        row_group_offsets = [0]
+        for i in range(pf.metadata.num_row_groups):
+            row_group_offsets.append(row_group_offsets[-1] + pf.metadata.row_group(i).num_rows)
+
+        # Find row groups that overlap with our range
+        start_rg = None
+        end_rg = None
+
+        for i in range(len(row_group_offsets) - 1):
+            if row_group_offsets[i] <= start_row < row_group_offsets[i + 1]:
+                start_rg = i
+            if row_group_offsets[i] < end_row <= row_group_offsets[i + 1]:
+                end_rg = i
+                break
+
+        if start_rg is None:
+            # If start row wasn't found, use the first row group
+            start_rg = 0
+            logger.warning(f"Could not find row group containing start row {start_row}, defaulting to first group")
+
+        if end_rg is None:
+            # If end row wasn't found, read until the last row group
+            end_rg = pf.metadata.num_row_groups - 1
+
+        logger.info(f"Reading row groups {start_rg} to {end_rg} for rows {start_row} to {end_row}")
+
+        # Read the selected row groups
+        tables = []
+        for i in range(start_rg, end_rg + 1):
             try:
-                # Try reading by row groups
-                pf = pq.ParquetFile(file_path)
+                tables.append(pf.read_row_group(i))
+            except Exception as e:
+                logger.error(f"Error reading row group {i}: {e}")
 
-                # Calculate which row groups to read
-                row_offsets = [0]
-                for i in range(pf.metadata.num_row_groups):
-                    row_offsets.append(row_offsets[-1] + pf.metadata.row_group(i).num_rows)
+        if not tables:
+            logger.error("No row groups could be read")
+            return pd.DataFrame()
 
-                # Find row groups that overlap with our range
-                start_rg = None
-                end_rg = None
-                for i in range(len(row_offsets) - 1):
-                    if start_row < row_offsets[i + 1] and start_rg is None:
-                        start_rg = i
-                    if start_row + chunk_size <= row_offsets[i]:
-                        end_rg = i
-                        break
+        # Combine the tables and convert to pandas
+        table = pa.concat_tables(tables)
+        all_rows_df = table.to_pandas()
 
-                if start_rg is None:
-                    start_rg = 0
-                if end_rg is None:
-                    end_rg = pf.metadata.num_row_groups - 1
+        # Calculate the proper slice indices
+        # For the start row, subtract the offset of the first row group we read
+        local_start = start_row - row_group_offsets[start_rg]
+        # Make sure we don't exceed the DataFrame length
+        local_end = min(local_start + actual_chunk_size, len(all_rows_df))
 
-                # Read the row groups
-                tables = []
-                for i in range(start_rg, end_rg + 1):
-                    tables.append(pf.read_row_group(i))
+        if local_start < 0:
+            logger.warning(f"Calculated negative local start index {local_start}, adjusting to 0")
+            local_start = 0
 
-                if tables:
-                    table = pa.concat_tables(tables)
-                    chunk_df = table.to_pandas()
+        if local_start >= len(all_rows_df):
+            logger.error(f"Calculated local start index {local_start} exceeds DataFrame length {len(all_rows_df)}")
+            return pd.DataFrame()
 
-                    # Slice to get the exact rows we want
-                    local_start = start_row - row_offsets[start_rg]
-                    local_end = min(local_start + chunk_size, len(chunk_df))
-                    return chunk_df.iloc[local_start:local_end]
-                else:
-                    raise ValueError("No row groups to read")
+        # Extract the slice we want
+        result_df = all_rows_df.iloc[local_start:local_end]
+        logger.info(f"Successfully read {len(result_df)} rows from chunk ({start_row}:{end_row})")
 
-            except Exception as e3:
-                logger.error(f"All approaches failed: {e3}")
-                # Final fallback - read the whole file and slice
-                try:
-                    logger.warning("Falling back to reading entire file - this may use a lot of memory")
-                    table = pq.read_table(file_path)
-                    chunk_df = table.to_pandas()
+        return result_df
 
-                    if start_row < len(chunk_df):
-                        end_row = min(start_row + chunk_size, len(chunk_df))
-                        return chunk_df.iloc[start_row:end_row]
-                    else:
-                        logger.error(f"Start row {start_row} exceeds dataframe length {len(chunk_df)}")
-                        return pd.DataFrame()
-                except Exception as e4:
-                    logger.error(f"Emergency fallback failed: {e4}")
-                    return pd.DataFrame()
+    except Exception as e:
+        logger.error(f"Error processing parquet file: {e}")
+
+        # Last resort fallback - try to read the whole file
+        try:
+            logger.warning("Falling back to reading the entire file - this may use more memory")
+            full_df = pd.read_parquet(file_path)
+
+            if start_row < len(full_df):
+                chunk_end = min(start_row + chunk_size, len(full_df))
+                result_df = full_df.iloc[start_row:chunk_end].copy()
+
+                # Free memory immediately
+                del full_df
+                gc.collect()
+
+                return result_df
+            else:
+                logger.error(f"Start row {start_row} exceeds DataFrame length {len(full_df)}")
+                return pd.DataFrame()
+
+        except Exception as fallback_error:
+            logger.error(f"All approaches to read parquet chunk failed: {fallback_error}")
+            return pd.DataFrame()
 
 
 def clean_up_cache():
