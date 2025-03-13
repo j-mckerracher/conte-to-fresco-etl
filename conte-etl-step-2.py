@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 terminate_requested = False
 
 # Define file paths - Updated to use absolute paths that match the ETL manager
-CACHE_DIR = Path(r"U:\projects\conte-to-fresco-etl\cache")
+CACHE_DIR = Path(r"/home/dynamo/a/jmckerra/projects/conte-to-fresco-etl/cache")
 JOB_ACCOUNTING_PATH = Path(CACHE_DIR / 'accounting')
 PROC_METRIC_PATH = Path(CACHE_DIR / 'input/metrics')
 OUTPUT_PATH = Path(CACHE_DIR / 'output')
