@@ -1,3 +1,4 @@
+import queue
 import signal
 import sys
 import pandas as pd
@@ -31,7 +32,7 @@ terminate_requested = False
 
 # Define file paths
 CACHE_DIR = Path("./cache")
-JOB_ACCOUNTING_PATH = Path(CACHE_DIR / 'accounting')  # FIXED: Removed 'input/' prefix
+JOB_ACCOUNTING_PATH = Path(CACHE_DIR / 'accounting')
 PROC_METRIC_PATH = Path(CACHE_DIR / 'input/metrics')
 OUTPUT_PATH = Path(CACHE_DIR / 'output')
 
@@ -41,12 +42,13 @@ OUTPUT_PATH.mkdir(exist_ok=True, parents=True)
 # We don't create input directories as they should already exist with data
 
 # Configuration
-MAX_WORKERS = 1  # Keep at 1 for better memory management
-MIN_FREE_MEMORY_GB = 2.0  # Lower this to be more aggressive with memory management
-MIN_FREE_DISK_GB = 5.0  # Keep as is
-BASE_CHUNK_SIZE = 50_000  # Reduce from 100,000 to 50,000 for smaller chunks
-MAX_MEMORY_USAGE_GB = 25.0  # Lower the limit from 30GB to 25GB for more headroom
-MEMORY_CHECK_INTERVAL = 0.1  # Check memory usage frequently
+MAX_WORKERS = 4
+MIN_FREE_MEMORY_GB = 2.0
+MIN_FREE_DISK_GB = 5.0
+BASE_CHUNK_SIZE = 50_000
+MAX_MEMORY_USAGE_GB = 25.0
+MEMORY_CHECK_INTERVAL = 0.1
+SMALL_FILE_THRESHOLD_MB = 20
 
 # Force pandas to use specific memory optimization settings
 pd.options.mode.use_inf_as_na = True  # Convert inf to NaN (saves memory in some cases)
@@ -1068,7 +1070,7 @@ def memory_monitor():
 
 
 def process_ts_file_in_parallel(ts_file, jobs_df, output_writer):
-    """Process a single time series file with reduced memory usage"""
+    """Process a single time series file with parallel processing"""
     global terminate_requested
     logger.info(f"Processing TS file: {ts_file}")
 
@@ -1130,155 +1132,183 @@ def process_ts_file_in_parallel(ts_file, jobs_df, output_writer):
     try:
         # Get the file size to estimate appropriate chunk count
         file_size = os.path.getsize(ts_file)
+        file_size_mb = file_size / (1024 * 1024)
 
         # Try to read just the file metadata without loading everything
         parquet_file = pq.ParquetFile(ts_file)
         total_rows = parquet_file.metadata.num_rows
 
-        # Use more conservative chunk sizing
+        # Calculate a reasonable chunk size based on available memory and cores
         available_memory_gb = get_available_memory()
-        current_memory_gb = get_memory_usage()
 
-        # Be even more conservative with chunk sizing
-        max_allowed_chunk_gb = min(1.0, available_memory_gb / 4)  # More aggressive memory limits
+        # Use more aggressive parallelism if we have memory available
+        num_workers = min(MAX_WORKERS, os.cpu_count() or 4)
+
+        # Adjust workers based on available memory
+        memory_per_worker = available_memory_gb / (num_workers * 2)  # Conservative estimate
+        if memory_per_worker < 1.0:  # If less than 1GB per worker
+            num_workers = max(1, int(available_memory_gb / 2))
+            logger.info(f"Reducing worker count to {num_workers} due to memory constraints")
+
+        logger.info(f"Using {num_workers} parallel workers for processing")
+
+        # Calculate chunk size based on file size and worker count
         estimated_bytes_per_row = file_size / total_rows if total_rows > 0 else 1000
 
-        # Calculate how many rows we can safely process in one chunk
-        safe_rows = int((max_allowed_chunk_gb * 1024 * 1024 * 1024) / estimated_bytes_per_row / 2)
+        # For very small files, use a smaller chunk size to ensure all workers get used
+        if file_size_mb < SMALL_FILE_THRESHOLD_MB:
+            # Divide evenly across workers
+            chunk_size = max(1000, total_rows // (num_workers * 2))
+            logger.info(f"Small file, using smaller chunk size of {chunk_size} rows per chunk")
+        else:
+            # For larger files, calculate a reasonable chunk size
+            safe_rows_per_worker = int((memory_per_worker * 1024 * 1024 * 1024) / estimated_bytes_per_row)
+            chunk_size = max(10_000, min(safe_rows_per_worker, 200_000))
 
-        # Clamp chunk size between more conservative bounds
-        chunk_size = max(5_000, min(safe_rows, 100_000))  # More conservative upper bound
+        # Calculate number of chunks (at least num_workers chunks to utilize all workers)
+        num_chunks = max(num_workers, (total_rows + chunk_size - 1) // chunk_size)
 
-        # Calculate number of chunks
-        num_chunks = (total_rows + chunk_size - 1) // chunk_size  # Ceiling division
-
-        # Process a very small file like 10MB in one go
-        if file_size / (1024 * 1024) < 20:  # If file is less than 20MB
-            logger.info(f"Small file ({file_size / (1024 * 1024 * 1024):.2f} GB), processing in one go")
-            return process_entire_file_with_schema(ts_file, jobs_df, output_writer, expected_columns,
-                                                   schema_column_types)
-
-        # Use just 1 worker for more predictable memory usage
-        num_workers = 1
+        # Recalculate chunk size to ensure even distribution
+        chunk_size = (total_rows + num_chunks - 1) // num_chunks
 
         logger.info(
-            f"File has {total_rows} rows, processing with {num_workers} thread in {num_chunks} chunks of {chunk_size} rows")
+            f"File has {total_rows} rows, processing with {num_workers} workers in {num_chunks} chunks of {chunk_size} rows")
 
-        # Process file in chunks sequentially to better control memory
+        # Create a thread-safe queue for results
+        result_queue = Queue()
+
+        # Process chunks in parallel
         with ThreadPoolExecutor(max_workers=num_workers) as executor:
-            # For each chunk, process sequentially
+            futures = []
+
+            # Submit all chunks for processing
             for chunk_idx in range(num_chunks):
-                # Check if termination was requested
+                # Check termination
                 if terminate_requested:
-                    logger.info("Termination requested, stopping processing of new chunks")
-                    break
-
-                # Check memory before processing each chunk - more aggressive memory check
-                current_memory = get_memory_usage()
-                available_memory = get_available_memory()
-
-                # More aggressive memory management - if memory is high, take stronger action
-                while current_memory > MAX_MEMORY_USAGE_GB * 0.8 or available_memory < MIN_FREE_MEMORY_GB * 1.5:
-                    if terminate_requested:
-                        break
-
-                    logger.warning(
-                        f"Memory usage too high: {current_memory:.2f}GB or available too low: {available_memory:.2f}GB. Pausing.")
-
-                    # Force garbage collection
-                    gc.collect()
-
-                    # Wait longer for memory to be freed
-                    time.sleep(10)
-
-                    # Check again
-                    current_memory = get_memory_usage()
-                    available_memory = get_available_memory()
-
-                    # Log progress
-                    logger.info(f"After cleanup: Usage={current_memory:.2f}GB, Available={available_memory:.2f}GB")
-
-                    # If we've waited and memory is still too high, terminate
-                    if current_memory > MAX_MEMORY_USAGE_GB * 0.9 or available_memory < MIN_FREE_MEMORY_GB:
-                        logger.warning("Memory still critical after cleanup. Requesting termination.")
-                        terminate_requested = True
-                        break
-
-                # Skip this chunk if termination was requested during the memory wait
-                if terminate_requested:
+                    logger.info("Termination requested, stopping submission of new chunks")
                     break
 
                 # Calculate row range for this chunk
                 start_row = chunk_idx * chunk_size
                 end_row = min(start_row + chunk_size, total_rows)
+                actual_chunk_size = end_row - start_row
 
+                # Submit the chunk for processing
+                future = executor.submit(
+                    process_chunk_with_queue,
+                    ts_file,
+                    jobs_df,
+                    start_row,
+                    actual_chunk_size,
+                    chunk_idx + 1,
+                    result_queue
+                )
+                futures.append(future)
+
+                # Small delay between submissions to avoid memory spikes
+                time.sleep(0.1)
+
+            # Process results as they complete
+            completed = 0
+            total_submitted = len(futures)
+
+            while completed < total_submitted and not terminate_requested:
                 try:
-                    # Use our improved function to read a chunk
-                    chunk_df = read_parquet_chunk(ts_file, start_row, chunk_size)
+                    # Get a result with timeout
+                    result_df = result_queue.get(timeout=1)
+                    completed += 1
 
-                    # Force garbage collection after reading
-                    gc.collect()
+                    # Process the result
+                    if result_df is not None and not result_df.empty:
+                        # Validate and enforce schema
+                        result_df = validate_dataframe_for_schema(result_df, expected_columns)
+                        result_df = enforce_schema_types(result_df, schema_column_types)
 
-                    # Optimize chunk data types immediately to reduce memory
-                    if chunk_df is not None and not chunk_df.empty:
-                        # Log chunk read success with memory usage
-                        mem_usage = chunk_df.memory_usage(deep=True).sum() / (1024 * 1024)
-                        logger.info(
-                            f"Successfully read chunk {chunk_idx + 1}/{num_chunks} with {len(chunk_df)} rows - Memory: {mem_usage:.2f} MB")
+                        try:
+                            # Reset index and convert to PyArrow table
+                            result_df = result_df.reset_index(drop=True)
+                            table = pa.Table.from_pandas(result_df, schema=schema)
 
-                        # Apply memory optimizations immediately
-                        chunk_df = optimize_dataframe_dtypes(chunk_df)
+                            # Write to output
+                            output_writer.write_table(table)
+                            logger.info(
+                                f"Successfully wrote chunk result with {len(result_df)} rows to output ({completed}/{total_submitted})")
+                        except Exception as e:
+                            logger.error(f"Error writing to parquet: {e}")
+                            logger.error(f"Result DataFrame dtypes: {result_df.dtypes}")
 
-                        # Process the chunk
-                        result_df = process_chunk(jobs_df, chunk_df, chunk_idx + 1)
-
-                        # Clean up chunk dataframe to free memory
-                        del chunk_df
+                        # Release memory
+                        del result_df
                         gc.collect()
 
-                        # Write results if we have any
-                        if result_df is not None and not result_df.empty:
-                            # Validate the dataframe against our schema before writing
-                            result_df = validate_dataframe_for_schema(result_df, expected_columns)
+                    # Check resources periodically
+                    if completed % max(1, num_workers // 2) == 0:
+                        check_and_optimize_resources()
 
-                            # IMPORTANT: Enforce schema types to match exactly
-                            result_df = enforce_schema_types(result_df, schema_column_types)
-
-                            # Convert to PyArrow table and write to output
-                            try:
-                                # Reset index to avoid __index_level_0__ in the output
-                                result_df = result_df.reset_index(drop=True)
-
-                                # Convert to PyArrow table with explicit schema to ensure consistency
-                                table = pa.Table.from_pandas(result_df, schema=schema)
-                                output_writer.write_table(table)
-                                logger.info(f"Successfully wrote {len(result_df)} rows to output")
-                            except Exception as e:
-                                logger.error(f"Error writing to parquet: {e}")
-                                # Log detailed schema info
-                                logger.error(f"Result DataFrame dtypes: {result_df.dtypes}")
-                                for col in result_df.columns:
-                                    logger.error(
-                                        f"Column {col} dtype: {result_df[col].dtype}, sample: {result_df[col].head(1).values}")
-
-                            # Release memory
-                            del result_df
-                            gc.collect()
+                except queue.Empty:
+                    # Check if all futures are done
+                    if all(future.done() for future in futures):
+                        break
+                    continue
                 except Exception as e:
-                    logger.error(f"Error processing chunk {chunk_idx}: {e}")
+                    logger.error(f"Error processing result: {e}")
+                    completed += 1
                     continue
 
-                # Check and optimize resources after each chunk
-                check_and_optimize_resources()
+            # Wait for all futures to complete
+            for future in futures:
+                try:
+                    future.result(timeout=1)
+                except Exception:
+                    # Already logged in the worker
+                    pass
 
         return not terminate_requested
+
     except Exception as e:
         logger.error(f"Error processing file {ts_file}: {e}")
         return False
 
 
+def process_chunk_with_queue(ts_file, jobs_df, start_row, chunk_size, chunk_id, result_queue):
+    """Process a chunk and put the result in a queue"""
+    thread_id = threading.get_ident()
+    logger.info(f"Thread {thread_id}: Starting chunk {chunk_id} ({start_row}:{start_row + chunk_size})")
+
+    try:
+        # Read the chunk
+        chunk_df = read_parquet_chunk(ts_file, start_row, chunk_size)
+
+        if chunk_df is None or chunk_df.empty:
+            logger.warning(f"Thread {thread_id}: Empty chunk {chunk_id}")
+            result_queue.put(None)
+            return
+
+        # Optimize immediately
+        chunk_df = optimize_dataframe_dtypes(chunk_df)
+
+        # Process the chunk
+        result_df = process_chunk(jobs_df, chunk_df, chunk_id)
+
+        # Clean up input chunk
+        del chunk_df
+        gc.collect()
+
+        # Put result in queue
+        if result_df is not None and not result_df.empty:
+            result_queue.put(result_df)
+            logger.info(f"Thread {thread_id}: Completed chunk {chunk_id} with {len(result_df)} rows")
+        else:
+            result_queue.put(None)
+            logger.info(f"Thread {thread_id}: Completed chunk {chunk_id} with no results")
+
+    except Exception as e:
+        logger.error(f"Thread {thread_id}: Error processing chunk {chunk_id}: {e}")
+        result_queue.put(None)
+
+
 def process_year_month(year, month):
-    """Process a specific year-month combination with better support for chunked files"""
+    """Process a specific year-month combination with parallel processing for all files"""
     global terminate_requested
 
     logger.info(f"Processing year: {year}, month: {month}")
@@ -1300,35 +1330,24 @@ def process_year_month(year, month):
             logger.error(f"Job file not found: {job_file}")
             return
 
-        # Find all time series files (Parquet) for this year/month with support for chunked files
+        # Find all time series files for this year/month
         ts_files = []
-
-        # UPDATED: Pattern to match both original files and chunked files
         fresco_pattern = f"FRESCO_Conte_ts_{year}_{month}"
 
-        # Find all files that match our patterns
-        all_files = []
+        # Find all matching files
+        all_files = list(PROC_METRIC_PATH.glob(f"{fresco_pattern}*.parquet"))
 
-        # Look for files with the basic pattern
-        basic_files = list(PROC_METRIC_PATH.glob(f"{fresco_pattern}*.parquet"))
-        all_files.extend(basic_files)
-
-        # If we found too few files, check for chunked versions
+        # Check backup pattern if needed
         if not all_files:
-            # Try backup pattern
             backup_files = list(PROC_METRIC_PATH.glob(f"*_{year}_{month}_*.parquet"))
             all_files.extend(backup_files)
 
         if all_files:
-            # Sort files logically - original files first, then chunked files
+            # Sort files logically
             for f in sorted(all_files, key=lambda x: (
-                    # Sort by original vs chunked (original files first)
                     1 if "_chunk" in x.name else 0,
-                    # Then by version number
                     int(re.search(r'v(\d+)', x.name).group(1)) if re.search(r'v(\d+)', x.name) else 0,
-                    # Then by chunk number if it exists
                     int(re.search(r'chunk(\d+)', x.name).group(1)) if re.search(r'chunk(\d+)', x.name) else 0,
-                    # Finally by name
                     x.name
             )):
                 ts_files.append(f)
@@ -1342,83 +1361,22 @@ def process_year_month(year, month):
             logger.warning(f"No time series files found for {year}-{month}")
             return
 
-        # Create output file path (will be Parquet)
+        # Create output file path
         output_file = OUTPUT_PATH / f"transformed_{year}_{month}.parquet"
 
-        # Read job data from CSV file with improved memory handling
+        # Read job data
         logger.info(f"Reading job data from file: {job_file}")
-
-        # First scan to determine data types
-        sample_df = pd.read_csv(job_file, nrows=1000)
-        dtypes = {}
-        date_columns = ["ctime", "qtime", "etime", "start", "end", "timestamp"]
-
-        # Determine column types to minimize memory usage
-        for col in sample_df.columns:
-            if col in date_columns:
-                continue  # Handle date columns separately
-            elif sample_df[col].dtype == 'int64':
-                # Use smaller integer types when possible
-                max_val = sample_df[col].max()
-                min_val = sample_df[col].min()
-                if pd.notna(max_val) and pd.notna(min_val):
-                    if max_val < 32767 and min_val > -32768:
-                        dtypes[col] = 'int16'
-                    elif max_val < 2147483647 and min_val > -2147483648:
-                        dtypes[col] = 'int32'
-            elif sample_df[col].dtype == 'float64':
-                dtypes[col] = 'float32'  # Use float32 to save memory
-
-        # Read with optimized settings
-        jobs_df = pd.read_csv(
-            job_file,
-            dtype=dtypes,
-            parse_dates=date_columns,  # More efficient date parsing
-            low_memory=True,
-            memory_map=True  # Memory map the file for more efficient I/O
-        )
+        jobs_df = read_jobs_df(job_file)
 
         # Log memory usage
         mem_usage = jobs_df.memory_usage(deep=True).sum() / (1024 * 1024 * 1024)
         logger.info(f"Job data loaded into dataframe with {len(jobs_df)} rows - Memory usage: {mem_usage:.2f} GB")
 
-        # Standardize job IDs - make sure it's done before datetime conversion to avoid
-        # the str accessor on datetime error
-        if "jobID" in jobs_df.columns:
-            if not pd.api.types.is_datetime64_any_dtype(jobs_df["jobID"]):
-                jobs_df["jobID"] = standardize_job_id(jobs_df["jobID"])
-            else:
-                logger.warning("jobID column is datetime type, skipping standardization")
-        else:
-            logger.warning("jobID column not found in CSV file")
+        # Standardize job IDs
+        if "jobID" in jobs_df.columns and not pd.api.types.is_datetime64_any_dtype(jobs_df["jobID"]):
+            jobs_df["jobID"] = standardize_job_id(jobs_df["jobID"])
 
-        # Define schema for output columns with proper types
-        schema_column_types = {
-            'time': 'timestamp[ns, tz=UTC]',
-            'submit_time': 'timestamp[ns, tz=UTC]',
-            'start_time': 'timestamp[ns, tz=UTC]',
-            'end_time': 'timestamp[ns, tz=UTC]',
-            'timelimit': 'double',
-            'nhosts': 'double',
-            'ncores': 'double',
-            'account': 'string',
-            'queue': 'string',
-            'host': 'string',
-            'jid': 'string',
-            'unit': 'string',
-            'jobname': 'string',
-            'exitcode': 'string',
-            'host_list': 'string',
-            'username': 'string',
-            'value_cpuuser': 'double',
-            'value_gpu_usage': 'double',
-            'value_memused': 'double',
-            'value_memused_minus_diskcache': 'double',
-            'value_nfs': 'double',
-            'value_block': 'double'
-        }
-
-        # Create parquet schema for output file
+        # Create PyArrow schema
         schema = pa.schema([
             ('time', pa.timestamp('ns', tz='UTC')),
             ('submit_time', pa.timestamp('ns', tz='UTC')),
@@ -1444,44 +1402,27 @@ def process_year_month(year, month):
             ('value_block', pa.float64())
         ])
 
-        # Create a single writer for the output file
+        # Create output writer
         with pq.ParquetWriter(str(output_file), schema, compression='snappy') as writer:
-            # Process each file sequentially
+            # Process each file
             for i, ts_file in enumerate(ts_files):
-                # Check if termination was requested
                 if terminate_requested:
                     logger.info("Termination requested, stopping file processing")
                     break
 
                 logger.info(f"Processing file {i + 1}/{len(ts_files)}: {ts_file.name}")
 
-                # Use more aggressive memory management for very large files
-                file_size_gb = os.path.getsize(ts_file) / (1024 * 1024 * 1024)
-
-                # For smaller files, we can just process the entire file at once
-                # For larger files, we use our chunking approach
-                if file_size_gb < 0.1:  # Less than 100MB
-                    logger.info(f"Small file ({file_size_gb:.2f} GB), processing in one go")
-                    success = process_entire_file_with_schema(
-                        ts_file,
-                        jobs_df,
-                        writer,
-                        list(schema_column_types.keys()),
-                        schema_column_types
-                    )
-                else:
-                    # Use our chunking approach for larger files
-                    success = process_ts_file_in_parallel(ts_file, jobs_df, writer)
+                # Always use parallel processing for all files
+                success = process_ts_file_in_parallel(ts_file, jobs_df, writer)
 
                 # Force garbage collection between files
                 gc.collect()
                 check_and_optimize_resources()
 
-                # Break if processing was not successful
                 if not success:
                     logger.warning(f"Processing of {ts_file} was not successful, moving to next file")
 
-        # Check if the output file was created properly
+        # Check output
         if output_file.exists() and output_file.stat().st_size > 0 and not terminate_requested:
             logger.info(f"Successfully created {output_file}")
         elif terminate_requested:
@@ -1497,84 +1438,84 @@ def process_year_month(year, month):
         logger.error(f"Error processing {year}-{month}: {e}", exc_info=True)
 
 
-def process_entire_file_with_schema(ts_file, jobs_df, output_writer, expected_columns, schema_column_types):
-    """Process a small file in its entirety without chunking, with schema enforcement"""
-    global terminate_requested
-
-    try:
-        logger.info(f"Processing entire file: {ts_file}")
-
-        # Read the entire file
-        ts_df = pd.read_parquet(ts_file)
-
-        # Log information about the loaded dataframe
-        mem_usage = ts_df.memory_usage(deep=True).sum() / (1024 * 1024)
-        logger.info(f"Loaded entire file with {len(ts_df)} rows - Memory usage: {mem_usage:.2f} MB")
-
-        # Process the dataframe
-        result_df = process_chunk(jobs_df, ts_df, 1)
-
-        # Free memory
-        del ts_df
-        gc.collect()
-
-        # Write the result if we have one
-        if result_df is not None and not result_df.empty:
-            # Validate the dataframe against our schema before writing
-            result_df = validate_dataframe_for_schema(result_df, expected_columns)
-
-            # IMPORTANT: Enforce schema types to match exactly
-            result_df = enforce_schema_types(result_df, schema_column_types)
-
-            try:
-                # Reset index to avoid __index_level_0__ in the output
-                result_df = result_df.reset_index(drop=True)
-
-                # Create a proper PyArrow schema
-                schema = pa.schema([
-                    ('time', pa.timestamp('ns', tz='UTC')),
-                    ('submit_time', pa.timestamp('ns', tz='UTC')),
-                    ('start_time', pa.timestamp('ns', tz='UTC')),
-                    ('end_time', pa.timestamp('ns', tz='UTC')),
-                    ('timelimit', pa.float64()),
-                    ('nhosts', pa.float64()),
-                    ('ncores', pa.float64()),
-                    ('account', pa.string()),
-                    ('queue', pa.string()),
-                    ('host', pa.string()),
-                    ('jid', pa.string()),
-                    ('unit', pa.string()),
-                    ('jobname', pa.string()),
-                    ('exitcode', pa.string()),
-                    ('host_list', pa.string()),
-                    ('username', pa.string()),
-                    ('value_cpuuser', pa.float64()),
-                    ('value_gpu_usage', pa.float64()),
-                    ('value_memused', pa.float64()),
-                    ('value_memused_minus_diskcache', pa.float64()),
-                    ('value_nfs', pa.float64()),
-                    ('value_block', pa.float64())
-                ])
-
-                # Convert to PyArrow table and write to output using the explicit schema
-                table = pa.Table.from_pandas(result_df, schema=schema)
-                output_writer.write_table(table)
-                logger.info(f"Successfully wrote {len(result_df)} rows from whole file to output")
-            except Exception as e:
-                logger.error(f"Error writing to parquet: {e}")
-                # Log detailed schema info
-                logger.error(f"Result DataFrame dtypes: {result_df.dtypes}")
-                for col in result_df.columns:
-                    logger.error(f"Column {col} dtype: {result_df[col].dtype}, sample: {result_df[col].head(1).values}")
-
-            # Release memory
-            del result_df
-            gc.collect()
-
-        return True
-    except Exception as e:
-        logger.error(f"Error processing file {ts_file}: {e}")
-        return False
+# def process_entire_file_with_schema(ts_file, jobs_df, output_writer, expected_columns, schema_column_types):
+#     """Process a small file in its entirety without chunking, with schema enforcement"""
+#     global terminate_requested
+#
+#     try:
+#         logger.info(f"Processing entire file: {ts_file}")
+#
+#         # Read the entire file
+#         ts_df = pd.read_parquet(ts_file)
+#
+#         # Log information about the loaded dataframe
+#         mem_usage = ts_df.memory_usage(deep=True).sum() / (1024 * 1024)
+#         logger.info(f"Loaded entire file with {len(ts_df)} rows - Memory usage: {mem_usage:.2f} MB")
+#
+#         # Process the dataframe
+#         result_df = process_chunk(jobs_df, ts_df, 1)
+#
+#         # Free memory
+#         del ts_df
+#         gc.collect()
+#
+#         # Write the result if we have one
+#         if result_df is not None and not result_df.empty:
+#             # Validate the dataframe against our schema before writing
+#             result_df = validate_dataframe_for_schema(result_df, expected_columns)
+#
+#             # IMPORTANT: Enforce schema types to match exactly
+#             result_df = enforce_schema_types(result_df, schema_column_types)
+#
+#             try:
+#                 # Reset index to avoid __index_level_0__ in the output
+#                 result_df = result_df.reset_index(drop=True)
+#
+#                 # Create a proper PyArrow schema
+#                 schema = pa.schema([
+#                     ('time', pa.timestamp('ns', tz='UTC')),
+#                     ('submit_time', pa.timestamp('ns', tz='UTC')),
+#                     ('start_time', pa.timestamp('ns', tz='UTC')),
+#                     ('end_time', pa.timestamp('ns', tz='UTC')),
+#                     ('timelimit', pa.float64()),
+#                     ('nhosts', pa.float64()),
+#                     ('ncores', pa.float64()),
+#                     ('account', pa.string()),
+#                     ('queue', pa.string()),
+#                     ('host', pa.string()),
+#                     ('jid', pa.string()),
+#                     ('unit', pa.string()),
+#                     ('jobname', pa.string()),
+#                     ('exitcode', pa.string()),
+#                     ('host_list', pa.string()),
+#                     ('username', pa.string()),
+#                     ('value_cpuuser', pa.float64()),
+#                     ('value_gpu_usage', pa.float64()),
+#                     ('value_memused', pa.float64()),
+#                     ('value_memused_minus_diskcache', pa.float64()),
+#                     ('value_nfs', pa.float64()),
+#                     ('value_block', pa.float64())
+#                 ])
+#
+#                 # Convert to PyArrow table and write to output using the explicit schema
+#                 table = pa.Table.from_pandas(result_df, schema=schema)
+#                 output_writer.write_table(table)
+#                 logger.info(f"Successfully wrote {len(result_df)} rows from whole file to output")
+#             except Exception as e:
+#                 logger.error(f"Error writing to parquet: {e}")
+#                 # Log detailed schema info
+#                 logger.error(f"Result DataFrame dtypes: {result_df.dtypes}")
+#                 for col in result_df.columns:
+#                     logger.error(f"Column {col} dtype: {result_df[col].dtype}, sample: {result_df[col].head(1).values}")
+#
+#             # Release memory
+#             del result_df
+#             gc.collect()
+#
+#         return True
+#     except Exception as e:
+#         logger.error(f"Error processing file {ts_file}: {e}")
+#         return False
 
 
 def signal_handler(sig, frame):
