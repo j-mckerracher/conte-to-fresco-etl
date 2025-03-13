@@ -3,8 +3,10 @@ import logging
 import re
 import json
 import shutil
+import sys
 import time
 import uuid
+from pathlib import Path
 from collections import defaultdict
 import threading
 from utils.ready_signal_creator import ReadySignalManager, JobStatus
@@ -35,7 +37,7 @@ CHUNK_SIZE = 1000000  # Default chunk size for splitting files (1 million rows)
 MAX_ACTIVE_JOBS = 2  # Maximum number of jobs to have active at once
 MAX_SERVER_DIR_SIZE = 25 * 1024 * 1024 * 1024  # 25GB max in server directory
 CHECK_INTERVAL = 60  # Check for completed jobs every 60 seconds
-FILE_SIZE_SPLIT_THRESHOLD = 5  # Files larger than 5GB will be split
+FILE_SIZE_SPLIT_THRESHOLD = 0.1  # Files larger than 100MB will be split
 
 # Tracking information
 active_jobs = {}  # Track active jobs and their status
@@ -225,12 +227,34 @@ def get_server_directory_size(directory):
 
 def process_accounting_file(accounting_file, year_month):
     """Copy accounting file to the server accounting directory"""
-    dest_file = os.path.join(server_accounting_input_dir, os.path.basename(accounting_file))
+    # Make sure accounting directory exists
+    if not os.path.exists(server_accounting_input_dir):
+        logger.info(f"Creating server accounting directory: {server_accounting_input_dir}")
+        os.makedirs(server_accounting_input_dir, exist_ok=True)
+
+    # Ensure source file exists
+    if not os.path.exists(accounting_file):
+        logger.error(f"Accounting file does not exist: {accounting_file}")
+        return False
+
+    # Create destination file path with .csv extension if not already present
+    base_name = os.path.basename(accounting_file)
+    if not base_name.endswith('.csv'):
+        base_name = f"{base_name}.csv"
+
+    dest_file = os.path.join(server_accounting_input_dir, base_name)
 
     try:
         # Copy the accounting file
         shutil.copy2(accounting_file, dest_file)
         logger.info(f"Copied accounting file {accounting_file} to {dest_file}")
+
+        # Verify the file was copied successfully
+        if os.path.exists(dest_file):
+            logger.info(f"Verified accounting file exists at {dest_file}")
+        else:
+            logger.error(f"Failed to copy accounting file: {dest_file} does not exist after copy operation")
+            return False
 
         # Add to processed files
         rel_path = os.path.relpath(accounting_file, source_dir_accounting)
@@ -254,6 +278,11 @@ def create_job_for_year_month(year_month, ts_files, accounting_file):
         logger.info(f"Month {year_month} already has active jobs. Skipping.")
         return None
 
+    # Verify accounting file exists
+    if not os.path.exists(accounting_file):
+        logger.error(f"Accounting file not found: {accounting_file}")
+        return None
+
     # Initialize month tracking if it doesn't exist yet
     if year_month not in month_tracking:
         month_tracking[year_month] = {
@@ -263,6 +292,12 @@ def create_job_for_year_month(year_month, ts_files, accounting_file):
             "is_complete": False,
             "accounting_file": os.path.basename(accounting_file)
         }
+
+    # Log accounting file information
+    logger.info(f"Using accounting file for {year_month}: {accounting_file}")
+    logger.info(f"Accounting file exists: {os.path.exists(accounting_file)}")
+    if os.path.exists(accounting_file):
+        logger.info(f"Accounting file size: {os.path.getsize(accounting_file)} bytes")
 
     # Generate job ID
     job_id = f"conte_{year}_{month}_{uuid.uuid4().hex[:8]}"
@@ -298,7 +333,21 @@ def process_job(job):
     job["status"] = "processing"
     active_jobs[job_id] = job
 
-    # Process time series files first
+    # Ensure server input directory exists
+    if not os.path.exists(server_input_dir):
+        logger.info(f"Creating server input directory: {server_input_dir}")
+        os.makedirs(server_input_dir, exist_ok=True)
+
+    # Process accounting file FIRST to ensure it's available for the server processor
+    logger.info(f"Processing accounting file {accounting_file} for {year_month}")
+    if not process_accounting_file(accounting_file, year_month):
+        logger.error(f"Failed to process accounting file for {year_month}. Aborting job.")
+        job["status"] = "failed"
+        return False
+    else:
+        logger.info(f"Successfully processed accounting file for {year_month}")
+
+    # Now process time series files
     all_files_success = True
     processed_count = 0
     created_files = []
@@ -324,23 +373,41 @@ def process_job(job):
         try:
             if file_size_gb > FILE_SIZE_SPLIT_THRESHOLD:
                 # For large files, split into chunks
-                logger.info(f"File is large ({file_size_gb:.2f} GB), splitting into chunks")
+                logger.info(
+                    f"File is large ({file_size_gb:.2f} GB), splitting into chunks (threshold: {FILE_SIZE_SPLIT_THRESHOLD} GB)")
 
                 # Prepare a prefix for the split files
                 prefix = f"FRESCO_Conte_ts_{year}_{month}_v{version}"
 
-                # Split the file into the server input directory
-                success, chunk_files = splitter.split_file(
-                    input_file=ts_file,
-                    output_dir=server_input_dir,
-                    prefix=prefix
-                )
+                # Log the output directory for split files
+                logger.info(f"Splitting file into directory: {server_input_dir}")
 
-                if success:
-                    logger.info(f"Successfully split {ts_file} into {len(chunk_files)} chunks")
-                    created_files.extend(chunk_files)
-                else:
-                    logger.error(f"Failed to split file {ts_file}")
+                # Split the file into the server input directory
+                try:
+                    success, chunk_files = splitter.split_file(
+                        input_file=ts_file,
+                        output_dir=server_input_dir,
+                        prefix=prefix
+                    )
+
+                    if success:
+                        logger.info(f"Successfully split {ts_file} into {len(chunk_files)} chunks")
+
+                        # Verify each chunk file exists in the server input directory
+                        for chunk_file in chunk_files:
+                            if os.path.exists(chunk_file):
+                                chunk_size_mb = os.path.getsize(chunk_file) / (1024 * 1024)
+                                logger.info(f"Verified chunk file exists: {chunk_file} ({chunk_size_mb:.2f} MB)")
+                                created_files.append(chunk_file)
+                            else:
+                                logger.error(f"Chunk file not found: {chunk_file}")
+                                all_files_success = False
+                    else:
+                        logger.error(f"Failed to split file {ts_file}")
+                        all_files_success = False
+                        continue
+                except Exception as e:
+                    logger.error(f"Error splitting file {ts_file}: {str(e)}", exc_info=True)
                     all_files_success = False
                     continue
             else:
@@ -350,8 +417,15 @@ def process_job(job):
 
                 # Copy the file
                 shutil.copy2(ts_file, dest_file)
-                logger.info(f"Copied file {ts_file} to {dest_file}")
-                created_files.append(dest_file)
+
+                # Verify the file was copied successfully
+                if os.path.exists(dest_file):
+                    logger.info(f"Copied file {ts_file} to {dest_file}")
+                    created_files.append(dest_file)
+                else:
+                    logger.error(f"Failed to copy file: {dest_file} does not exist after copy operation")
+                    all_files_success = False
+                    continue
 
             # Add to processed files
             rel_path = os.path.relpath(ts_file, source_dir)
@@ -368,13 +442,13 @@ def process_job(job):
             logger.error(f"Error processing file {ts_file}: {str(e)}")
             all_files_success = False
 
-    # Process accounting file AFTER all time series files are processed
-    if all_files_success and processed_count == len(ts_files):
-        if not process_accounting_file(accounting_file, year_month):
-            logger.error(f"Failed to process accounting file for {year_month}")
-            all_files_success = False
-        else:
-            logger.info(f"Successfully processed accounting file for {year_month}")
+    # Count files in server input directory to verify
+    input_files = [f for f in os.listdir(server_input_dir) if f.startswith(f"FRESCO_Conte_ts_{year}_{month}")]
+    logger.info(f"Found {len(input_files)} files in server input directory for {year_month}")
+    for f in input_files[:5]:  # Log first 5 to avoid too much output
+        logger.info(f"  File in server input: {f}")
+    if len(input_files) > 5:
+        logger.info(f"  ... and {len(input_files) - 5} more files")
 
     # Update job status and create ready signal
     if all_files_success and processed_count == len(ts_files):
@@ -382,9 +456,22 @@ def process_job(job):
         month_tracking[year_month]["files_processed"] = True
         logger.info(f"All files for {year_month} have been successfully processed")
 
-        # Create a ready signal to notify the server processor
-        signal_manager.create_ready_signal(year, month)
-        logger.info(f"Created ready signal for {year_month}")
+        # Verify accounting file exists before creating the ready signal
+        accounting_dest_file = os.path.join(server_accounting_input_dir, os.path.basename(accounting_file))
+        if os.path.exists(accounting_dest_file):
+            logger.info(f"Verified accounting file exists at {accounting_dest_file}")
+
+            # Only create ready signal if there are files in the input directory
+            if len(input_files) > 0:
+                # Create a ready signal to notify the server processor
+                signal_manager.create_ready_signal(year, month)
+                logger.info(f"Created ready signal for {year_month}")
+            else:
+                logger.error(f"No files found in server input directory for {year_month}, cannot create ready signal")
+                all_files_success = False
+        else:
+            logger.error(f"Accounting file not found at {accounting_dest_file}, cannot create ready signal")
+            all_files_success = False
     else:
         job["status"] = "processing_partial"
         logger.warning(f"Some files for {year_month} could not be processed")

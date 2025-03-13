@@ -53,7 +53,7 @@ MAX_MEMORY_USAGE_GB = 25.0
 MEMORY_CHECK_INTERVAL = 0.1
 SMALL_FILE_THRESHOLD_MB = 20
 MAX_RETRIES = 5
-JOB_CHECK_INTERVAL = 0.1
+JOB_CHECK_INTERVAL = 60
 
 # Force pandas to use specific memory optimization settings
 pd.options.mode.use_inf_as_na = True  # Convert inf to NaN (saves memory in some cases)
