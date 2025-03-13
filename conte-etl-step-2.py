@@ -80,9 +80,6 @@ def get_free_disk_space():
     return free / (1024 * 1024 * 1024)
 
 
-
-
-
 def calculate_chunk_size(current_size=BASE_CHUNK_SIZE):
     """More aggressive dynamic chunk size calculation based on available memory"""
     available_memory_gb = get_available_memory()
@@ -106,11 +103,8 @@ def calculate_chunk_size(current_size=BASE_CHUNK_SIZE):
     return current_size
 
 
-
-
-
 def convert_walltime_to_seconds(walltime_series):
-    """Vectorized conversion of HH:MM:SS format to seconds"""
+    """Vectorized conversion of HH:MM:SS format to seconds with improved error handling"""
     if walltime_series.empty:
         return walltime_series
 
@@ -122,70 +116,107 @@ def convert_walltime_to_seconds(walltime_series):
     # Only process non-NaN values
     to_process = walltime_series[~mask_na]
 
+    # Check if we have any values to process
+    if to_process.empty:
+        return result
+
+    # Convert to string if not already
+    if not pd.api.types.is_string_dtype(to_process):
+        try:
+            to_process = to_process.astype(str)
+        except Exception as e:
+            logger.warning(f"Failed to convert walltime series to string: {e}")
+            return result
+
     # Handle numeric values
-    mask_numeric = pd.to_numeric(to_process, errors='coerce').notna()
-    result.loc[to_process[mask_numeric].index] = pd.to_numeric(to_process[mask_numeric])
+    try:
+        mask_numeric = pd.to_numeric(to_process, errors='coerce').notna()
+        result.loc[to_process[mask_numeric].index] = pd.to_numeric(to_process[mask_numeric])
+    except Exception as e:
+        logger.warning(f"Error processing numeric walltime values: {e}")
+        mask_numeric = pd.Series(False, index=to_process.index)
 
-    # Handle string time formats
-    str_times = to_process[~mask_numeric]
+    # Handle string time formats - only process if we have some non-numeric strings
+    if (~mask_numeric).any():
+        str_times = to_process[~mask_numeric]
 
-    # Process HH:MM:SS format
-    mask_hhmmss = str_times.str.count(':') == 2
-    if mask_hhmmss.any():
-        hhmmss = str_times[mask_hhmmss].str.split(':', expand=True).astype(float)
-        result.loc[hhmmss.index] = hhmmss[0] * 3600 + hhmmss[1] * 60 + hhmmss[2]
+        try:
+            # Process HH:MM:SS format
+            mask_hhmmss = str_times.str.count(':') == 2
+            if mask_hhmmss.any():
+                hhmmss = str_times[mask_hhmmss].str.split(':', expand=True).astype(float)
+                result.loc[hhmmss.index] = hhmmss[0] * 3600 + hhmmss[1] * 60 + hhmmss[2]
 
-    # Process MM:SS format
-    mask_mmss = (str_times.str.count(':') == 1) & (~mask_hhmmss)
-    if mask_mmss.any():
-        mmss = str_times[mask_mmss].str.split(':', expand=True).astype(float)
-        result.loc[mmss.index] = mmss[0] * 60 + mmss[1]
+            # Process MM:SS format
+            mask_mmss = (str_times.str.count(':') == 1) & (~mask_hhmmss)
+            if mask_mmss.any():
+                mmss = str_times[mask_mmss].str.split(':', expand=True).astype(float)
+                result.loc[mmss.index] = mmss[0] * 60 + mmss[1]
+        except Exception as e:
+            logger.warning(f"Error processing string walltime formats: {e}")
 
     return result
 
 
-
-
-
 def get_exit_status_description(df):
-    """Vectorized conversion of exit status to descriptive text"""
+    """Vectorized conversion of exit status to descriptive text with better error handling"""
     # Check if required columns exist
     if 'jobevent' not in df.columns or 'Exit_status' not in df.columns:
         return pd.Series([None] * len(df), index=df.index)
 
     # Initialize with empty strings
-    jobevent = df['jobevent'].fillna('')
-    exit_status = df['Exit_status'].fillna('')
+    try:
+        jobevent = df['jobevent'].fillna('')
+        exit_status = df['Exit_status'].fillna('')
+    except Exception as e:
+        logger.warning(f"Error preparing jobevent or exit_status columns: {e}")
+        return pd.Series([None] * len(df), index=df.index)
 
     # Create result series
     result = pd.Series(index=df.index, dtype='object')
 
-    # Apply conditions using vectorized operations
-    result[(jobevent == 'E') & (exit_status == '0')] = 'COMPLETED'
-    result[(jobevent == 'E') & (exit_status != '0')] = 'FAILED:' + exit_status[(jobevent == 'E') & (exit_status != '0')]
-    result[jobevent == 'A'] = 'ABORTED'
-    result[jobevent == 'S'] = 'STARTED'
-    result[jobevent == 'Q'] = 'QUEUED'
+    try:
+        # Apply conditions using vectorized operations
+        result[(jobevent == 'E') & (exit_status == '0')] = 'COMPLETED'
+        result[(jobevent == 'E') & (exit_status != '0')] = 'FAILED:' + exit_status[
+            (jobevent == 'E') & (exit_status != '0')]
+        result[jobevent == 'A'] = 'ABORTED'
+        result[jobevent == 'S'] = 'STARTED'
+        result[jobevent == 'Q'] = 'QUEUED'
 
-    # Handle remaining cases
-    mask_other = ~result.notna()
-    if mask_other.any():
-        result[mask_other] = jobevent[mask_other] + ':' + exit_status[mask_other]
+        # Handle remaining cases
+        mask_other = ~result.notna()
+        if mask_other.any():
+            # Convert to string if needed before concatenation
+            if not pd.api.types.is_string_dtype(jobevent):
+                jobevent = jobevent.astype(str)
+            if not pd.api.types.is_string_dtype(exit_status):
+                exit_status = exit_status.astype(str)
+
+            result[mask_other] = jobevent[mask_other] + ':' + exit_status[mask_other]
+    except Exception as e:
+        logger.warning(f"Error generating exit status descriptions: {e}")
+        result[:] = None
 
     return result
 
 
 def optimize_dataframe_dtypes(df):
-    """Optimize DataFrame memory usage by changing data types, but be careful with datetime columns"""
+    """Optimize DataFrame memory usage by changing data types, with improved error handling"""
     # Get list of datetime columns to be careful with
     datetime_cols = []
-    for col in df.columns:
-        if pd.api.types.is_datetime64_any_dtype(df[col]):
-            datetime_cols.append(col)
-        # Also identify columns with datetime-related names
-        elif col in ["time", "date", "timestamp", "start_time", "end_time", "submit_time"] or any(
-                dt_term in col.lower() for dt_term in ["time", "date", "timestamp"]):
-            datetime_cols.append(col)
+    try:
+        for col in df.columns:
+            if pd.api.types.is_datetime64_any_dtype(df[col]):
+                datetime_cols.append(col)
+            # Also identify columns with datetime-related names
+            elif col in ["time", "date", "timestamp", "start_time", "end_time", "submit_time"] or any(
+                    dt_term in col.lower() for dt_term in ["time", "date", "timestamp"]):
+                datetime_cols.append(col)
+    except Exception as e:
+        logger.warning(f"Error identifying datetime columns: {e}")
+        # If we can't identify datetime columns, use a conservative approach
+        datetime_cols = ["time", "date", "timestamp", "start_time", "end_time", "submit_time"]
 
     # Convert object columns that are mostly numeric to appropriate numeric types
     for col in df.select_dtypes(include=['object']).columns:
@@ -211,9 +242,10 @@ def optimize_dataframe_dtypes(df):
                         else:
                             # It's a float
                             df[col] = pd.to_numeric(df[col], downcast='float')
-        except (TypeError, ValueError) as e:
+        except Exception as e:
             # Just continue if there's an error
-            pass
+            logger.debug(f"Error optimizing column {col}: {e}")
+            continue
 
     # Convert string columns with low cardinality to category type - but be careful
     for col in df.select_dtypes(include=['object']).columns:
@@ -235,7 +267,8 @@ def optimize_dataframe_dtypes(df):
                         df[col] = df[col].astype('category')
         except Exception as e:
             # Just continue if there's an error
-            pass
+            logger.debug(f"Error categorizing column {col}: {e}")
+            continue
 
     # Downcast numeric columns to save memory
     for col in df.select_dtypes(include=['number']).columns:
@@ -250,7 +283,8 @@ def optimize_dataframe_dtypes(df):
                 df[col] = pd.to_numeric(df[col], downcast='integer')
         except Exception as e:
             # Just continue if there's an error
-            pass
+            logger.debug(f"Error downcasting column {col}: {e}")
+            continue
 
     return df
 
@@ -289,28 +323,6 @@ def parse_host_list(exec_host_series):
     # Handle empty series
     if exec_host_series.empty:
         return exec_host_series
-
-    # Initialize result series with same index and None values
-    result = pd.Series([None] * len(exec_host_series), index=exec_host_series.index)
-
-    # Check for datetime type (which would cause .str accessor to fail)
-    if pd.api.types.is_datetime64_any_dtype(exec_host_series):
-        logger.warning("Cannot parse host list: series is datetime type")
-        return result
-
-    # Force conversion to string if needed
-    if not pd.api.types.is_string_dtype(exec_host_series):
-        # Convert non-null values to string
-        mask = exec_host_series.notna()
-        if mask.any():
-            # Convert carefully
-            try:
-                string_series = exec_host_series[mask].astype(str)
-                exec_host_series = exec_host_series.copy()
-                exec_host_series[mask] = string_series
-            except Exception as e:
-                logger.warning(f"Error converting exec_host series to string: {e}")
-                return result
 
     # Initialize result series with same index and None values
     result = pd.Series([None] * len(exec_host_series), index=exec_host_series.index)
@@ -399,6 +411,30 @@ def process_chunk(jobs_df, ts_chunk, chunk_id):
     job_columns_to_use = [col for col in required_job_columns if col in jobs_df.columns]
     jobs_subset = jobs_df[job_columns_to_use]
 
+    # CRITICAL FIX: Ensure jobID in jobs_subset is string type for proper joining
+    if "jobID" in jobs_subset.columns:
+        # Ensure jobID is string type, not datetime or other type
+        if not pd.api.types.is_string_dtype(jobs_subset["jobID"]):
+            try:
+                mask = jobs_subset["jobID"].notna()
+                if mask.any():
+                    jobs_subset = jobs_subset.copy()
+                    jobs_subset.loc[mask, "jobID"] = jobs_subset.loc[mask, "jobID"].astype(str)
+            except Exception as e:
+                logger.warning(f"Error converting jobID to string: {e}")
+
+    # CRITICAL FIX: Ensure Job Id in ts_chunk is string type for proper joining
+    if "Job Id" in ts_chunk.columns:
+        # Ensure Job Id is string type, not datetime or other type
+        if not pd.api.types.is_string_dtype(ts_chunk["Job Id"]):
+            try:
+                mask = ts_chunk["Job Id"].notna()
+                if mask.any():
+                    ts_chunk = ts_chunk.copy()
+                    ts_chunk.loc[mask, "Job Id"] = ts_chunk.loc[mask, "Job Id"].astype(str)
+            except Exception as e:
+                logger.warning(f"Error converting Job Id to string: {e}")
+
     # CRITICAL FIX: Ensure datetime columns in jobs_df are proper datetime
     datetime_cols = ["start", "end", "qtime"]
     for col in datetime_cols:
@@ -477,24 +513,35 @@ def process_chunk(jobs_df, ts_chunk, chunk_id):
         return None
 
     # Process events more efficiently to reduce memory usage
-    events = filtered['Event'].unique()
+    try:
+        events = filtered['Event'].unique()
+    except Exception as e:
+        logger.error(f"Error getting unique events: {e}")
+        return None
 
     # Create only the necessary columns with NaN values
     for event in events:
-        if event in ["cpuuser", "gpu_usage", "memused", "memused_minus_diskcache", "nfs", "block"]:
-            col_name = f'value_{event}'
-        else:
-            col_name = event
+        try:
+            if event in ["cpuuser", "gpu_usage", "memused", "memused_minus_diskcache", "nfs", "block"]:
+                col_name = f'value_{event}'
+            else:
+                col_name = event
 
-        # Create the column with NaN values
-        filtered[col_name] = np.nan
+            # Create the column with NaN values
+            filtered[col_name] = np.nan
 
-        # Fill values only for matching event rows
-        event_mask = filtered['Event'] == event
-        filtered.loc[event_mask, col_name] = filtered.loc[event_mask, 'Value']
+            # Fill values only for matching event rows
+            event_mask = filtered['Event'] == event
+            filtered.loc[event_mask, col_name] = filtered.loc[event_mask, 'Value']
+        except Exception as e:
+            logger.warning(f"Error processing event {event}: {e}")
+            continue
 
     # Drop Event and Value columns to save memory
-    filtered.drop(columns=['Event', 'Value'], inplace=True)
+    try:
+        filtered.drop(columns=['Event', 'Value'], inplace=True)
+    except Exception as e:
+        logger.warning(f"Error dropping columns: {e}")
 
     # Map columns efficiently
     column_mapping = {
@@ -525,23 +572,38 @@ def process_chunk(jobs_df, ts_chunk, chunk_id):
 
     # Only rename columns that exist
     existing_cols = {col: mapping for col, mapping in column_mapping.items() if col in filtered.columns}
-    filtered.rename(columns=existing_cols, inplace=True)  # Rename in-place
+    try:
+        filtered.rename(columns=existing_cols, inplace=True)  # Rename in-place
+    except Exception as e:
+        logger.warning(f"Error renaming columns: {e}")
 
-    # Process special cases
+    # Process special cases with better error handling
     if "timelimit" in filtered.columns:
-        filtered["timelimit"] = convert_walltime_to_seconds(filtered["timelimit"])
+        try:
+            filtered["timelimit"] = convert_walltime_to_seconds(filtered["timelimit"])
+        except Exception as e:
+            logger.warning(f"Error converting walltime: {e}")
+            filtered["timelimit"] = np.nan
 
     if "host_list" in filtered.columns:
-        filtered["host_list"] = parse_host_list(filtered["host_list"])
+        try:
+            filtered["host_list"] = parse_host_list(filtered["host_list"])
+        except Exception as e:
+            logger.warning(f"Error parsing host list: {e}")
+            filtered["host_list"] = None
 
     # Generate exitcode from jobevent and Exit_status using vectorized approach
     if "jobevent" in filtered.columns:
-        filtered["exitcode"] = get_exit_status_description(filtered)
+        try:
+            filtered["exitcode"] = get_exit_status_description(filtered)
 
-        # Remove the source columns after processing
-        columns_to_drop = [col for col in ["jobevent", "Exit_status"] if col in filtered.columns]
-        if columns_to_drop:
-            filtered.drop(columns=columns_to_drop, inplace=True)
+            # Remove the source columns after processing
+            columns_to_drop = [col for col in ["jobevent", "Exit_status"] if col in filtered.columns]
+            if columns_to_drop:
+                filtered.drop(columns=columns_to_drop, inplace=True)
+        except Exception as e:
+            logger.warning(f"Error generating exitcode: {e}")
+            filtered["exitcode"] = None
 
     # Ensure all required columns exist in the output
     set3_columns = ["time", "submit_time", "start_time", "end_time", "timelimit",
@@ -575,7 +637,10 @@ def process_chunk(jobs_df, ts_chunk, chunk_id):
     result = filtered[available_columns]
 
     # Optimize the result dataframe, being careful not to convert datetime columns to categorical
-    result = optimize_dataframe_dtypes(result)
+    try:
+        result = optimize_dataframe_dtypes(result)
+    except Exception as e:
+        logger.warning(f"Error optimizing datatypes: {e}")
 
     # Add memory usage logging
     mem_usage = result.memory_usage(deep=True).sum() / (1024 * 1024)
