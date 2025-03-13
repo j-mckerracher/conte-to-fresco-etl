@@ -17,6 +17,7 @@ import pyarrow.parquet as pq
 import gc
 from queue import Queue
 import threading
+from utils.ready_signal_creator import ReadySignalManager
 
 # Configure logging
 logging.basicConfig(
@@ -51,6 +52,8 @@ BASE_CHUNK_SIZE = 50_000
 MAX_MEMORY_USAGE_GB = 25.0
 MEMORY_CHECK_INTERVAL = 0.1
 SMALL_FILE_THRESHOLD_MB = 20
+MAX_RETRIES = 5
+JOB_CHECK_INTERVAL = 0.1
 
 # Force pandas to use specific memory optimization settings
 pd.options.mode.use_inf_as_na = True  # Convert inf to NaN (saves memory in some cases)
@@ -59,6 +62,8 @@ pd.options.mode.string_storage = 'python'  # Use Python's memory-efficient strin
 # Disable the SettingWithCopyWarning which can slow things down
 pd.options.mode.chained_assignment = None
 
+# Create a global instance of the ReadySignalManager
+signal_manager = ReadySignalManager(ready_dir=Path(CACHE_DIR / 'ready'), logger=logger)
 
 # Register the signal handler for various signals
 def setup_signal_handlers():
@@ -217,6 +222,56 @@ def get_exit_status_description(df):
         result[:] = None
 
     return result
+
+
+def check_for_ready_jobs():
+    """Check for ready job signals from the ETL Manager"""
+    ready_jobs = []
+
+    # Get jobs marked as ready by the signal manager
+    for year, month in signal_manager.get_ready_jobs():
+        try:
+            # Ensure year and month are strings
+            year_str = str(year)
+            month_str = str(month).zfill(2)
+            year_month = f"{year_str}-{month_str}"
+
+            # Check if accounting file exists
+            accounting_file = JOB_ACCOUNTING_PATH / f"{year_month}.csv"
+            if not accounting_file.exists():
+                logger.warning(f"Job {year_month} marked as ready but accounting file {accounting_file} not found")
+                continue
+
+            # Check if parquet files exist for this year-month
+            parquet_pattern = f"FRESCO_Conte_ts_{year_str}_{month_str}"
+            ts_files = list(PROC_METRIC_PATH.glob(f"{parquet_pattern}*.parquet"))
+
+            if not ts_files:
+                logger.warning(f"Job {year_month} marked as ready but no matching parquet files found")
+                continue
+
+            # Check if output file already exists
+            output_file = OUTPUT_PATH / f"transformed_{year_str}_{month_str}.parquet"
+            if output_file.exists() and output_file.stat().st_size > 0:
+                logger.info(f"Job {year_month} already processed, output file exists: {output_file}")
+                # Mark as complete since output already exists
+                signal_manager.create_complete_signal(year_str, month_str)
+                continue
+
+            # This job is ready for processing
+            ready_jobs.append({
+                "year_month": year_month,
+                "year": year_str,
+                "month": month_str,
+                "accounting_file": accounting_file,
+                "ts_files": ts_files
+            })
+            logger.info(f"Found ready job: {year_month} with {len(ts_files)} parquet files")
+
+        except Exception as e:
+            logger.error(f"Error processing ready job {year}-{month}: {str(e)}")
+
+    return ready_jobs
 
 
 def optimize_dataframe_dtypes(df):
@@ -1002,65 +1057,85 @@ def get_year_month_combinations():
 
 
 def read_jobs_df(job_file):
-    """Read job data from CSV with optimized memory usage from the start"""
-    # First, determine column data types by scanning sample
-    sample_size = min(1000, os.path.getsize(job_file) // 2)
-    sample_df = pd.read_csv(job_file, nrows=1000)
+    """Read job data from CSV with optimized memory usage and proper error handling"""
+    logger.info(f"Reading job accounting file: {job_file}")
 
-    # Analyze column types in sample
-    dtypes = {}
-    categorical_columns = []
-    datetime_columns = ["ctime", "qtime", "etime", "start", "end", "timestamp", "Timestamp"]
+    try:
+        # First, try to infer column types from a small sample
+        sample_df = pd.read_csv(job_file, nrows=100)
+        logger.info(f"Successfully read sample with {len(sample_df)} rows")
 
-    for col in sample_df.columns:
-        # Skip datetime columns
-        if col in datetime_columns or any(dt_term in col.lower() for dt_term in ["time", "date", "timestamp"]):
-            continue
+        # Analyze sample to determine proper types
+        dtypes = {}
+        datetime_columns = ["ctime", "qtime", "etime", "start", "end", "timestamp", "Timestamp"]
 
-        nunique = sample_df[col].nunique()
+        # For all other columns, default to object type (string) to avoid conversion errors
+        for col in sample_df.columns:
+            if col not in datetime_columns:
+                # Default most columns to string type to prevent conversion errors
+                dtypes[col] = 'object'
 
-        # Handle column type assignment
-        if nunique <= 100 and sample_df[col].dtype == 'object':
-            # Low cardinality strings should be categorical
-            categorical_columns.append(col)
-        elif pd.api.types.is_numeric_dtype(sample_df[col]):
-            # Optimize numeric columns
-            if sample_df[col].isna().sum() == 0 and (sample_df[col] % 1 == 0).all():
-                if sample_df[col].max() < 32767 and sample_df[col].min() > -32768:
-                    dtypes[col] = 'int16'
-                elif sample_df[col].max() < 2147483647 and sample_df[col].min() > -2147483648:
-                    dtypes[col] = 'int32'
-                else:
-                    dtypes[col] = 'int64'
-            else:
-                # Use float32 for most floats to save memory
-                dtypes[col] = 'float32'
+                # Only assign numeric types if we're very confident
+                if pd.api.types.is_numeric_dtype(sample_df[col]):
+                    # If it contains only integers and no NaNs
+                    if sample_df[col].notna().all() and (sample_df[col] % 1 == 0).all():
+                        dtypes[col] = 'int64'
+                    else:
+                        dtypes[col] = 'float64'
 
-    # Now read the actual file with optimized settings
-    jobs_df = pd.read_csv(
-        job_file,
-        dtype=dtypes,
-        low_memory=True,
-        memory_map=True  # Memory map the file for more efficient I/O
-    )
+        logger.info(f"Reading full CSV file with explicit dtypes")
+        jobs_df = pd.read_csv(
+            job_file,
+            dtype=dtypes,
+            parse_dates=datetime_columns,
+            date_parser=lambda x: pd.to_datetime(x, errors='coerce'),
+            low_memory=False  # Important to prevent mixed-type inference
+        )
 
-    # Convert categorical columns after reading
-    for col in categorical_columns:
-        if col in jobs_df.columns:
-            jobs_df[col] = jobs_df[col].astype('category')
+        logger.info(f"Successfully read job data with {len(jobs_df)} rows")
 
-    # Standardize job IDs
-    if "jobID" in jobs_df.columns:
-        jobs_df["jobID"] = standardize_job_id(jobs_df["jobID"])
-    else:
-        logger.warning("jobID column not found in CSV file")
+        # Standardize job IDs
+        if "jobID" in jobs_df.columns:
+            jobs_df["jobID"] = standardize_job_id(jobs_df["jobID"])
+        else:
+            logger.warning("jobID column not found in CSV file")
 
-    # Convert datetime columns explicitly
-    for col in datetime_columns:
-        if col in jobs_df.columns:
-            jobs_df[col] = pd.to_datetime(jobs_df[col], format="%m/%d/%Y %H:%M:%S", errors='coerce')
+        # Report memory usage
+        mem_usage = jobs_df.memory_usage(deep=True).sum() / (1024 * 1024)
+        logger.info(f"Job dataframe memory usage: {mem_usage:.2f} MB")
 
-    return jobs_df
+        return jobs_df
+
+    except Exception as e:
+        logger.error(f"Error reading job file {job_file}: {str(e)}")
+        logger.info("Trying alternative method to read job file...")
+
+        try:
+            # If the first method failed, try a more robust approach
+            # Read with no type inference, then convert manually
+            jobs_df = pd.read_csv(
+                job_file,
+                dtype='object',  # Read everything as strings first
+                low_memory=False
+            )
+
+            # Convert datetime columns after reading
+            for col in ["ctime", "qtime", "etime", "start", "end"]:
+                if col in jobs_df.columns:
+                    jobs_df[col] = pd.to_datetime(jobs_df[col], errors='coerce')
+
+            # Standardize job IDs
+            if "jobID" in jobs_df.columns:
+                jobs_df["jobID"] = standardize_job_id(jobs_df["jobID"])
+
+            logger.info(f"Successfully read job data with alternative method: {len(jobs_df)} rows")
+            return jobs_df
+
+        except Exception as e2:
+            logger.error(f"Both methods failed to read job file. Final error: {str(e2)}")
+            # Return an empty DataFrame with expected columns
+            empty_df = pd.DataFrame(columns=["jobID", "start", "end", "qtime"])
+            return empty_df
 
 
 def memory_monitor():
@@ -1334,19 +1409,25 @@ def process_chunk_with_queue(ts_file, jobs_df, start_row, chunk_size, chunk_id, 
         result_queue.put(None)
 
 
-def process_year_month(year, month):
-    """Process a specific year-month combination with parallel processing for all files"""
+def process_year_month(year, month, retry_count=0):
+    """Process a specific year-month combination with improved error handling"""
     global terminate_requested
 
-    logger.info(f"Processing year: {year}, month: {month}")
+    # Create a processing signal
+    signal_manager.create_processing_signal(year, month)
+
+    logger.info(f"Processing year: {year}, month: {month} (attempt {retry_count + 1}/{MAX_RETRIES + 1})")
 
     # Check resources before starting
-    check_and_optimize_resources()
+    if not check_and_optimize_resources():
+        logger.warning(f"Insufficient resources to process {year}-{month}, will retry later")
+        return False
 
     # Check if termination was requested
     if terminate_requested:
         logger.info("Termination requested, skipping processing")
-        return
+        signal_manager.create_failed_signal(year, month)
+        return False
 
     try:
         # Get job accounting file (CSV)
@@ -1355,7 +1436,8 @@ def process_year_month(year, month):
         # Check if job file exists
         if not job_file.exists():
             logger.error(f"Job file not found: {job_file}")
-            return
+            signal_manager.create_failed_signal(year, month)
+            return False
 
         # Find all time series files for this year/month (including chunked files)
         ts_files = []
@@ -1397,7 +1479,8 @@ def process_year_month(year, month):
 
         if not ts_files:
             logger.warning(f"No time series files found for {year}-{month}")
-            return
+            signal_manager.create_failed_signal(year, month)
+            return False
 
         # Create output file path
         output_file = OUTPUT_PATH / f"transformed_{year}_{month}.parquet"
@@ -1405,6 +1488,17 @@ def process_year_month(year, month):
         # Read job data
         logger.info(f"Reading job data from file: {job_file}")
         jobs_df = read_jobs_df(job_file)
+
+        # Check if job data was read successfully
+        if jobs_df.empty:
+            logger.error(f"Failed to read job data for {year}-{month}, job dataframe is empty")
+            if retry_count < MAX_RETRIES:
+                logger.info(f"Will retry processing {year}-{month} later (attempt {retry_count + 1}/{MAX_RETRIES})")
+                return False
+            else:
+                logger.error(f"Exceeded maximum retries for {year}-{month}, marking as failed")
+                signal_manager.create_failed_signal(year, month)
+                return False
 
         # Log memory usage
         mem_usage = jobs_df.memory_usage(deep=True).sum() / (1024 * 1024 * 1024)
@@ -1443,6 +1537,7 @@ def process_year_month(year, month):
         # Create output writer
         with pq.ParquetWriter(str(output_file), schema, compression='snappy') as writer:
             # Process each file
+            all_files_success = True
             for i, ts_file in enumerate(ts_files):
                 if terminate_requested:
                     logger.info("Termination requested, stopping file processing")
@@ -1453,27 +1548,47 @@ def process_year_month(year, month):
                 # Process the file using parallel processing
                 success = process_ts_file_in_parallel(ts_file, jobs_df, writer)
 
+                if not success:
+                    all_files_success = False
+                    logger.warning(f"Processing of {ts_file} was not successful")
+
                 # Force garbage collection between files
                 gc.collect()
-                check_and_optimize_resources()
-
-                if not success:
-                    logger.warning(f"Processing of {ts_file} was not successful, moving to next file")
+                if not check_and_optimize_resources():
+                    logger.warning("Resource check failed, may affect processing quality")
 
         # Check output
-        if output_file.exists() and output_file.stat().st_size > 0 and not terminate_requested:
+        if output_file.exists() and output_file.stat().st_size > 0 and all_files_success and not terminate_requested:
             logger.info(f"Successfully created {output_file}")
+            signal_manager.create_complete_signal(year, month)
+            return True
         elif terminate_requested:
             logger.info(f"Processing of {year}-{month} was interrupted")
+            signal_manager.create_failed_signal(year, month)
+            return False
+        elif not all_files_success and retry_count < MAX_RETRIES:
+            logger.warning(
+                f"Some files for {year}-{month} had processing issues, will retry (attempt {retry_count + 1}/{MAX_RETRIES})")
+            return False
         else:
-            logger.warning(f"No output generated for {year}-{month}")
-
-        # Clear memory
-        del jobs_df
-        gc.collect()
+            logger.warning(f"Issues detected processing {year}-{month}, marking as complete with warnings")
+            success = output_file.exists() and output_file.stat().st_size > 0
+            if success:
+                signal_manager.create_complete_signal(year, month)
+            else:
+                signal_manager.create_failed_signal(year, month)
+            return success
 
     except Exception as e:
         logger.error(f"Error processing {year}-{month}: {e}", exc_info=True)
+
+        if retry_count < MAX_RETRIES:
+            logger.info(f"Will retry processing {year}-{month} later (attempt {retry_count + 1}/{MAX_RETRIES})")
+            return False
+        else:
+            logger.error(f"Exceeded maximum retries for {year}-{month}, marking as failed")
+            signal_manager.create_failed_signal(year, month)
+            return False
 
 
 def signal_handler(sig, frame):
@@ -1490,98 +1605,155 @@ def signal_handler(sig, frame):
 
 
 def main():
-    """Main function with memory monitoring"""
+    """Main function with improved synchronization with ETL Manager"""
     global terminate_requested
 
     # Set up signal handlers for graceful termination
     setup_signal_handlers()
 
-    logger.info("Starting Conte data transformation process")
+    logger.info("Starting Conte server processor with improved job synchronization")
     start_time = time.time()
 
+    # Start memory monitoring thread
+    monitor_thread = threading.Thread(target=memory_monitor, daemon=True)
+    monitor_thread.start()
+
+    # Queue for tracking jobs that need retrying
+    retry_queue = []
+
+    # Track last check time for ready jobs
+    last_check_time = 0
+
     try:
-        # Start memory monitoring thread
-        monitor_thread = threading.Thread(target=memory_monitor, daemon=True)
-        monitor_thread.start()
+        while not terminate_requested:
+            # Check for ready jobs periodically
+            current_time = time.time()
+            if current_time - last_check_time >= JOB_CHECK_INTERVAL:
+                # First check for new ready jobs from ETL Manager
+                ready_jobs = check_for_ready_jobs()
+                logger.info(f"Found {len(ready_jobs)} ready jobs to process")
 
-        # Get all year-month combinations
-        year_month_combinations = get_year_month_combinations()
-        processed_something = False
+                # Add any jobs from retry queue that are due for retry
+                current_retry_jobs = []
+                remaining_retry_jobs = []
 
-        if year_month_combinations and not terminate_requested:
-            # Sort combinations for ordered processing
-            sorted_combinations = sorted(year_month_combinations)
+                for job in retry_queue:
+                    if current_time >= job["retry_time"]:
+                        current_retry_jobs.append(job)
+                    else:
+                        remaining_retry_jobs.append(job)
 
-            # Process one year-month combination at a time
-            for idx, (year, month) in enumerate(sorted_combinations):
-                # Check if termination was requested
-                if terminate_requested:
-                    logger.info("Termination requested, stopping processing")
-                    break
+                retry_queue = remaining_retry_jobs
 
-                logger.info(f"Processing combination {idx + 1}/{len(sorted_combinations)}: {year}-{month}")
+                if current_retry_jobs:
+                    logger.info(f"Processing {len(current_retry_jobs)} jobs from retry queue")
 
-                try:
-                    process_year_month(year, month)
-                    processed_something = True
-                except Exception as e:
-                    logger.error(f"Error processing {year}-{month}: {e}", exc_info=True)
-                    # Continue with next combination instead of terminating the entire process
-                    continue
+                # Reset last check time
+                last_check_time = current_time
 
-                # Check resources after each combination
-                if not check_and_optimize_resources():
-                    logger.warning("Resource check failed. Pausing before continuing...")
-                    time.sleep(30)  # Longer pause to let system recover
-
-                    # Check again
-                    if not check_and_optimize_resources():
-                        logger.error("Resource check failed twice. Requesting termination.")
-                        terminate_requested = True
+                # Process each ready job
+                for job in ready_jobs:
+                    if terminate_requested:
                         break
 
-        elif not terminate_requested:
-            logger.warning("No common year-month combinations found to process")
+                    # Get job details
+                    year_month = job["year_month"]
+                    year, month = job["year"], job["month"]
 
-            # Manual check for specific Conte files (similar to fallback logic but for Conte)
-            logger.info("Attempting manual check for available Conte data...")
+                    # Process the job
+                    try:
+                        success = process_year_month(year, month)
 
-            # We'll check for all possible year-month combinations in the job accounting dir
-            for job_file in JOB_ACCOUNTING_PATH.glob("*.csv"):
-                if terminate_requested:
-                    break
+                        if not success:
+                            # Add to retry queue with exponential backoff
+                            retry_attempt = 1  # First retry attempt
+                            retry_delay = 60 * (2 ** (retry_attempt - 1))  # Start with 1 minute, then exponential
+                            logger.info(f"Scheduling {year_month} for retry in {retry_delay} seconds")
 
-                match = re.match(r'(\d{4})-(\d{2})\.csv', job_file.name)
-                if match:
-                    year, month = match.groups()
+                            retry_queue.append({
+                                "year": year,
+                                "month": month,
+                                "year_month": year_month,
+                                "retry_time": current_time + retry_delay,
+                                "retry_attempt": retry_attempt
+                            })
+                    except Exception as e:
+                        logger.error(f"Error processing job {year_month}: {e}")
+                        # Add to retry queue
+                        retry_queue.append({
+                            "year": year,
+                            "month": month,
+                            "year_month": year_month,
+                            "retry_time": current_time + 60,  # Retry in 1 minute
+                            "retry_attempt": 1
+                        })
 
-                    # Check for corresponding time series files
-                    ts_pattern = f"FRESCO_Conte_ts_{year}_{month}"
-                    ts_files = list(PROC_METRIC_PATH.glob(f"{ts_pattern}*.parquet"))
+                # Process retry jobs
+                for job in current_retry_jobs:
+                    if terminate_requested:
+                        break
 
-                    if ts_files:
-                        logger.info(f"Found data for {year}-{month} during manual check")
-                        try:
-                            process_year_month(year, month)
-                            processed_something = True
-                        except Exception as e:
-                            logger.error(f"Error processing {year}-{month} during manual check: {e}", exc_info=True)
-                            continue
+                    year, month = job["year"], job["month"]
+                    retry_attempt = job["retry_attempt"]
 
-        if processed_something and not terminate_requested:
-            elapsed_time = time.time() - start_time
-            logger.info(f"Conte data transformation process completed successfully in {elapsed_time:.2f} seconds")
-        elif terminate_requested:
-            elapsed_time = time.time() - start_time
-            logger.info(f"Conte data transformation process was terminated after {elapsed_time:.2f} seconds")
-        else:
-            logger.warning("No data was processed. Please check your input directories and file patterns.")
+                    logger.info(f"Retrying {job['year_month']} (attempt {retry_attempt}/{MAX_RETRIES})")
+
+                    try:
+                        success = process_year_month(year, month, retry_count=retry_attempt)
+
+                        if not success and retry_attempt < MAX_RETRIES:
+                            # Schedule another retry with exponential backoff
+                            next_retry = retry_attempt + 1
+                            retry_delay = 60 * (2 ** (next_retry - 1))  # Exponential backoff
+                            logger.info(
+                                f"Scheduling {job['year_month']} for retry #{next_retry} in {retry_delay} seconds")
+
+                            retry_queue.append({
+                                "year": year,
+                                "month": month,
+                                "year_month": job["year_month"],
+                                "retry_time": current_time + retry_delay,
+                                "retry_attempt": next_retry
+                            })
+                    except Exception as e:
+                        logger.error(f"Error processing retry job {job['year_month']}: {e}")
+
+                        # Add back to retry queue if not exceeding max retries
+                        if retry_attempt < MAX_RETRIES:
+                            next_retry = retry_attempt + 1
+                            retry_delay = 60 * (2 ** (next_retry - 1))
+
+                            retry_queue.append({
+                                "year": year,
+                                "month": month,
+                                "year_month": job["year_month"],
+                                "retry_time": current_time + retry_delay,
+                                "retry_attempt": next_retry
+                            })
+                        else:
+                            logger.error(f"Exceeded maximum retries for {job['year_month']}, giving up")
+                            signal_manager.create_failed_signal(year, month, success=False)
+
+            # Sleep before checking again if no jobs were processed
+            if not ready_jobs and not current_retry_jobs:
+                time.sleep(JOB_CHECK_INTERVAL)
+            else:
+                # Just a short pause to allow for cleanup
+                time.sleep(5)
+
+    except KeyboardInterrupt:
+        logger.info("Keyboard interrupt received, initiating graceful shutdown")
+        terminate_requested = True
+
     except Exception as e:
-        logger.error(f"Error in main function: {e}", exc_info=True)
+        logger.error(f"Unexpected error in main loop: {e}", exc_info=True)
+        terminate_requested = True
 
-    if terminate_requested:
-        logger.info("Clean exit after termination request")
-        sys.exit(0)
+    finally:
+        # Final cleanup
+        logger.info("Server processor shutting down")
+        elapsed_time = time.time() - start_time
+        logger.info(f"Total runtime: {elapsed_time:.2f} seconds")
 
 
 if __name__ == "__main__":
