@@ -329,6 +329,57 @@ def standardize_job_id(job_id_series):
         return job_id_series
 
 
+def enforce_schema_types(df, schema_columns):
+    """
+    Enforce schema data types to exactly match our parquet schema.
+
+    Args:
+        df: DataFrame to convert
+        schema_columns: Dictionary mapping column names to desired types
+
+    Returns:
+        DataFrame with corrected types
+    """
+    # Define mapping from schema to pandas data types
+    type_mapping = {
+        'string': 'str',
+        'double': 'float64',  # Use float64 to match 'double' in parquet schema
+        'timestamp[ns, tz=UTC]': 'datetime64[ns, UTC]'
+    }
+
+    # Convert each column to the required type
+    for col, dtype in schema_columns.items():
+        if col in df.columns:
+            try:
+                # Check if it's a dictionary type that needs to be converted to string
+                if pd.api.types.is_categorical_dtype(df[col]) or 'dictionary' in str(df[col].dtype):
+                    df[col] = df[col].astype(str)
+
+                # For string columns, convert objects, dictionaries, etc to plain strings
+                if dtype == 'string':
+                    df[col] = df[col].astype(str)
+
+                # For double columns, ensure they are float64 not float32
+                elif dtype == 'double':
+                    df[col] = df[col].astype('float64')
+
+                # Handle timestamp columns
+                elif 'timestamp' in dtype:
+                    if not pd.api.types.is_datetime64_dtype(df[col]):
+                        df[col] = pd.to_datetime(df[col], errors='coerce')
+                    # Ensure timezone is set
+                    if hasattr(df[col], 'dt') and df[col].dt.tz is None:
+                        df[col] = df[col].dt.tz_localize('UTC')
+            except Exception as e:
+                logger.warning(f"Error converting column {col} to {dtype}: {e}")
+
+    # Remove any index columns that might cause problems
+    if '__index_level_0__' in df.columns:
+        df = df.drop(columns=['__index_level_0__'])
+
+    return df
+
+
 def parse_host_list(exec_host_series):
     """Parse exec_host into a list of hosts in JSON format with better type handling"""
     # Handle empty series
@@ -1017,6 +1068,35 @@ def process_ts_file_in_parallel(ts_file, jobs_df, output_writer):
     global terminate_requested
     logger.info(f"Processing TS file: {ts_file}")
 
+    # Define schema for output columns
+    schema_column_types = {
+        'time': 'timestamp[ns, tz=UTC]',
+        'submit_time': 'timestamp[ns, tz=UTC]',
+        'start_time': 'timestamp[ns, tz=UTC]',
+        'end_time': 'timestamp[ns, tz=UTC]',
+        'timelimit': 'double',
+        'nhosts': 'double',
+        'ncores': 'double',
+        'account': 'string',
+        'queue': 'string',
+        'host': 'string',
+        'jid': 'string',
+        'unit': 'string',
+        'jobname': 'string',
+        'exitcode': 'string',
+        'host_list': 'string',
+        'username': 'string',
+        'value_cpuuser': 'double',
+        'value_gpu_usage': 'double',
+        'value_memused': 'double',
+        'value_memused_minus_diskcache': 'double',
+        'value_nfs': 'double',
+        'value_block': 'double'
+    }
+
+    # List of columns in the expected order
+    expected_columns = list(schema_column_types.keys())
+
     try:
         # Get the file size to estimate appropriate chunk count
         file_size = os.path.getsize(ts_file)
@@ -1041,6 +1121,12 @@ def process_ts_file_in_parallel(ts_file, jobs_df, output_writer):
 
         # Calculate number of chunks
         num_chunks = (total_rows + chunk_size - 1) // chunk_size  # Ceiling division
+
+        # Process a very small file like 10MB in one go
+        if file_size / (1024 * 1024) < 20:  # If file is less than 20MB
+            logger.info(f"Small file ({file_size / (1024 * 1024 * 1024):.2f} GB), processing in one go")
+            return process_entire_file_with_schema(ts_file, jobs_df, output_writer, expected_columns,
+                                                   schema_column_types)
 
         # Use just 1 worker for more predictable memory usage
         num_workers = 1
@@ -1123,20 +1209,26 @@ def process_ts_file_in_parallel(ts_file, jobs_df, output_writer):
                         # Write results if we have any
                         if result_df is not None and not result_df.empty:
                             # Validate the dataframe against our schema before writing
-                            expected_columns = ["time", "submit_time", "start_time", "end_time", "timelimit",
-                                                "nhosts", "ncores", "account", "queue", "host", "jid", "unit",
-                                                "jobname", "exitcode", "host_list", "username",
-                                                "value_cpuuser", "value_gpu_usage", "value_memused",
-                                                "value_memused_minus_diskcache", "value_nfs", "value_block"]
-
                             result_df = validate_dataframe_for_schema(result_df, expected_columns)
 
+                            # IMPORTANT: Enforce schema types to match exactly
+                            result_df = enforce_schema_types(result_df, schema_column_types)
+
                             # Convert to PyArrow table and write to output
-                            table = pa.Table.from_pandas(result_df)
-                            output_writer.write_table(table)
+                            try:
+                                table = pa.Table.from_pandas(result_df)
+                                output_writer.write_table(table)
+                                logger.info(f"Successfully wrote {len(result_df)} rows to output")
+                            except Exception as e:
+                                logger.error(f"Error writing to parquet: {e}")
+                                # Log detailed schema info
+                                logger.error(f"Result DataFrame dtypes: {result_df.dtypes}")
+                                for col in result_df.columns:
+                                    logger.error(
+                                        f"Column {col} dtype: {result_df[col].dtype}, sample: {result_df[col].head(1).values}")
 
                             # Release memory
-                            del result_df, table
+                            del result_df
                             gc.collect()
                 except Exception as e:
                     logger.error(f"Error processing chunk {chunk_idx}: {e}")
@@ -1266,6 +1358,32 @@ def process_year_month(year, month):
         else:
             logger.warning("jobID column not found in CSV file")
 
+        # Define schema for output columns with proper types
+        schema_column_types = {
+            'time': 'timestamp[ns, tz=UTC]',
+            'submit_time': 'timestamp[ns, tz=UTC]',
+            'start_time': 'timestamp[ns, tz=UTC]',
+            'end_time': 'timestamp[ns, tz=UTC]',
+            'timelimit': 'double',
+            'nhosts': 'double',
+            'ncores': 'double',
+            'account': 'string',
+            'queue': 'string',
+            'host': 'string',
+            'jid': 'string',
+            'unit': 'string',
+            'jobname': 'string',
+            'exitcode': 'string',
+            'host_list': 'string',
+            'username': 'string',
+            'value_cpuuser': 'double',
+            'value_gpu_usage': 'double',
+            'value_memused': 'double',
+            'value_memused_minus_diskcache': 'double',
+            'value_nfs': 'double',
+            'value_block': 'double'
+        }
+
         # Create parquet schema for output file
         schema = pa.schema([
             ('time', pa.timestamp('ns', tz='UTC')),
@@ -1310,7 +1428,13 @@ def process_year_month(year, month):
                 # For larger files, we use our chunking approach
                 if file_size_gb < 0.1:  # Less than 100MB
                     logger.info(f"Small file ({file_size_gb:.2f} GB), processing in one go")
-                    success = process_entire_file(ts_file, jobs_df, writer)
+                    success = process_entire_file_with_schema(
+                        ts_file,
+                        jobs_df,
+                        writer,
+                        list(schema_column_types.keys()),
+                        schema_column_types
+                    )
                 else:
                     # Use our chunking approach for larger files
                     success = process_ts_file_in_parallel(ts_file, jobs_df, writer)
@@ -1339,8 +1463,8 @@ def process_year_month(year, month):
         logger.error(f"Error processing {year}-{month}: {e}", exc_info=True)
 
 
-def process_entire_file(ts_file, jobs_df, output_writer):
-    """Process a small file in its entirety without chunking"""
+def process_entire_file_with_schema(ts_file, jobs_df, output_writer, expected_columns, schema_column_types):
+    """Process a small file in its entirety without chunking, with schema enforcement"""
     global terminate_requested
 
     try:
@@ -1362,12 +1486,26 @@ def process_entire_file(ts_file, jobs_df, output_writer):
 
         # Write the result if we have one
         if result_df is not None and not result_df.empty:
-            # Convert to PyArrow table and write to output
-            table = pa.Table.from_pandas(result_df)
-            output_writer.write_table(table)
+            # Validate the dataframe against our schema before writing
+            result_df = validate_dataframe_for_schema(result_df, expected_columns)
+
+            # IMPORTANT: Enforce schema types to match exactly
+            result_df = enforce_schema_types(result_df, schema_column_types)
+
+            try:
+                # Convert to PyArrow table and write to output
+                table = pa.Table.from_pandas(result_df)
+                output_writer.write_table(table)
+                logger.info(f"Successfully wrote {len(result_df)} rows from whole file to output")
+            except Exception as e:
+                logger.error(f"Error writing to parquet: {e}")
+                # Log detailed schema info
+                logger.error(f"Result DataFrame dtypes: {result_df.dtypes}")
+                for col in result_df.columns:
+                    logger.error(f"Column {col} dtype: {result_df[col].dtype}, sample: {result_df[col].head(1).values}")
 
             # Release memory
-            del result_df, table
+            del result_df
             gc.collect()
 
         return True
@@ -1501,148 +1639,6 @@ def main():
     if terminate_requested:
         logger.info("Clean exit after termination request")
         sys.exit(0)
-
-
-# def process_year_month(year, month):
-#     """Process a specific year-month combination with intra-file parallelism"""
-#     global terminate_requested
-#
-#     logger.info(f"Processing year: {year}, month: {month}")
-#
-#     # Check resources before starting
-#     check_and_optimize_resources()
-#
-#     # Check if termination was requested
-#     if terminate_requested:
-#         logger.info("Termination requested, skipping processing")
-#         return
-#
-#     try:
-#         # Get job accounting file (CSV)
-#         job_file = JOB_ACCOUNTING_PATH / f"{year}-{month}.csv"
-#
-#         # Check if job file exists
-#         if not job_file.exists():
-#             logger.error(f"Job file not found: {job_file}")
-#             return
-#
-#         # Find all time series files (Parquet) for this year/month
-#         # Modified pattern to match FRESCO_Conte_ts_2015_07_v5.parquet format
-#         ts_files = []
-#
-#         # Try the FRESCO pattern first
-#         fresco_files = list(PROC_METRIC_PATH.glob(f"FRESCO_Conte_ts_{year}_{month}_*.parquet"))
-#         if fresco_files:
-#             ts_files.extend(fresco_files)
-#             logger.info(f"Found {len(fresco_files)} FRESCO pattern files")
-#
-#         # Try other pattern as backup
-#         other_files = list(PROC_METRIC_PATH.glob(f"*_{year}_{month}_*.parquet"))
-#         new_files = [f for f in other_files if f not in ts_files]
-#         if new_files:
-#             ts_files.extend(new_files)
-#             logger.info(f"Found {len(new_files)} additional files with other pattern")
-#
-#         if not ts_files:
-#             logger.warning(f"No time series files found for {year}-{month}")
-#             # List all files in directory to help debug
-#             all_files = list(PROC_METRIC_PATH.glob("*.parquet"))
-#             logger.info(f"Available parquet files in directory: {[f.name for f in all_files]}")
-#             return
-#
-#         # Log the files we found
-#         for ts_file in ts_files:
-#             logger.info(f"Found time series file: {ts_file}")
-#
-#         # Create output file path (will be Parquet)
-#         output_file = OUTPUT_PATH / f"transformed_{year}_{month}.parquet"
-#
-#         # Read job data from CSV file
-#         logger.info(f"Reading job data from file: {job_file}")
-#
-#         # Read with optimized dtypes
-#         jobs_df = pd.read_csv(job_file, low_memory=False)
-#
-#         # Optimize datatypes for memory efficiency
-#         jobs_df = optimize_dataframe_dtypes(jobs_df)
-#
-#         # Handle problematic large integers
-#         for col in jobs_df.select_dtypes(include=['int64']).columns:
-#             # Check if any values exceed C long limit
-#             try:
-#                 if jobs_df[col].max() > 2147483647 or jobs_df[col].min() < -2147483648:
-#                     jobs_df[col] = jobs_df[col].astype(str)
-#             except (TypeError, ValueError, OverflowError):
-#                 jobs_df[col] = jobs_df[col].astype(str)
-#
-#         # Standardize job IDs
-#         if "jobID" in jobs_df.columns:
-#             jobs_df["jobID"] = standardize_job_id(jobs_df["jobID"])
-#         else:
-#             logger.warning("jobID column not found in CSV file")
-#
-#         # Convert datetime columns
-#         datetime_cols = ["ctime", "qtime", "etime", "start", "end", "timestamp"]
-#         for col in datetime_cols:
-#             if col in jobs_df.columns:
-#                 jobs_df[col] = pd.to_datetime(jobs_df[col], format="%m/%d/%Y %H:%M:%S", errors='coerce')
-#
-#         # Create parquet schema for output file
-#         schema = pa.schema([
-#             ('time', pa.timestamp('ns', tz='UTC')),
-#             ('submit_time', pa.timestamp('ns', tz='UTC')),
-#             ('start_time', pa.timestamp('ns', tz='UTC')),
-#             ('end_time', pa.timestamp('ns', tz='UTC')),
-#             ('timelimit', pa.float64()),
-#             ('nhosts', pa.float64()),
-#             ('ncores', pa.float64()),
-#             ('account', pa.string()),
-#             ('queue', pa.string()),
-#             ('host', pa.string()),
-#             ('jid', pa.string()),
-#             ('unit', pa.string()),
-#             ('jobname', pa.string()),
-#             ('exitcode', pa.string()),
-#             ('host_list', pa.string()),
-#             ('username', pa.string()),
-#             ('value_cpuuser', pa.float64()),
-#             ('value_gpu_usage', pa.float64()),
-#             ('value_memused', pa.float64()),
-#             ('value_memused_minus_diskcache', pa.float64()),
-#             ('value_nfs', pa.float64()),
-#             ('value_block', pa.float64())
-#         ])
-#
-#         # Create a single writer for the output file
-#         with pq.ParquetWriter(str(output_file), schema, compression='snappy') as writer:
-#             # Process each file sequentially, but with internal parallelism
-#             for i, ts_file in enumerate(ts_files):
-#                 # Check if termination was requested
-#                 if terminate_requested:
-#                     logger.info("Termination requested, stopping file processing")
-#                     break
-#
-#                 logger.info(f"Processing file {i + 1}/{len(ts_files)}: {ts_file.name}")
-#                 process_ts_file_in_parallel(ts_file, jobs_df, writer)
-#
-#                 # Force garbage collection between files
-#                 gc.collect()
-#                 check_and_optimize_resources()
-#
-#         # Check if the output file was created properly
-#         if output_file.exists() and output_file.stat().st_size > 0 and not terminate_requested:
-#             logger.info(f"Successfully created {output_file}")
-#         elif terminate_requested:
-#             logger.info(f"Processing of {year}-{month} was interrupted")
-#         else:
-#             logger.warning(f"No output generated for {year}-{month}")
-#
-#         # Clear memory
-#         del jobs_df
-#         gc.collect()
-#
-#     except Exception as e:
-#         logger.error(f"Error processing {year}-{month}: {e}", exc_info=True)
 
 
 if __name__ == "__main__":
