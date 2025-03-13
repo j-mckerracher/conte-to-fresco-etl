@@ -7,7 +7,6 @@ import re
 import json
 import os
 import logging
-import multiprocessing as mp
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import shutil
@@ -16,22 +15,25 @@ import psutil
 import pyarrow as pa
 import pyarrow.parquet as pq
 import gc
-from tqdm import tqdm
 from queue import Queue
 import threading
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("conte_server_processor.log"),
+        logging.StreamHandler()
+    ]
 )
 logger = logging.getLogger(__name__)
 
 # Global flag to indicate termination
 terminate_requested = False
 
-# Define file paths
-CACHE_DIR = Path("./cache")
+# Define file paths - Updated to use absolute paths that match the ETL manager
+CACHE_DIR = Path(r"U:\projects\conte-to-fresco-etl\cache")
 JOB_ACCOUNTING_PATH = Path(CACHE_DIR / 'accounting')
 PROC_METRIC_PATH = Path(CACHE_DIR / 'input/metrics')
 OUTPUT_PATH = Path(CACHE_DIR / 'output')
@@ -42,7 +44,7 @@ OUTPUT_PATH.mkdir(exist_ok=True, parents=True)
 # We don't create input directories as they should already exist with data
 
 # Configuration
-MAX_WORKERS = 4
+MAX_WORKERS = 8
 MIN_FREE_MEMORY_GB = 2.0
 MIN_FREE_DISK_GB = 5.0
 BASE_CHUNK_SIZE = 50_000
@@ -938,8 +940,11 @@ def get_year_month_combinations():
     # Get files from proc metric directory (parquet files)
     proc_metric_files = list(PROC_METRIC_PATH.glob("*.parquet"))
     logger.info(f"Found {len(proc_metric_files)} files in proc metric directory (parquet)")
-    for f in proc_metric_files:
+    for f in proc_metric_files[:10]:  # Log only first 10 to avoid too much output
         logger.info(f"  Found parquet file: {f.name}")
+
+    if len(proc_metric_files) > 10:
+        logger.info(f"  ... and {len(proc_metric_files) - 10} more parquet files")
 
     # Get files from job accounting directory (CSV files)
     job_accounting_files = list(JOB_ACCOUNTING_PATH.glob("*.csv"))
@@ -963,7 +968,7 @@ def get_year_month_combinations():
         if match:
             year, month = match.groups()
             proc_metrics_years_months.add((year, month))
-            logger.info(f"Matched FRESCO pattern: {year}-{month} from {filename}")
+            logger.debug(f"Matched FRESCO pattern: {year}-{month} from {filename}")
             continue
 
         # Try the other pattern
@@ -971,7 +976,7 @@ def get_year_month_combinations():
         if matches:
             year, month = matches[0]
             proc_metrics_years_months.add((year, month))
-            logger.info(f"Matched other pattern: {year}-{month} from {filename}")
+            logger.debug(f"Matched other pattern: {year}-{month} from {filename}")
 
     # Compile job accounting pattern
     job_pattern = re.compile(r'(\d{4})-(\d{2})\.csv')
@@ -985,11 +990,13 @@ def get_year_month_combinations():
         if match:
             year, month = match.groups()
             job_accounting_years_months.add((year, month))
-            logger.info(f"Matched job pattern: {year}-{month} from {filename}")
+            logger.debug(f"Matched job pattern: {year}-{month} from {filename}")
 
     # Find common year-month combinations
     common_years_months = proc_metrics_years_months.intersection(job_accounting_years_months)
-    logger.info(f"Found {len(common_years_months)} common year-month combinations: {common_years_months}")
+    logger.info(f"Found {len(common_years_months)} common year-month combinations")
+    for year, month in sorted(common_years_months):
+        logger.info(f"  Found common year-month: {year}-{month}")
 
     return common_years_months
 
@@ -1350,32 +1357,43 @@ def process_year_month(year, month):
             logger.error(f"Job file not found: {job_file}")
             return
 
-        # Find all time series files for this year/month
+        # Find all time series files for this year/month (including chunked files)
         ts_files = []
         fresco_pattern = f"FRESCO_Conte_ts_{year}_{month}"
 
-        # Find all matching files
+        # Find all matching files (original and chunked)
         all_files = list(PROC_METRIC_PATH.glob(f"{fresco_pattern}*.parquet"))
+
+        # Log found files
+        logger.info(f"Found {len(all_files)} time series files for {year}-{month}")
 
         # Check backup pattern if needed
         if not all_files:
             backup_files = list(PROC_METRIC_PATH.glob(f"*_{year}_{month}_*.parquet"))
             all_files.extend(backup_files)
+            if backup_files:
+                logger.info(f"Found {len(backup_files)} additional files with backup pattern")
 
         if all_files:
-            # Sort files logically
-            for f in sorted(all_files, key=lambda x: (
-                    1 if "_chunk" in x.name else 0,
-                    int(re.search(r'v(\d+)', x.name).group(1)) if re.search(r'v(\d+)', x.name) else 0,
-                    int(re.search(r'chunk(\d+)', x.name).group(1)) if re.search(r'chunk(\d+)', x.name) else 0,
-                    x.name
-            )):
-                ts_files.append(f)
+            # Sort files logically - chunked files after originals, then by version, then by chunk number
+            try:
+                for f in sorted(all_files, key=lambda x: (
+                        1 if "_chunk" in x.name else 0,
+                        int(re.search(r'v(\d+)', x.name).group(1)) if re.search(r'v(\d+)', x.name) else 0,
+                        int(re.search(r'chunk(\d+)', x.name).group(1)) if re.search(r'chunk(\d+)', x.name) else 0,
+                        x.name
+                )):
+                    ts_files.append(f)
+            except Exception as e:
+                logger.warning(f"Error sorting files, using unsorted list: {e}")
+                ts_files = all_files
 
         # Log what we found
-        logger.info(f"Found {len(ts_files)} files for {year}-{month}")
-        for ts_file in ts_files:
-            logger.info(f"Found time series file: {ts_file}")
+        logger.info(f"Processing {len(ts_files)} files for {year}-{month}")
+        for ts_file in ts_files[:5]:  # Log first 5 to avoid too much output
+            logger.info(f"Found time series file: {ts_file.name}")
+        if len(ts_files) > 5:
+            logger.info(f"... and {len(ts_files) - 5} more files")
 
         if not ts_files:
             logger.warning(f"No time series files found for {year}-{month}")
@@ -1432,7 +1450,7 @@ def process_year_month(year, month):
 
                 logger.info(f"Processing file {i + 1}/{len(ts_files)}: {ts_file.name}")
 
-                # Always use parallel processing for all files
+                # Process the file using parallel processing
                 success = process_ts_file_in_parallel(ts_file, jobs_df, writer)
 
                 # Force garbage collection between files
@@ -1458,86 +1476,6 @@ def process_year_month(year, month):
         logger.error(f"Error processing {year}-{month}: {e}", exc_info=True)
 
 
-# def process_entire_file_with_schema(ts_file, jobs_df, output_writer, expected_columns, schema_column_types):
-#     """Process a small file in its entirety without chunking, with schema enforcement"""
-#     global terminate_requested
-#
-#     try:
-#         logger.info(f"Processing entire file: {ts_file}")
-#
-#         # Read the entire file
-#         ts_df = pd.read_parquet(ts_file)
-#
-#         # Log information about the loaded dataframe
-#         mem_usage = ts_df.memory_usage(deep=True).sum() / (1024 * 1024)
-#         logger.info(f"Loaded entire file with {len(ts_df)} rows - Memory usage: {mem_usage:.2f} MB")
-#
-#         # Process the dataframe
-#         result_df = process_chunk(jobs_df, ts_df, 1)
-#
-#         # Free memory
-#         del ts_df
-#         gc.collect()
-#
-#         # Write the result if we have one
-#         if result_df is not None and not result_df.empty:
-#             # Validate the dataframe against our schema before writing
-#             result_df = validate_dataframe_for_schema(result_df, expected_columns)
-#
-#             # IMPORTANT: Enforce schema types to match exactly
-#             result_df = enforce_schema_types(result_df, schema_column_types)
-#
-#             try:
-#                 # Reset index to avoid __index_level_0__ in the output
-#                 result_df = result_df.reset_index(drop=True)
-#
-#                 # Create a proper PyArrow schema
-#                 schema = pa.schema([
-#                     ('time', pa.timestamp('ns', tz='UTC')),
-#                     ('submit_time', pa.timestamp('ns', tz='UTC')),
-#                     ('start_time', pa.timestamp('ns', tz='UTC')),
-#                     ('end_time', pa.timestamp('ns', tz='UTC')),
-#                     ('timelimit', pa.float64()),
-#                     ('nhosts', pa.float64()),
-#                     ('ncores', pa.float64()),
-#                     ('account', pa.string()),
-#                     ('queue', pa.string()),
-#                     ('host', pa.string()),
-#                     ('jid', pa.string()),
-#                     ('unit', pa.string()),
-#                     ('jobname', pa.string()),
-#                     ('exitcode', pa.string()),
-#                     ('host_list', pa.string()),
-#                     ('username', pa.string()),
-#                     ('value_cpuuser', pa.float64()),
-#                     ('value_gpu_usage', pa.float64()),
-#                     ('value_memused', pa.float64()),
-#                     ('value_memused_minus_diskcache', pa.float64()),
-#                     ('value_nfs', pa.float64()),
-#                     ('value_block', pa.float64())
-#                 ])
-#
-#                 # Convert to PyArrow table and write to output using the explicit schema
-#                 table = pa.Table.from_pandas(result_df, schema=schema)
-#                 output_writer.write_table(table)
-#                 logger.info(f"Successfully wrote {len(result_df)} rows from whole file to output")
-#             except Exception as e:
-#                 logger.error(f"Error writing to parquet: {e}")
-#                 # Log detailed schema info
-#                 logger.error(f"Result DataFrame dtypes: {result_df.dtypes}")
-#                 for col in result_df.columns:
-#                     logger.error(f"Column {col} dtype: {result_df[col].dtype}, sample: {result_df[col].head(1).values}")
-#
-#             # Release memory
-#             del result_df
-#             gc.collect()
-#
-#         return True
-#     except Exception as e:
-#         logger.error(f"Error processing file {ts_file}: {e}")
-#         return False
-
-
 def signal_handler(sig, frame):
     """Handle Ctrl+C and other termination signals"""
     global terminate_requested
@@ -1558,7 +1496,7 @@ def main():
     # Set up signal handlers for graceful termination
     setup_signal_handlers()
 
-    logger.info("Starting data transformation process")
+    logger.info("Starting Conte data transformation process")
     start_time = time.time()
 
     try:
@@ -1605,56 +1543,37 @@ def main():
         elif not terminate_requested:
             logger.warning("No common year-month combinations found to process")
 
-            # Check if files exist but patterns don't match
-            logger.info("Attempting manual check for 2015-07 data...")
+            # Manual check for specific Conte files (similar to fallback logic but for Conte)
+            logger.info("Attempting manual check for available Conte data...")
 
-            # Check for specific files mentioned
-            job_file = JOB_ACCOUNTING_PATH / "2015-07.csv"
-            ts_file1 = PROC_METRIC_PATH / "FRESCO_Conte_ts_2015_07_v5.parquet"
-            ts_file2 = PROC_METRIC_PATH / "FRESCO_Conte_ts_2015_07_v6.parquet"
+            # We'll check for all possible year-month combinations in the job accounting dir
+            for job_file in JOB_ACCOUNTING_PATH.glob("*.csv"):
+                if terminate_requested:
+                    break
 
-            # Also check for chunked files
-            chunk_files = list(PROC_METRIC_PATH.glob("FRESCO_Conte_ts_2015_07_v*_chunk*.parquet"))
+                match = re.match(r'(\d{4})-(\d{2})\.csv', job_file.name)
+                if match:
+                    year, month = match.groups()
 
-            logger.info(f"Found {len(chunk_files)} chunked files")
-            if chunk_files:
-                for cf in chunk_files[:5]:  # Log first few to avoid flooding log
-                    logger.info(f"Found chunked file: {cf}")
+                    # Check for corresponding time series files
+                    ts_pattern = f"FRESCO_Conte_ts_{year}_{month}"
+                    ts_files = list(PROC_METRIC_PATH.glob(f"{ts_pattern}*.parquet"))
 
-            logger.info(f"Checking if job file exists: {job_file}")
-            if job_file.exists():
-                logger.info(f"Job file exists: {job_file}")
-            else:
-                logger.warning(f"Job file does not exist: {job_file}")
-
-            logger.info(f"Checking if TS file 1 exists: {ts_file1}")
-            if ts_file1.exists():
-                logger.info(f"TS file 1 exists: {ts_file1}")
-            else:
-                logger.warning(f"TS file 1 does not exist: {ts_file1}")
-
-            logger.info(f"Checking if TS file 2 exists: {ts_file2}")
-            if ts_file2.exists():
-                logger.info(f"TS file 2 exists: {ts_file2}")
-            else:
-                logger.warning(f"TS file 2 does not exist: {ts_file2}")
-
-            # If files exist but weren't detected by pattern matching, manually add them
-            if job_file.exists() and (
-                    ts_file1.exists() or ts_file2.exists() or chunk_files) and not terminate_requested:
-                logger.info("Files exist but weren't detected by pattern matching. Processing 2015-07 manually.")
-                try:
-                    process_year_month("2015", "07")
-                    processed_something = True
-                except Exception as e:
-                    logger.error(f"Error processing 2015-07 manually: {e}", exc_info=True)
+                    if ts_files:
+                        logger.info(f"Found data for {year}-{month} during manual check")
+                        try:
+                            process_year_month(year, month)
+                            processed_something = True
+                        except Exception as e:
+                            logger.error(f"Error processing {year}-{month} during manual check: {e}", exc_info=True)
+                            continue
 
         if processed_something and not terminate_requested:
             elapsed_time = time.time() - start_time
-            logger.info(f"Data transformation process completed successfully in {elapsed_time:.2f} seconds")
+            logger.info(f"Conte data transformation process completed successfully in {elapsed_time:.2f} seconds")
         elif terminate_requested:
             elapsed_time = time.time() - start_time
-            logger.info(f"Data transformation process was terminated after {elapsed_time:.2f} seconds")
+            logger.info(f"Conte data transformation process was terminated after {elapsed_time:.2f} seconds")
         else:
             logger.warning("No data was processed. Please check your input directories and file patterns.")
     except Exception as e:
@@ -1667,4 +1586,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
