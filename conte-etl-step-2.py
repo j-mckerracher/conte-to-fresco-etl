@@ -264,11 +264,24 @@ def standardize_job_id(job_id_series):
 
     # Handle non-string types by converting to string first
     if not pd.api.types.is_string_dtype(job_id_series):
-        # Convert to string type first
-        job_id_series = job_id_series.astype(str)
+        # Convert to string type first, but handle non-null values only
+        mask = job_id_series.notna()
+        if mask.any():
+            # Convert safely
+            try:
+                job_id_series = job_id_series.copy()
+                job_id_series[mask] = job_id_series[mask].astype(str)
+            except Exception as e:
+                logger.warning(f"Error converting job IDs to string: {e}")
+                return job_id_series
 
-    # Now we can safely use the .str accessor
-    return job_id_series.str.replace(r'^jobID', 'JOB', regex=True)
+    # Now we should be able to safely use the .str accessor
+    try:
+        return job_id_series.str.replace(r'^jobID', 'JOB', regex=True)
+    except AttributeError:
+        # If we still can't use .str accessor, return original
+        logger.warning("Could not use string accessor on job_id_series after conversion")
+        return job_id_series
 
 
 def parse_host_list(exec_host_series):
@@ -276,6 +289,28 @@ def parse_host_list(exec_host_series):
     # Handle empty series
     if exec_host_series.empty:
         return exec_host_series
+
+    # Initialize result series with same index and None values
+    result = pd.Series([None] * len(exec_host_series), index=exec_host_series.index)
+
+    # Check for datetime type (which would cause .str accessor to fail)
+    if pd.api.types.is_datetime64_any_dtype(exec_host_series):
+        logger.warning("Cannot parse host list: series is datetime type")
+        return result
+
+    # Force conversion to string if needed
+    if not pd.api.types.is_string_dtype(exec_host_series):
+        # Convert non-null values to string
+        mask = exec_host_series.notna()
+        if mask.any():
+            # Convert carefully
+            try:
+                string_series = exec_host_series[mask].astype(str)
+                exec_host_series = exec_host_series.copy()
+                exec_host_series[mask] = string_series
+            except Exception as e:
+                logger.warning(f"Error converting exec_host series to string: {e}")
+                return result
 
     # Initialize result series with same index and None values
     result = pd.Series([None] * len(exec_host_series), index=exec_host_series.index)
