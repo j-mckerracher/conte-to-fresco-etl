@@ -171,6 +171,7 @@ def get_exit_status_description(df):
         exit_status = df['Exit_status'].copy()
 
         # Check if columns are categorical and convert to string if needed
+        # Use isinstance instead of deprecated is_categorical_dtype
         if isinstance(jobevent.dtype, pd.CategoricalDtype):
             jobevent = jobevent.astype(str)
         if isinstance(exit_status.dtype, pd.CategoricalDtype):
@@ -189,8 +190,13 @@ def get_exit_status_description(df):
     try:
         # Apply conditions using vectorized operations
         result.loc[(jobevent == 'E') & (exit_status == '0')] = 'COMPLETED'
-        result.loc[(jobevent == 'E') & (exit_status != '0')] = 'FAILED:' + exit_status[
-            (jobevent == 'E') & (exit_status != '0')]
+
+        # FIX: Ensure exit_status is converted to string before concatenation
+        non_zero_mask = (jobevent == 'E') & (exit_status != '0')
+        if non_zero_mask.any():
+            # Explicitly convert to string before concatenation
+            result.loc[non_zero_mask] = 'FAILED:' + exit_status[non_zero_mask].astype(str)
+
         result.loc[jobevent == 'A'] = 'ABORTED'
         result.loc[jobevent == 'S'] = 'STARTED'
         result.loc[jobevent == 'Q'] = 'QUEUED'
@@ -198,13 +204,10 @@ def get_exit_status_description(df):
         # Handle remaining cases
         mask_other = ~result.notna()
         if mask_other.any():
-            # Convert to string if needed before concatenation
-            if not pd.api.types.is_string_dtype(jobevent):
-                jobevent = jobevent.astype(str)
-            if not pd.api.types.is_string_dtype(exit_status):
-                exit_status = exit_status.astype(str)
-
-            result.loc[mask_other] = jobevent[mask_other] + ':' + exit_status[mask_other]
+            # Always convert to string before concatenation
+            jobevent_str = jobevent[mask_other].astype(str)
+            exit_status_str = exit_status[mask_other].astype(str)
+            result.loc[mask_other] = jobevent_str + ':' + exit_status_str
     except Exception as e:
         logger.warning(f"Error generating exit status descriptions: {e}")
         result[:] = None
@@ -351,8 +354,9 @@ def enforce_schema_types(df, schema_columns):
     for col, dtype in schema_columns.items():
         if col in df.columns:
             try:
-                # Check if it's a dictionary type that needs to be converted to string
-                if pd.api.types.is_categorical_dtype(df[col]) or 'dictionary' in str(df[col].dtype):
+                # Check if it's a categorical type that needs to be converted to string
+                # Use isinstance instead of deprecated is_categorical_dtype
+                if isinstance(df[col].dtype, pd.CategoricalDtype) or 'dictionary' in str(df[col].dtype):
                     df[col] = df[col].astype(str)
 
                 # For string columns, convert objects, dictionaries, etc to plain strings
@@ -1097,6 +1101,32 @@ def process_ts_file_in_parallel(ts_file, jobs_df, output_writer):
     # List of columns in the expected order
     expected_columns = list(schema_column_types.keys())
 
+    # Create a proper PyArrow schema
+    schema = pa.schema([
+        ('time', pa.timestamp('ns', tz='UTC')),
+        ('submit_time', pa.timestamp('ns', tz='UTC')),
+        ('start_time', pa.timestamp('ns', tz='UTC')),
+        ('end_time', pa.timestamp('ns', tz='UTC')),
+        ('timelimit', pa.float64()),
+        ('nhosts', pa.float64()),
+        ('ncores', pa.float64()),
+        ('account', pa.string()),
+        ('queue', pa.string()),
+        ('host', pa.string()),
+        ('jid', pa.string()),
+        ('unit', pa.string()),
+        ('jobname', pa.string()),
+        ('exitcode', pa.string()),
+        ('host_list', pa.string()),
+        ('username', pa.string()),
+        ('value_cpuuser', pa.float64()),
+        ('value_gpu_usage', pa.float64()),
+        ('value_memused', pa.float64()),
+        ('value_memused_minus_diskcache', pa.float64()),
+        ('value_nfs', pa.float64()),
+        ('value_block', pa.float64())
+    ])
+
     try:
         # Get the file size to estimate appropriate chunk count
         file_size = os.path.getsize(ts_file)
@@ -1216,7 +1246,11 @@ def process_ts_file_in_parallel(ts_file, jobs_df, output_writer):
 
                             # Convert to PyArrow table and write to output
                             try:
-                                table = pa.Table.from_pandas(result_df)
+                                # Reset index to avoid __index_level_0__ in the output
+                                result_df = result_df.reset_index(drop=True)
+
+                                # Convert to PyArrow table with explicit schema to ensure consistency
+                                table = pa.Table.from_pandas(result_df, schema=schema)
                                 output_writer.write_table(table)
                                 logger.info(f"Successfully wrote {len(result_df)} rows to output")
                             except Exception as e:
@@ -1493,8 +1527,37 @@ def process_entire_file_with_schema(ts_file, jobs_df, output_writer, expected_co
             result_df = enforce_schema_types(result_df, schema_column_types)
 
             try:
-                # Convert to PyArrow table and write to output
-                table = pa.Table.from_pandas(result_df)
+                # Reset index to avoid __index_level_0__ in the output
+                result_df = result_df.reset_index(drop=True)
+
+                # Create a proper PyArrow schema
+                schema = pa.schema([
+                    ('time', pa.timestamp('ns', tz='UTC')),
+                    ('submit_time', pa.timestamp('ns', tz='UTC')),
+                    ('start_time', pa.timestamp('ns', tz='UTC')),
+                    ('end_time', pa.timestamp('ns', tz='UTC')),
+                    ('timelimit', pa.float64()),
+                    ('nhosts', pa.float64()),
+                    ('ncores', pa.float64()),
+                    ('account', pa.string()),
+                    ('queue', pa.string()),
+                    ('host', pa.string()),
+                    ('jid', pa.string()),
+                    ('unit', pa.string()),
+                    ('jobname', pa.string()),
+                    ('exitcode', pa.string()),
+                    ('host_list', pa.string()),
+                    ('username', pa.string()),
+                    ('value_cpuuser', pa.float64()),
+                    ('value_gpu_usage', pa.float64()),
+                    ('value_memused', pa.float64()),
+                    ('value_memused_minus_diskcache', pa.float64()),
+                    ('value_nfs', pa.float64()),
+                    ('value_block', pa.float64())
+                ])
+
+                # Convert to PyArrow table and write to output using the explicit schema
+                table = pa.Table.from_pandas(result_df, schema=schema)
                 output_writer.write_table(table)
                 logger.info(f"Successfully wrote {len(result_df)} rows from whole file to output")
             except Exception as e:
