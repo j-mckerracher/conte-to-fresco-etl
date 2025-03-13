@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Ready signal utility class for ETL job synchronization.
 This class handles creating and checking status signals between ETL components.
@@ -8,6 +7,7 @@ import os
 import sys
 import time
 import logging
+import re  # Added proper import at module level
 from pathlib import Path
 from enum import Enum
 
@@ -353,8 +353,6 @@ class ReadySignalManager:
 
 # Command-line interface for manual signal creation
 if __name__ == "__main__":
-    import re
-
     def print_usage():
         """Print usage instructions"""
         print("Usage: python ready_signal_manager.py <command> <year> <month> [message]")

@@ -3,12 +3,11 @@ import logging
 import re
 import json
 import shutil
-import sys
 import time
 import uuid
-from utils.ready_signal_creator import ReadySignalManager, JobStatus
 from collections import defaultdict
 import threading
+from utils.ready_signal_creator import ReadySignalManager, JobStatus
 from utils.split_parquet_files_to_smaller_files import ParquetFileSplitter
 
 # Set up logging
@@ -36,6 +35,7 @@ CHUNK_SIZE = 1000000  # Default chunk size for splitting files (1 million rows)
 MAX_ACTIVE_JOBS = 2  # Maximum number of jobs to have active at once
 MAX_SERVER_DIR_SIZE = 25 * 1024 * 1024 * 1024  # 25GB max in server directory
 CHECK_INTERVAL = 60  # Check for completed jobs every 60 seconds
+FILE_SIZE_SPLIT_THRESHOLD = 5  # Files larger than 5GB will be split
 
 # Tracking information
 active_jobs = {}  # Track active jobs and their status
@@ -223,23 +223,6 @@ def get_server_directory_size(directory):
     return total_size
 
 
-def split_file(input_file, output_dir, year, month, version, prefix=None):
-    """Split a large parquet file into smaller chunks using the provided script"""
-    splitter = ParquetFileSplitter(chunk_size=CHUNK_SIZE)
-    success, created_files = splitter.split_file(
-        input_file=input_file,
-        output_dir=output_dir,
-        prefix=prefix
-    )
-
-    if not success:
-        sys.exit(1)
-    else:
-        print(f"Created {len(created_files)} files:")
-        for file in created_files:
-            print(f"  - {file}")
-
-
 def process_accounting_file(accounting_file, year_month):
     """Copy accounting file to the server accounting directory"""
     dest_file = os.path.join(server_accounting_input_dir, os.path.basename(accounting_file))
@@ -315,15 +298,13 @@ def process_job(job):
     job["status"] = "processing"
     active_jobs[job_id] = job
 
-    # Process accounting file first
-    if not process_accounting_file(accounting_file, year_month):
-        logger.error(f"Failed to process accounting file for {year_month}. Aborting job.")
-        job["status"] = "failed"
-        return False
-
-    # Process each time series file
+    # Process time series files first
     all_files_success = True
     processed_count = 0
+    created_files = []
+
+    # Instantiate the ParquetFileSplitter
+    splitter = ParquetFileSplitter(chunk_size=CHUNK_SIZE, logger=logger)
 
     for ts_file in ts_files:
         # Extract version from filename
@@ -334,9 +315,6 @@ def process_job(job):
 
         version = version_match.group(1)
 
-        # Define the output directory for split chunks
-        output_dir = server_input_dir
-
         # Check file size to determine if splitting is needed
         file_size = os.path.getsize(ts_file)
         file_size_gb = file_size / (1024 * 1024 * 1024)
@@ -344,25 +322,23 @@ def process_job(job):
         logger.info(f"Processing file {ts_file} (Size: {file_size_gb:.2f} GB)")
 
         try:
-            if file_size_gb > 5:
+            if file_size_gb > FILE_SIZE_SPLIT_THRESHOLD:
                 # For large files, split into chunks
                 logger.info(f"File is large ({file_size_gb:.2f} GB), splitting into chunks")
 
                 # Prepare a prefix for the split files
                 prefix = f"FRESCO_Conte_ts_{year}_{month}_v{version}"
 
-                # Use the ParquetFileSplitter to split the file
-                splitter = ParquetFileSplitter(chunk_size=CHUNK_SIZE)
-                success, created_files = splitter.split_file(
+                # Split the file into the server input directory
+                success, chunk_files = splitter.split_file(
                     input_file=ts_file,
-                    output_dir=output_dir,
+                    output_dir=server_input_dir,
                     prefix=prefix
                 )
 
                 if success:
-                    logger.info(f"Successfully split {ts_file} into {len(created_files)} chunks")
-                    for chunk_file in created_files:
-                        logger.debug(f"Created chunk: {chunk_file}")
+                    logger.info(f"Successfully split {ts_file} into {len(chunk_files)} chunks")
+                    created_files.extend(chunk_files)
                 else:
                     logger.error(f"Failed to split file {ts_file}")
                     all_files_success = False
@@ -370,14 +346,12 @@ def process_job(job):
             else:
                 # For smaller files, just copy directly
                 dest_filename = os.path.basename(ts_file)
-                dest_file = os.path.join(output_dir, dest_filename)
+                dest_file = os.path.join(server_input_dir, dest_filename)
 
                 # Copy the file
                 shutil.copy2(ts_file, dest_file)
                 logger.info(f"Copied file {ts_file} to {dest_file}")
-
-                # Record as a single "created file"
-                created_files = [dest_file]
+                created_files.append(dest_file)
 
             # Add to processed files
             rel_path = os.path.relpath(ts_file, source_dir)
@@ -394,6 +368,14 @@ def process_job(job):
             logger.error(f"Error processing file {ts_file}: {str(e)}")
             all_files_success = False
 
+    # Process accounting file AFTER all time series files are processed
+    if all_files_success and processed_count == len(ts_files):
+        if not process_accounting_file(accounting_file, year_month):
+            logger.error(f"Failed to process accounting file for {year_month}")
+            all_files_success = False
+        else:
+            logger.info(f"Successfully processed accounting file for {year_month}")
+
     # Update job status and create ready signal
     if all_files_success and processed_count == len(ts_files):
         job["status"] = "processing_complete"
@@ -402,6 +384,7 @@ def process_job(job):
 
         # Create a ready signal to notify the server processor
         signal_manager.create_ready_signal(year, month)
+        logger.info(f"Created ready signal for {year_month}")
     else:
         job["status"] = "processing_partial"
         logger.warning(f"Some files for {year_month} could not be processed")
@@ -413,29 +396,30 @@ def process_job(job):
     return all_files_success
 
 
-def check_processing_status(year, month):
-    """Check if the server processor has completed processing this job"""
-    return signal_manager.check_status(year, month)
-
-
 def check_completed_jobs():
-    """Check for jobs that have been completed by the server"""
+    """Check for jobs that have been completed by the server processor"""
     completed_jobs = []
 
-    # Check for output files in the server complete directory
-    for year_month in month_tracking:
-        if month_tracking[year_month].get("is_complete", False):
+    # Check each job in month_tracking that hasn't been marked as complete
+    for year_month, tracking_data in month_tracking.items():
+        if tracking_data.get("is_complete", False):
             continue
 
         year, month = year_month.split('-')
-        output_file = os.path.join(server_complete_dir, f"transformed_{year}_{month}.parquet")
+        job_id = tracking_data.get("job_id")
 
-        if os.path.exists(output_file) and os.path.getsize(output_file) > 0:
-            job_id = month_tracking[year_month].get("job_id")
+        if not job_id or job_id not in active_jobs:
+            continue
 
-            if job_id and job_id in active_jobs:
-                logger.info(f"Job {job_id} for {year_month} has completed")
-                completed_jobs.append(job_id)
+        # Check if the server processor has completed this job
+        status = signal_manager.check_status(year, month)
+
+        if status == JobStatus.COMPLETE:
+            logger.info(f"Job {job_id} for {year_month} has been completed by server processor")
+            completed_jobs.append(job_id)
+        elif status == JobStatus.FAILED:
+            logger.error(f"Job {job_id} for {year_month} failed during server processing")
+            # Could implement retry logic here if desired
 
     return completed_jobs
 
@@ -449,26 +433,6 @@ def process_completed_job(job_id):
     job = active_jobs[job_id]
     year_month = job["year_month"]
     year, month = year_month.split('-')
-
-    # First, check if the server processor has completed this job
-    status = signal_manager.check_status(year, month)
-
-    if status == JobStatus.PROCESSING:
-        logger.info(f"Job {year_month} is still being processed by server processor, waiting")
-        return False
-    elif status == JobStatus.FAILED:
-        logger.error(f"Server processor failed to process job {year_month}")
-        # You can implement retry logic here if desired
-        return False
-    elif status != JobStatus.COMPLETE:
-        # If files have been copied but server hasn't picked them up yet
-        if job["status"] == "processing_complete":
-            # Check if we already created a ready signal
-            if not signal_manager.is_ready(year, month):
-                logger.info(f"Creating ready signal for {year_month}")
-                signal_manager.create_ready_signal(year, month)
-            return False
-        return False
 
     # Source file path in server complete directory
     source_file = os.path.join(server_complete_dir, f"transformed_{year}_{month}.parquet")
