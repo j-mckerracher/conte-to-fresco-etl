@@ -375,7 +375,7 @@ def check_for_ready_jobs():
                 "accounting_file": accounting_file,
                 "ts_files": ts_files
             })
-            logger.info(f"Found ready job: {year_month} with {len(ts_files)} parquet files")
+            # logger.info(f"Found ready job: {year_month} with {len(ts_files)} parquet files")
 
         except Exception as e:
             logger.error(f"Error processing ready job {year}-{month}: {str(e)}")
@@ -622,7 +622,7 @@ def validate_dataframe_for_schema(df, expected_columns):
     duplicates = df.columns.duplicated()
     if any(duplicates):
         duplicate_cols = df.columns[duplicates].tolist()
-        logger.warning(f"Found duplicate columns: {duplicate_cols}")
+        # logger.warning(f"Found duplicate columns: {duplicate_cols}")
 
         # Create a safe copy with renamed duplicates
         safe_df = df.copy()
@@ -649,18 +649,18 @@ def process_chunk(jobs_df, ts_chunk, chunk_id):
     logger.debug(f"Thread {thread_id}: Processing chunk {chunk_id} with {len(ts_chunk)} rows")
 
     # Log sample job IDs from both datasets for debugging
-    logger.info(
-        f"TS chunk {chunk_id} sample job IDs: {ts_chunk['Job Id'].head(5).tolist() if 'Job Id' in ts_chunk.columns else 'Job Id column not found'}")
-    logger.info(
-        f"Jobs data sample job IDs: {jobs_df['jobID'].head(5).tolist() if 'jobID' in jobs_df.columns else 'jobID column not found'}")
+    # logger.info(
+    #     f"TS chunk {chunk_id} sample job IDs: {ts_chunk['Job Id'].head(5).tolist() if 'Job Id' in ts_chunk.columns else 'Job Id column not found'}")
+    # logger.info(
+    #     f"Jobs data sample job IDs: {jobs_df['jobID'].head(5).tolist() if 'jobID' in jobs_df.columns else 'jobID column not found'}")
 
     # Check for any matches
     ts_job_ids = set(ts_chunk['Job Id'].unique()) if 'Job Id' in ts_chunk.columns else set()
     jobs_job_ids = set(jobs_df['jobID'].unique()) if 'jobID' in jobs_df.columns else set()
     common_ids = ts_job_ids.intersection(jobs_job_ids)
-    logger.info(f"Found {len(common_ids)} common job IDs between datasets")
-    if common_ids:
-        logger.info(f"Sample common IDs: {list(common_ids)[:5]}")
+    # logger.info(f"Found {len(common_ids)} common job IDs between datasets")
+    # if common_ids:
+    #     logger.info(f"Sample common IDs: {list(common_ids)[:5]}")
 
     # Ensure we're only keeping the columns we'll actually need from ts_chunk
     required_ts_columns = ["Timestamp", "Job Id", "Event", "Value", "Host", "Units"]
@@ -737,7 +737,7 @@ def process_chunk(jobs_df, ts_chunk, chunk_id):
     # Join time series chunk with jobs data on jobID
     try:
         # Log before join
-        logger.info(f"Joining {len(ts_chunk)} ts rows with {len(jobs_subset)} job rows")
+        # logger.info(f"Joining {len(ts_chunk)} ts rows with {len(jobs_subset)} job rows")
 
         joined = pd.merge(
             ts_chunk,
@@ -748,7 +748,7 @@ def process_chunk(jobs_df, ts_chunk, chunk_id):
         )
 
         # Log join results
-        logger.info(f"Thread {thread_id}: Joined dataframe has {len(joined)} rows")
+        # logger.info(f"Thread {thread_id}: Joined dataframe has {len(joined)} rows")
 
         if joined.empty:
             return None
@@ -796,7 +796,7 @@ def process_chunk(jobs_df, ts_chunk, chunk_id):
     del joined
     gc.collect()
 
-    logger.debug(f"Thread {thread_id}: Filtered dataframe has {len(filtered)} rows")
+    # logger.debug(f"Thread {thread_id}: Filtered dataframe has {len(filtered)} rows")
 
     if filtered.empty:
         return None
@@ -875,7 +875,7 @@ def process_chunk(jobs_df, ts_chunk, chunk_id):
             for pos in dup_positions[1:]:
                 new_col_name = f"{col}_dup"
                 filtered.columns.values[pos] = new_col_name
-                logger.info(f"Renamed duplicate column {col} to {new_col_name}")
+                # logger.info(f"Renamed duplicate column {col} to {new_col_name}")
     except Exception as e:
         logger.warning(f"Error renaming columns: {e}")
 
@@ -953,7 +953,7 @@ def process_chunk(jobs_df, ts_chunk, chunk_id):
 
 def read_parquet_chunk(file_path, start_row, chunk_size):
     """Read a chunk from a parquet file with improved row group handling"""
-    logger.debug(f"Reading chunk from {start_row} to {start_row + chunk_size}")
+    # logger.debug(f"Reading chunk from {start_row} to {start_row + chunk_size}")
 
     try:
         # Use PyArrow's ParquetFile API to get metadata
@@ -1182,7 +1182,7 @@ def get_year_month_combinations():
         if match:
             year, month = match.groups()
             job_accounting_years_months.add((year, month))
-            logger.debug(f"Matched job pattern: {year}-{month} from {filename}")
+            # logger.debug(f"Matched job pattern: {year}-{month} from {filename}")
 
     # Find common year-month combinations
     common_years_months = proc_metrics_years_months.intersection(job_accounting_years_months)
