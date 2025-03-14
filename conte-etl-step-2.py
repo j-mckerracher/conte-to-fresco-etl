@@ -49,7 +49,7 @@ MAX_WORKERS = 8
 MIN_FREE_MEMORY_GB = 2.0
 MIN_FREE_DISK_GB = 5.0
 BASE_CHUNK_SIZE = 50_000
-MAX_MEMORY_USAGE_GB = 25.0
+MAX_MEMORY_USAGE_GB = 50.0
 MEMORY_CHECK_INTERVAL = 0.1
 SMALL_FILE_THRESHOLD_MB = 20
 MAX_RETRIES = 5
@@ -857,7 +857,7 @@ def read_parquet_chunk(file_path, start_row, chunk_size):
             # If end row wasn't found, read until the last row group
             end_rg = pf.metadata.num_row_groups - 1
 
-        logger.info(f"Reading row groups {start_rg} to {end_rg} for rows {start_row} to {end_row}")
+        # logger.info(f"Reading row groups {start_rg} to {end_rg} for rows {start_row} to {end_row}")
 
         # Read the selected row groups
         tables = []
@@ -891,7 +891,7 @@ def read_parquet_chunk(file_path, start_row, chunk_size):
 
         # Extract the slice we want
         result_df = all_rows_df.iloc[local_start:local_end]
-        logger.info(f"Successfully read {len(result_df)} rows from chunk ({start_row}:{end_row})")
+        # logger.info(f"Successfully read {len(result_df)} rows from chunk ({start_row}:{end_row})")
 
         return result_df
 
@@ -1333,8 +1333,8 @@ def process_ts_file_in_parallel(ts_file, jobs_df, output_writer):
 
                             # Write to output
                             output_writer.write_table(table)
-                            logger.info(
-                                f"Successfully wrote chunk result with {len(result_df)} rows to output ({completed}/{total_submitted})")
+                            # logger.info(
+                            #     # f"Successfully wrote chunk result with {len(result_df)} rows to output ({completed}/{total_submitted})")
                         except Exception as e:
                             logger.error(f"Error writing to parquet: {e}")
                             logger.error(f"Result DataFrame dtypes: {result_df.dtypes}")
@@ -1375,7 +1375,7 @@ def process_ts_file_in_parallel(ts_file, jobs_df, output_writer):
 def process_chunk_with_queue(ts_file, jobs_df, start_row, chunk_size, chunk_id, result_queue):
     """Process a chunk and put the result in a queue"""
     thread_id = threading.get_ident()
-    logger.info(f"Thread {thread_id}: Starting chunk {chunk_id} ({start_row}:{start_row + chunk_size})")
+    # logger.info(f"Thread {thread_id}: Starting chunk {chunk_id} ({start_row}:{start_row + chunk_size})")
 
     try:
         # Read the chunk

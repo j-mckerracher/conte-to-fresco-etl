@@ -34,7 +34,7 @@ job_tracking_dir = r"job_tracking"
 
 # Configuration
 CHUNK_SIZE = 1000000  # Default chunk size for splitting files (1 million rows)
-MAX_ACTIVE_JOBS = 2  # Maximum number of jobs to have active at once
+MAX_ACTIVE_JOBS = 1  # Maximum number of jobs to have active at once
 MAX_SERVER_DIR_SIZE = 25 * 1024 * 1024 * 1024  # 25GB max in server directory
 CHECK_INTERVAL = 60  # Check for completed jobs every 60 seconds
 FILE_SIZE_SPLIT_THRESHOLD = 0.1  # Files larger than 100MB will be split
@@ -539,10 +539,98 @@ def process_completed_job(job_id):
         shutil.copy2(source_file, dest_file)
         logger.info(f"Copied output file {source_file} to {dest_file}")
 
+        # Verify the file was copied successfully
+        if os.path.exists(dest_file):
+            file_size_source = os.path.getsize(source_file)
+            file_size_dest = os.path.getsize(dest_file)
+
+            if file_size_source == file_size_dest:
+                logger.info(
+                    f"Verified file {dest_file} exists in destination with correct size: {file_size_dest} bytes")
+
+                # PHASE 1: Clean up server_complete_dir
+                # Delete the main output file
+                os.remove(source_file)
+                logger.info(f"Deleted source file {source_file} after successful copying")
+
+                # Delete any other files/directories in server_complete_dir related to this job/year-month
+                complete_dir_cleanup_count = 0
+                for filename in os.listdir(server_complete_dir):
+                    if job_id in filename or f"{year}_{month}" in filename:
+                        try:
+                            file_path = os.path.join(server_complete_dir, filename)
+                            if os.path.isfile(file_path):
+                                os.remove(file_path)
+                                complete_dir_cleanup_count += 1
+                            elif os.path.isdir(file_path):
+                                shutil.rmtree(file_path)
+                                complete_dir_cleanup_count += 1
+                        except Exception as cleanup_err:
+                            logger.error(f"Error deleting {filename} from complete dir: {str(cleanup_err)}")
+
+                logger.info(f"Cleaned up {complete_dir_cleanup_count} additional items from server complete directory")
+
+                # PHASE 2: Clean up server_input_dir
+                input_dir_cleanup_count = 0
+                for filename in os.listdir(server_input_dir):
+                    # Check for both job_id and year-month patterns
+                    if job_id in filename or f"FRESCO_Conte_ts_{year}_{month}" in filename or f"_{year}_{month}_" in filename:
+                        try:
+                            file_path = os.path.join(server_input_dir, filename)
+                            os.remove(file_path)
+                            input_dir_cleanup_count += 1
+                        except Exception as cleanup_err:
+                            logger.error(f"Error deleting input file {filename}: {str(cleanup_err)}")
+
+                logger.info(f"Cleaned up {input_dir_cleanup_count} files from server input directory")
+
+                # PHASE 3: Clean up server_accounting_input_dir
+                accounting_cleanup_count = 0
+
+                # First try the accounting file from the job info
+                if "accounting_file" in job:
+                    accounting_file_name = os.path.basename(job["accounting_file"])
+                    accounting_path = os.path.join(server_accounting_input_dir, accounting_file_name)
+                    if os.path.exists(accounting_path):
+                        try:
+                            os.remove(accounting_path)
+                            accounting_cleanup_count += 1
+                            logger.info(
+                                f"Deleted accounting file {accounting_file_name} from server accounting directory")
+                        except Exception as acc_err:
+                            logger.error(f"Error deleting accounting file {accounting_file_name}: {str(acc_err)}")
+
+                # Then check for any other accounting files matching the year-month or job_id
+                for filename in os.listdir(server_accounting_input_dir):
+                    if job_id in filename or filename.startswith(f"{year}-{month}") or filename.startswith(
+                            f"{year_month}"):
+                        try:
+                            file_path = os.path.join(server_accounting_input_dir, filename)
+                            os.remove(file_path)
+                            accounting_cleanup_count += 1
+                            logger.info(f"Deleted accounting file {filename}")
+                        except Exception as acc_err:
+                            logger.error(f"Error deleting accounting file {filename}: {str(acc_err)}")
+
+                logger.info(f"Cleaned up {accounting_cleanup_count} files from server accounting directory")
+
+                # Log overall cleanup results
+                logger.info(f"Cleanup complete for job {job_id} ({year_month}):")
+                logger.info(f"  - {complete_dir_cleanup_count} items from server complete directory")
+                logger.info(f"  - {input_dir_cleanup_count} files from server input directory")
+                logger.info(f"  - {accounting_cleanup_count} files from server accounting directory")
+            else:
+                logger.error(f"File size mismatch! Source: {file_size_source}, Destination: {file_size_dest}")
+                return False
+        else:
+            logger.error(f"Destination file {dest_file} does not exist after copy operation")
+            return False
+
         # Update month tracking
         month_tracking[year_month]["is_complete"] = True
         month_tracking[year_month]["completed_at"] = time.time()
         month_tracking[year_month]["destination_file"] = dest_file
+        month_tracking[year_month]["cleanup_complete"] = True
 
         # Add to already processed year-months
         if year_month not in already_processed_year_months:
@@ -555,7 +643,7 @@ def process_completed_job(job_id):
         # Remove job from active jobs
         del active_jobs[job_id]
 
-        logger.info(f"Successfully completed processing for {year_month}")
+        logger.info(f"Successfully completed processing for {year_month} with cleanup")
         return True
 
     except Exception as e:
