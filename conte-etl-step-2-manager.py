@@ -29,6 +29,8 @@ server_input_dir = r"U:\projects\conte-to-fresco-etl\cache\input\metrics"
 server_accounting_input_dir = r"U:\projects\conte-to-fresco-etl\cache\accounting"
 server_complete_dir = r"U:\projects\conte-to-fresco-etl\cache\output"
 job_tracking_dir = r"job_tracking"
+server_daily_csv_dir = r"U:\projects\conte-to-fresco-etl\cache\daily_csv"
+destination_daily_csv_dir = r"P:\Conte\conte-daily-csv-2"
 
 # Configuration
 CHUNK_SIZE = 1000000  # Default chunk size for splitting files (1 million rows)
@@ -50,7 +52,8 @@ signal_manager = ReadySignalManager(ready_dir=r"U:\projects\conte-to-fresco-etl\
 
 def setup_directories():
     """Ensure all required directories exist"""
-    for dir_path in [server_input_dir, server_accounting_input_dir, server_complete_dir, job_tracking_dir]:
+    for dir_path in [server_input_dir, server_accounting_input_dir, server_complete_dir, job_tracking_dir,
+                     destination_daily_csv_dir]:
         os.makedirs(dir_path, exist_ok=True)
         logger.info(f"Ensured directory exists: {dir_path}")
 
@@ -519,133 +522,235 @@ def process_completed_job(job_id):
     year_month = job["year_month"]
     year, month = year_month.split('-')
 
-    # Source file path in server complete directory
+    # Source file path in server complete directory (original parquet file)
     source_file = os.path.join(server_complete_dir, f"transformed_{year}_{month}.parquet")
 
+    # Path to daily CSV files directory for this month
+    source_daily_csv_dir = os.path.join(server_daily_csv_dir, f"{year}-{month}")
+
+    # Check for both parquet file and daily CSV directory
     if not os.path.exists(source_file):
-        logger.warning(f"Output file for job {job_id} not found: {source_file}")
+        logger.warning(f"Output parquet file for job {job_id} not found: {source_file}")
+        # Continue even if parquet file is missing, as we might still have CSV files
+
+    csv_files_exist = os.path.exists(source_daily_csv_dir) and any(
+        f.endswith('.csv') for f in os.listdir(source_daily_csv_dir)
+    ) if os.path.exists(source_daily_csv_dir) else False
+
+    if not csv_files_exist and not os.path.exists(source_file):
+        logger.error(f"Neither parquet file nor CSV files found for job {job_id}")
         return False
 
-    # Create destination directory if it doesn't exist
+    # Create destination directories if they don't exist
     os.makedirs(destination_dir, exist_ok=True)
 
-    # Destination file path
+    # Destination for daily CSV files
+    dest_daily_csv_dir = os.path.join(destination_daily_csv_dir, f"{year}-{month}")
+    os.makedirs(dest_daily_csv_dir, exist_ok=True)
+
+    # Destination file path for parquet file
     dest_file = os.path.join(destination_dir, f"transformed_{year}_{month}.parquet")
 
+    # Track success of copy operations
+    copy_success = True
+    copied_files = []
+
     try:
-        # Copy the file to the destination
-        shutil.copy2(source_file, dest_file)
-        logger.info(f"Copied output file {source_file} to {dest_file}")
+        # 1. Copy the parquet file if it exists
+        if os.path.exists(source_file):
+            # Copy the file to the destination
+            shutil.copy2(source_file, dest_file)
+            logger.info(f"Copied output parquet file {source_file} to {dest_file}")
 
-        # Verify the file was copied successfully
-        if os.path.exists(dest_file):
-            file_size_source = os.path.getsize(source_file)
-            file_size_dest = os.path.getsize(dest_file)
+            # Verify the file was copied successfully
+            if os.path.exists(dest_file):
+                file_size_source = os.path.getsize(source_file)
+                file_size_dest = os.path.getsize(dest_file)
 
-            if file_size_source == file_size_dest:
-                logger.info(
-                    f"Verified file {dest_file} exists in destination with correct size: {file_size_dest} bytes")
-
-                # PHASE 1: Clean up server_complete_dir
-                # Delete the main output file
-                os.remove(source_file)
-                logger.info(f"Deleted source file {source_file} after successful copying")
-
-                # Delete any other files/directories in server_complete_dir related to this job/year-month
-                complete_dir_cleanup_count = 0
-                for filename in os.listdir(server_complete_dir):
-                    if job_id in filename or f"{year}_{month}" in filename:
-                        try:
-                            file_path = os.path.join(server_complete_dir, filename)
-                            if os.path.isfile(file_path):
-                                os.remove(file_path)
-                                complete_dir_cleanup_count += 1
-                            elif os.path.isdir(file_path):
-                                shutil.rmtree(file_path)
-                                complete_dir_cleanup_count += 1
-                        except Exception as cleanup_err:
-                            logger.error(f"Error deleting {filename} from complete dir: {str(cleanup_err)}")
-
-                logger.info(f"Cleaned up {complete_dir_cleanup_count} additional items from server complete directory")
-
-                # PHASE 2: Clean up server_input_dir
-                input_dir_cleanup_count = 0
-                for filename in os.listdir(server_input_dir):
-                    # Check for both job_id and year-month patterns
-                    if job_id in filename or f"FRESCO_Conte_ts_{year}_{month}" in filename or f"_{year}_{month}_" in filename:
-                        try:
-                            file_path = os.path.join(server_input_dir, filename)
-                            os.remove(file_path)
-                            input_dir_cleanup_count += 1
-                        except Exception as cleanup_err:
-                            logger.error(f"Error deleting input file {filename}: {str(cleanup_err)}")
-
-                logger.info(f"Cleaned up {input_dir_cleanup_count} files from server input directory")
-
-                # PHASE 3: Clean up server_accounting_input_dir
-                accounting_cleanup_count = 0
-
-                # First try the accounting file from the job info
-                if "accounting_file" in job:
-                    accounting_file_name = os.path.basename(job["accounting_file"])
-                    accounting_path = os.path.join(server_accounting_input_dir, accounting_file_name)
-                    if os.path.exists(accounting_path):
-                        try:
-                            os.remove(accounting_path)
-                            accounting_cleanup_count += 1
-                            logger.info(
-                                f"Deleted accounting file {accounting_file_name} from server accounting directory")
-                        except Exception as acc_err:
-                            logger.error(f"Error deleting accounting file {accounting_file_name}: {str(acc_err)}")
-
-                # Then check for any other accounting files matching the year-month or job_id
-                for filename in os.listdir(server_accounting_input_dir):
-                    if job_id in filename or filename.startswith(f"{year}-{month}") or filename.startswith(
-                            f"{year_month}"):
-                        try:
-                            file_path = os.path.join(server_accounting_input_dir, filename)
-                            os.remove(file_path)
-                            accounting_cleanup_count += 1
-                            logger.info(f"Deleted accounting file {filename}")
-                        except Exception as acc_err:
-                            logger.error(f"Error deleting accounting file {filename}: {str(acc_err)}")
-
-                logger.info(f"Cleaned up {accounting_cleanup_count} files from server accounting directory")
-
-                # Log overall cleanup results
-                logger.info(f"Cleanup complete for job {job_id} ({year_month}):")
-                logger.info(f"  - {complete_dir_cleanup_count} items from server complete directory")
-                logger.info(f"  - {input_dir_cleanup_count} files from server input directory")
-                logger.info(f"  - {accounting_cleanup_count} files from server accounting directory")
+                if file_size_source == file_size_dest:
+                    logger.info(
+                        f"Verified parquet file {dest_file} exists in destination with correct size: {file_size_dest} bytes")
+                    copied_files.append(dest_file)
+                else:
+                    logger.error(
+                        f"Parquet file size mismatch! Source: {file_size_source}, Destination: {file_size_dest}")
+                    copy_success = False
             else:
-                logger.error(f"File size mismatch! Source: {file_size_source}, Destination: {file_size_dest}")
-                return False
+                logger.error(f"Destination parquet file {dest_file} does not exist after copy operation")
+                copy_success = False
+
+                # 2. Move the daily CSV files if they exist
+        if csv_files_exist:
+            logger.info(f"Moving daily CSV files from {source_daily_csv_dir} to {dest_daily_csv_dir}")
+            csv_files_count = 0
+            csv_files_success = 0
+
+            for filename in os.listdir(source_daily_csv_dir):
+                if not filename.endswith('.csv'):
+                    continue
+
+                csv_files_count += 1
+                source_csv = os.path.join(source_daily_csv_dir, filename)
+                dest_csv = os.path.join(dest_daily_csv_dir, filename)
+
+                try:
+                    # Move the file instead of copying
+                    shutil.move(source_csv, dest_csv)
+
+                    # Verify the file was moved successfully
+                    if os.path.exists(dest_csv):
+                        logger.debug(f"Verified CSV file {filename} moved successfully")
+                        copied_files.append(dest_csv)
+                        csv_files_success += 1
+                    else:
+                        logger.error(f"Destination CSV file {dest_csv} does not exist after move operation")
+                except Exception as e:
+                    logger.error(f"Error moving CSV file {filename}: {str(e)}")
+                    copy_success = False
+
+            logger.info(f"Moved {csv_files_success}/{csv_files_count} daily CSV files")
+
+            # If we moved at least some CSV files, consider it a success
+            if csv_files_success > 0:
+                logger.info(f"Successfully moved {csv_files_success} daily CSV files")
+            else:
+                logger.error("Failed to move any daily CSV files")
+                copy_success = False
+
+        # Only perform cleanup if copy operations were successful
+        if copy_success:
+            # PHASE 1: Clean up server_complete_dir
+            # Delete the main output file if it exists
+            if os.path.exists(source_file):
+                os.remove(source_file)
+                logger.info(f"Deleted source parquet file {source_file} after successful copying")
+
+            # Delete any other files/directories in server_complete_dir related to this job/year-month
+            complete_dir_cleanup_count = 0
+            for filename in os.listdir(server_complete_dir):
+                if job_id in filename or f"{year}_{month}" in filename:
+                    try:
+                        file_path = os.path.join(server_complete_dir, filename)
+                        if os.path.isfile(file_path):
+                            os.remove(file_path)
+                            complete_dir_cleanup_count += 1
+                        elif os.path.isdir(file_path):
+                            shutil.rmtree(file_path)
+                            complete_dir_cleanup_count += 1
+                    except Exception as cleanup_err:
+                        logger.error(f"Error deleting {filename} from complete dir: {str(cleanup_err)}")
+
+            logger.info(f"Cleaned up {complete_dir_cleanup_count} additional items from server complete directory")
+
+            # PHASE 2: Clean up server_input_dir
+            input_dir_cleanup_count = 0
+            for filename in os.listdir(server_input_dir):
+                # Check for both job_id and year-month patterns
+                if job_id in filename or f"FRESCO_Conte_ts_{year}_{month}" in filename or f"_{year}_{month}_" in filename:
+                    try:
+                        file_path = os.path.join(server_input_dir, filename)
+                        os.remove(file_path)
+                        input_dir_cleanup_count += 1
+                    except Exception as cleanup_err:
+                        logger.error(f"Error deleting input file {filename}: {str(cleanup_err)}")
+
+            logger.info(f"Cleaned up {input_dir_cleanup_count} files from server input directory")
+
+            # PHASE 3: Clean up server_accounting_input_dir
+            accounting_cleanup_count = 0
+
+            # First try the accounting file from the job info
+            if "accounting_file" in job:
+                accounting_file_name = os.path.basename(job["accounting_file"])
+                accounting_path = os.path.join(server_accounting_input_dir, accounting_file_name)
+                if os.path.exists(accounting_path):
+                    try:
+                        os.remove(accounting_path)
+                        accounting_cleanup_count += 1
+                        logger.info(
+                            f"Deleted accounting file {accounting_file_name} from server accounting directory")
+                    except Exception as acc_err:
+                        logger.error(f"Error deleting accounting file {accounting_file_name}: {str(acc_err)}")
+
+            # Then check for any other accounting files matching the year-month or job_id
+            for filename in os.listdir(server_accounting_input_dir):
+                if job_id in filename or filename.startswith(f"{year}-{month}") or filename.startswith(
+                        f"{year_month}"):
+                    try:
+                        file_path = os.path.join(server_accounting_input_dir, filename)
+                        os.remove(file_path)
+                        accounting_cleanup_count += 1
+                        logger.info(f"Deleted accounting file {filename}")
+                    except Exception as acc_err:
+                        logger.error(f"Error deleting accounting file {filename}: {str(acc_err)}")
+
+            logger.info(f"Cleaned up {accounting_cleanup_count} files from server accounting directory")
+
+            # PHASE 4: Clean up daily CSV files directory
+            # Since we're using shutil.move(), most files should already be gone
+            # Just try to remove any remaining files and the directory itself
+            if csv_files_exist:
+                # Check if the directory still exists (it might have been removed if all files were moved)
+                if os.path.exists(source_daily_csv_dir):
+                    # Check for any remaining files (there shouldn't be many since we moved the CSV files)
+                    remaining_files = [f for f in os.listdir(source_daily_csv_dir) if
+                                       os.path.isfile(os.path.join(source_daily_csv_dir, f))]
+
+                    # Log any remaining files
+                    if remaining_files:
+                        logger.warning(
+                            f"Found {len(remaining_files)} files remaining in daily CSV directory after move")
+
+                        # Try to remove them
+                        for filename in remaining_files:
+                            try:
+                                file_path = os.path.join(source_daily_csv_dir, filename)
+                                os.remove(file_path)
+                                logger.debug(f"Removed remaining file: {filename}")
+                            except Exception as cleanup_err:
+                                logger.error(f"Error deleting remaining file {filename}: {str(cleanup_err)}")
+
+                    # Try to remove the directory itself
+                    try:
+                        os.rmdir(source_daily_csv_dir)
+                        logger.info(f"Removed daily CSV directory for {year}-{month}")
+                    except Exception as dir_err:
+                        logger.warning(f"Could not remove daily CSV directory: {str(dir_err)}")
+
+            # Log overall cleanup results
+            logger.info(f"Cleanup complete for job {job_id} ({year_month}):")
+            logger.info(f"  - {complete_dir_cleanup_count} items from server complete directory")
+            logger.info(f"  - {input_dir_cleanup_count} files from server input directory")
+            logger.info(f"  - {accounting_cleanup_count} files from server accounting directory")
+            if csv_files_exist:
+                logger.info(f"  - {csv_files_success} CSV files moved to destination")
+
+            # Update month tracking
+            month_tracking[year_month]["is_complete"] = True
+            month_tracking[year_month]["completed_at"] = time.time()
+            month_tracking[year_month]["destination_file"] = dest_file
+            month_tracking[year_month]["cleanup_complete"] = True
+            month_tracking[year_month]["csv_files_copied"] = True  # New tracking field
+
+            # Add to already processed year-months
+            if year_month not in already_processed_year_months:
+                already_processed_year_months.append(year_month)
+
+            # Save tracking information
+            save_month_tracking()
+            save_processed_files()
+
+            # Remove job from active jobs
+            del active_jobs[job_id]
+
+            logger.info(f"Successfully completed processing for {year_month} with cleanup")
+            return True
         else:
-            logger.error(f"Destination file {dest_file} does not exist after copy operation")
+            logger.error(f"One or more copy operations failed for {year_month}")
             return False
 
-        # Update month tracking
-        month_tracking[year_month]["is_complete"] = True
-        month_tracking[year_month]["completed_at"] = time.time()
-        month_tracking[year_month]["destination_file"] = dest_file
-        month_tracking[year_month]["cleanup_complete"] = True
-
-        # Add to already processed year-months
-        if year_month not in already_processed_year_months:
-            already_processed_year_months.append(year_month)
-
-        # Save tracking information
-        save_month_tracking()
-        save_processed_files()
-
-        # Remove job from active jobs
-        del active_jobs[job_id]
-
-        logger.info(f"Successfully completed processing for {year_month} with cleanup")
-        return True
-
     except Exception as e:
-        logger.error(f"Error copying output file for {year_month}: {str(e)}")
+        logger.error(f"Error copying output files for {year_month}: {str(e)}")
         return False
 
 

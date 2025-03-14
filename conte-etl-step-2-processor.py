@@ -43,7 +43,7 @@ DAILY_CSV_PATH = Path(CACHE_DIR / 'daily_csv')
 DAILY_CSV_PATH.mkdir(exist_ok=True, parents=True)
 
 # Configuration
-MAX_WORKERS = 8
+MAX_WORKERS = 16
 MIN_FREE_MEMORY_GB = 2.0
 MIN_FREE_DISK_GB = 5.0
 BASE_CHUNK_SIZE = 50_000
