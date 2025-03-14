@@ -1057,52 +1057,57 @@ def get_year_month_combinations():
 
 
 def read_jobs_df(job_file):
-    """Read job data from CSV with optimized memory usage and proper error handling"""
+    """Read job data from CSV with improved case-insensitive column handling"""
     logger.info(f"Reading job accounting file: {job_file}")
 
     try:
-        # First, try to infer column types from a small sample
-        sample_df = pd.read_csv(job_file, nrows=100)
+        # First try to read with basic settings to inspect headers
+        sample_df = pd.read_csv(job_file, nrows=5)
         logger.info(f"Successfully read sample with {len(sample_df)} rows")
+        logger.info(f"Found columns: {sample_df.columns.tolist()}")
 
-        # Analyze sample to determine proper types
-        dtypes = {}
-        datetime_columns = ["ctime", "qtime", "etime", "start", "end", "timestamp", "Timestamp"]
+        # Check for timestamp column with case-insensitive matching
+        datetime_columns = []
+        column_mapping = {}
 
-        # For all other columns, default to object type (string) to avoid conversion errors
         for col in sample_df.columns:
-            if col not in datetime_columns:
-                # Default most columns to string type to prevent conversion errors
-                dtypes[col] = 'object'
+            # Build a mapping for case-insensitive column names
+            if col.lower() == "timestamp":
+                column_mapping[col] = "Timestamp"
+                datetime_columns.append("Timestamp")
+            elif col.lower() in ["ctime", "qtime", "etime", "start", "end"]:
+                datetime_columns.append(col)
 
-                # Only assign numeric types if we're very confident
-                if pd.api.types.is_numeric_dtype(sample_df[col]):
-                    # If it contains only integers and no NaNs
-                    if sample_df[col].notna().all() and (sample_df[col] % 1 == 0).all():
-                        dtypes[col] = 'int64'
-                    else:
-                        dtypes[col] = 'float64'
+        logger.info(f"Using datetime columns: {datetime_columns}")
+        logger.info(f"Using column mappings: {column_mapping}")
 
-        logger.info(f"Reading full CSV file with explicit dtypes")
+        # Read data with case-insensitive column mapping
         jobs_df = pd.read_csv(
             job_file,
-            dtype=dtypes,
+            dtype='object',  # Read everything as strings first
             parse_dates=datetime_columns,
             date_parser=lambda x: pd.to_datetime(x, errors='coerce'),
-            low_memory=False  # Important to prevent mixed-type inference
+            low_memory=False
         )
 
-        logger.info(f"Successfully read job data with {len(jobs_df)} rows")
+        # Apply column mapping if needed
+        if column_mapping:
+            jobs_df = jobs_df.rename(columns=column_mapping)
 
-        # Standardize job IDs
+        # Log job ID sample to check format
         if "jobID" in jobs_df.columns:
+            logger.info(f"Job ID sample before standardization: {jobs_df['jobID'].head(5).tolist()}")
             jobs_df["jobID"] = standardize_job_id(jobs_df["jobID"])
+            logger.info(f"Job ID sample after standardization: {jobs_df['jobID'].head(5).tolist()}")
         else:
             logger.warning("jobID column not found in CSV file")
 
-        # Report memory usage
-        mem_usage = jobs_df.memory_usage(deep=True).sum() / (1024 * 1024)
-        logger.info(f"Job dataframe memory usage: {mem_usage:.2f} MB")
+        # Log date range to check overlap
+        for dt_col in ["start", "end"]:
+            if dt_col in jobs_df.columns:
+                min_date = jobs_df[dt_col].min()
+                max_date = jobs_df[dt_col].max()
+                logger.info(f"Date range for {dt_col}: {min_date} to {max_date}")
 
         return jobs_df
 

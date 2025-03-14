@@ -3,10 +3,8 @@ import logging
 import re
 import json
 import shutil
-import sys
 import time
 import uuid
-from pathlib import Path
 from collections import defaultdict
 import threading
 from utils.ready_signal_creator import ReadySignalManager, JobStatus
@@ -34,7 +32,7 @@ job_tracking_dir = r"job_tracking"
 
 # Configuration
 CHUNK_SIZE = 1000000  # Default chunk size for splitting files (1 million rows)
-MAX_ACTIVE_JOBS = 1  # Maximum number of jobs to have active at once
+MAX_ACTIVE_JOBS = 2  # Maximum number of jobs to have active at once
 MAX_SERVER_DIR_SIZE = 25 * 1024 * 1024 * 1024  # 25GB max in server directory
 CHECK_INTERVAL = 60  # Check for completed jobs every 60 seconds
 FILE_SIZE_SPLIT_THRESHOLD = 0.1  # Files larger than 100MB will be split
