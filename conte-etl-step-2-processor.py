@@ -23,10 +23,6 @@ from utils.ready_signal_creator import ReadySignalManager
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler("conte_server_processor.log"),
-        logging.StreamHandler()
-    ]
 )
 logger = logging.getLogger(__name__)
 
@@ -363,7 +359,7 @@ def optimize_dataframe_dtypes(df):
 
 
 def standardize_job_id(job_id_series):
-    """Convert jobIDxxxxx to JOBxxxxx with better type handling"""
+    """Convert jobID formats to JOB prefix with numeric ID"""
     # First check if we have a datetime series (which would cause .str accessor to fail)
     if pd.api.types.is_datetime64_any_dtype(job_id_series):
         logger.warning("Cannot standardize job IDs: series is datetime type")
@@ -382,12 +378,23 @@ def standardize_job_id(job_id_series):
                 logger.warning(f"Error converting job IDs to string: {e}")
                 return job_id_series
 
-    # Now we should be able to safely use the .str accessor
+    # Extract numeric part and add JOB prefix
     try:
-        return job_id_series.str.replace(r'^jobID', 'JOB', regex=True)
+        def standardize_id(job_id):
+            if pd.isna(job_id):
+                return job_id
+            job_id = str(job_id)
+            # Extract numeric part using regex
+            import re
+            match = re.search(r'(\d+)', job_id)
+            if match:
+                return f"JOB{match.group(1)}"
+            return job_id
+
+        return job_id_series.apply(standardize_id)
     except AttributeError:
-        # If we still can't use .str accessor, return original
-        logger.warning("Could not use string accessor on job_id_series after conversion")
+        # If we still can't use .apply, return original
+        logger.warning("Could not use apply on job_id_series after conversion")
         return job_id_series
 
 
@@ -528,6 +535,20 @@ def process_chunk(jobs_df, ts_chunk, chunk_id):
     thread_id = threading.get_ident()
     logger.debug(f"Thread {thread_id}: Processing chunk {chunk_id} with {len(ts_chunk)} rows")
 
+    # Log sample job IDs from both datasets for debugging
+    logger.info(
+        f"TS chunk {chunk_id} sample job IDs: {ts_chunk['Job Id'].head(5).tolist() if 'Job Id' in ts_chunk.columns else 'Job Id column not found'}")
+    logger.info(
+        f"Jobs data sample job IDs: {jobs_df['jobID'].head(5).tolist() if 'jobID' in jobs_df.columns else 'jobID column not found'}")
+
+    # Check for any matches
+    ts_job_ids = set(ts_chunk['Job Id'].unique()) if 'Job Id' in ts_chunk.columns else set()
+    jobs_job_ids = set(jobs_df['jobID'].unique()) if 'jobID' in jobs_df.columns else set()
+    common_ids = ts_job_ids.intersection(jobs_job_ids)
+    logger.info(f"Found {len(common_ids)} common job IDs between datasets")
+    if common_ids:
+        logger.info(f"Sample common IDs: {list(common_ids)[:5]}")
+
     # Ensure we're only keeping the columns we'll actually need from ts_chunk
     required_ts_columns = ["Timestamp", "Job Id", "Event", "Value", "Host", "Units"]
     ts_columns_to_keep = [col for col in required_ts_columns if col in ts_chunk.columns]
@@ -602,6 +623,9 @@ def process_chunk(jobs_df, ts_chunk, chunk_id):
 
     # Join time series chunk with jobs data on jobID
     try:
+        # Log before join
+        logger.info(f"Joining {len(ts_chunk)} ts rows with {len(jobs_subset)} job rows")
+
         joined = pd.merge(
             ts_chunk,
             jobs_subset,
@@ -611,7 +635,7 @@ def process_chunk(jobs_df, ts_chunk, chunk_id):
         )
 
         # Log join results
-        logger.debug(f"Thread {thread_id}: Joined dataframe has {len(joined)} rows")
+        logger.info(f"Thread {thread_id}: Joined dataframe has {len(joined)} rows")
 
         if joined.empty:
             return None
@@ -1057,57 +1081,61 @@ def get_year_month_combinations():
 
 
 def read_jobs_df(job_file):
-    """Read job data from CSV with improved case-insensitive column handling"""
+    """Read job data from CSV with optimized memory usage and proper error handling"""
     logger.info(f"Reading job accounting file: {job_file}")
 
     try:
-        # First try to read with basic settings to inspect headers
+        # First read without parsing dates
         sample_df = pd.read_csv(job_file, nrows=5)
         logger.info(f"Successfully read sample with {len(sample_df)} rows")
         logger.info(f"Found columns: {sample_df.columns.tolist()}")
 
-        # Check for timestamp column with case-insensitive matching
-        datetime_columns = []
-        column_mapping = {}
-
-        for col in sample_df.columns:
-            # Build a mapping for case-insensitive column names
-            if col.lower() == "timestamp":
-                column_mapping[col] = "Timestamp"
-                datetime_columns.append("Timestamp")
-            elif col.lower() in ["ctime", "qtime", "etime", "start", "end"]:
-                datetime_columns.append(col)
-
-        logger.info(f"Using datetime columns: {datetime_columns}")
-        logger.info(f"Using column mappings: {column_mapping}")
-
-        # Read data with case-insensitive column mapping
+        # Read the full file
         jobs_df = pd.read_csv(
             job_file,
             dtype='object',  # Read everything as strings first
-            parse_dates=datetime_columns,
-            date_parser=lambda x: pd.to_datetime(x, errors='coerce'),
             low_memory=False
         )
 
-        # Apply column mapping if needed
-        if column_mapping:
-            jobs_df = jobs_df.rename(columns=column_mapping)
+        # Rename columns first
+        if 'timestamp' in jobs_df.columns and 'Timestamp' not in jobs_df.columns:
+            jobs_df = jobs_df.rename(columns={'timestamp': 'Timestamp'})
+            logger.info("Renamed timestamp → Timestamp")
 
-        # Log job ID sample to check format
+        # Now convert datetime columns
+        for col in ["Timestamp", "ctime", "qtime", "etime", "start", "end"]:
+            if col in jobs_df.columns:
+                jobs_df[col] = pd.to_datetime(jobs_df[col], errors='coerce')
+
+        # Add better job ID standardization
         if "jobID" in jobs_df.columns:
-            logger.info(f"Job ID sample before standardization: {jobs_df['jobID'].head(5).tolist()}")
-            jobs_df["jobID"] = standardize_job_id(jobs_df["jobID"])
-            logger.info(f"Job ID sample after standardization: {jobs_df['jobID'].head(5).tolist()}")
-        else:
-            logger.warning("jobID column not found in CSV file")
+            # Log before standardization
+            logger.info(f"Job ID samples before standardization: {jobs_df['jobID'].head(5).tolist()}")
 
-        # Log date range to check overlap
+            # Extract numeric part and add JOB prefix
+            def standardize_id(job_id):
+                if pd.isna(job_id):
+                    return job_id
+                job_id = str(job_id)
+                # Extract numeric part using regex
+                import re
+                match = re.search(r'(\d+)', job_id)
+                if match:
+                    return f"JOB{match.group(1)}"
+                return job_id
+
+            jobs_df["jobID"] = jobs_df["jobID"].apply(standardize_id)
+            logger.info(f"Job ID samples after standardization: {jobs_df['jobID'].head(5).tolist()}")
+
+        # Log date ranges
         for dt_col in ["start", "end"]:
             if dt_col in jobs_df.columns:
-                min_date = jobs_df[dt_col].min()
-                max_date = jobs_df[dt_col].max()
-                logger.info(f"Date range for {dt_col}: {min_date} to {max_date}")
+                try:
+                    min_date = jobs_df[dt_col].min()
+                    max_date = jobs_df[dt_col].max()
+                    logger.info(f"Date range for {dt_col}: {min_date} to {max_date}")
+                except:
+                    pass
 
         return jobs_df
 
@@ -1115,8 +1143,8 @@ def read_jobs_df(job_file):
         logger.error(f"Error reading job file {job_file}: {str(e)}")
         logger.info("Trying alternative method to read job file...")
 
+        # Fallback method
         try:
-            # If the first method failed, try a more robust approach
             # Read with no type inference, then convert manually
             jobs_df = pd.read_csv(
                 job_file,
@@ -1124,14 +1152,32 @@ def read_jobs_df(job_file):
                 low_memory=False
             )
 
+            # Rename timestamp column if needed
+            if 'timestamp' in jobs_df.columns and 'Timestamp' not in jobs_df.columns:
+                jobs_df = jobs_df.rename(columns={'timestamp': 'Timestamp'})
+                logger.info("Renamed timestamp → Timestamp in fallback method")
+
             # Convert datetime columns after reading
-            for col in ["ctime", "qtime", "etime", "start", "end"]:
+            for col in ["Timestamp", "ctime", "qtime", "etime", "start", "end"]:
                 if col in jobs_df.columns:
                     jobs_df[col] = pd.to_datetime(jobs_df[col], errors='coerce')
 
-            # Standardize job IDs
+            # Better job ID standardization
             if "jobID" in jobs_df.columns:
-                jobs_df["jobID"] = standardize_job_id(jobs_df["jobID"])
+                # Extract numeric part and add JOB prefix
+                def standardize_id(job_id):
+                    if pd.isna(job_id):
+                        return job_id
+                    job_id = str(job_id)
+                    # Extract numeric part using regex
+                    import re
+                    match = re.search(r'(\d+)', job_id)
+                    if match:
+                        return f"JOB{match.group(1)}"
+                    return job_id
+
+                jobs_df["jobID"] = jobs_df["jobID"].apply(standardize_id)
+                logger.info(f"Job ID samples after standardization (fallback): {jobs_df['jobID'].head(5).tolist()}")
 
             logger.info(f"Successfully read job data with alternative method: {len(jobs_df)} rows")
             return jobs_df
