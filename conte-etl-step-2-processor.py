@@ -1,3 +1,4 @@
+import uuid
 import queue
 import signal
 import sys
@@ -38,7 +39,8 @@ OUTPUT_PATH = Path(CACHE_DIR / 'output')
 # Ensure directories exists
 CACHE_DIR.mkdir(exist_ok=True)
 OUTPUT_PATH.mkdir(exist_ok=True, parents=True)
-# We don't create input directories as they should already exist with data
+DAILY_CSV_PATH = Path(CACHE_DIR / 'daily_csv')
+DAILY_CSV_PATH.mkdir(exist_ok=True, parents=True)
 
 # Configuration
 MAX_WORKERS = 8
@@ -106,6 +108,117 @@ def calculate_chunk_size(current_size=BASE_CHUNK_SIZE):
         return max(10_000, current_size // 2)
 
     return current_size
+
+
+def split_dataframe_by_day(df):
+    """
+    Split a DataFrame into chunks based on the day extracted from the 'time' column.
+
+    Args:
+        df: DataFrame with a 'time' column containing timestamps
+
+    Returns:
+        dict: Dictionary mapping days (as integers) to DataFrames
+    """
+    if 'time' not in df.columns:
+        logger.error("'time' column not found in dataframe")
+        return {}
+
+    # Ensure time column is datetime
+    if not pd.api.types.is_datetime64_any_dtype(df['time']):
+        try:
+            df['time'] = pd.to_datetime(df['time'])
+        except Exception as e:
+            logger.error(f"Error converting time column to datetime: {e}")
+            return {}
+
+    # Create a dictionary to store dataframes by day
+    day_dataframes = {}
+
+    # Extract day and group by day
+    try:
+        # Create a day column
+        df = df.copy()
+        df['_day'] = df['time'].dt.day
+
+        # Group by day
+        for day, group in df.groupby('_day'):
+            # Remove the temporary day column
+            day_df = group.drop(columns=['_day'])
+            day_dataframes[day] = day_df
+
+    except Exception as e:
+        logger.error(f"Error grouping dataframe by day: {e}")
+
+    return day_dataframes
+
+
+def append_to_daily_csv(day_df, day, year, month, output_dir):
+    """
+    Append data to a daily CSV file, creating if it doesn't exist.
+
+    Args:
+        day_df: DataFrame for a specific day
+        day: Day of the month (integer)
+        year: Year (string)
+        month: Month (string)
+        output_dir: Directory to write the CSV files
+
+    Returns:
+        Path: Path to the CSV file
+    """
+    # Format day as two digits
+    day_str = f"{day:02d}"
+
+    # Define output file path for CSV
+    csv_file = output_dir / f"{year}-{month}-{day_str}.csv"
+
+    try:
+        # Generate a unique temporary file path for safe writing
+        temp_csv_file = output_dir / f"temp_{uuid.uuid4().hex}_{year}-{month}-{day_str}.csv"
+
+        # Write day_df to temporary CSV file
+        day_df.to_csv(temp_csv_file, index=False)
+
+        # Check if main file exists
+        if csv_file.exists():
+            # Append content (excluding header) to existing file
+            try:
+                with open(csv_file, 'a') as main_file, open(temp_csv_file, 'r') as temp_file:
+                    # Skip header in temp file when appending
+                    next(temp_file)  # Skip header
+                    for line in temp_file:
+                        main_file.write(line)
+
+                logger.info(f"Appended {len(day_df)} rows to {csv_file}")
+            except Exception as e:
+                logger.error(f"Error appending to CSV {csv_file}: {e}")
+                # If appending fails, rename temp file to backup
+                backup_file = output_dir / f"backup_{uuid.uuid4().hex}_{year}-{month}-{day_str}.csv"
+                os.rename(temp_csv_file, backup_file)
+                logger.warning(f"Saved data to backup file {backup_file}")
+                return backup_file
+        else:
+            # Simply rename temp file to main file
+            os.rename(temp_csv_file, csv_file)
+            logger.info(f"Created new file {csv_file} with {len(day_df)} rows")
+
+        # Cleanup temp file if it still exists
+        if os.path.exists(temp_csv_file):
+            os.remove(temp_csv_file)
+
+    except Exception as e:
+        logger.error(f"Error writing to CSV file {csv_file}: {e}")
+        # Create a backup file if we couldn't write to the main file
+        try:
+            backup_file = output_dir / f"error_{uuid.uuid4().hex}_{year}-{month}-{day_str}.csv"
+            day_df.to_csv(backup_file, index=False)
+            logger.warning(f"Saved data to backup file {backup_file}")
+            return backup_file
+        except Exception as backup_e:
+            logger.error(f"Error creating backup file: {backup_e}")
+
+    return csv_file
 
 
 def convert_walltime_to_seconds(walltime_series):
@@ -1222,10 +1335,19 @@ def memory_monitor():
         time.sleep(5)
 
 
-def process_ts_file_in_parallel(ts_file, jobs_df, output_writer):
-    """Process a single time series file with parallel processing"""
+def process_ts_file_in_parallel(ts_file, jobs_df, output_writer=None, csv_output_dir=None, year=None, month=None):
+    """Process a single time series file with parallel processing and write to daily CSV files"""
     global terminate_requested
     logger.info(f"Processing TS file: {ts_file}")
+
+    # Check if we're using CSV output mode
+    csv_mode = csv_output_dir is not None and year is not None and month is not None
+
+    if csv_mode:
+        logger.info(f"CSV output mode enabled, writing to {csv_output_dir}")
+    elif output_writer is None:
+        logger.error("No output writer provided for parquet mode")
+        return False
 
     # Define schema for output columns
     schema_column_types = {
@@ -1256,7 +1378,7 @@ def process_ts_file_in_parallel(ts_file, jobs_df, output_writer):
     # List of columns in the expected order
     expected_columns = list(schema_column_types.keys())
 
-    # Create a proper PyArrow schema
+    # Create a proper PyArrow schema (for parquet mode)
     schema = pa.schema([
         ('time', pa.timestamp('ns', tz='UTC')),
         ('submit_time', pa.timestamp('ns', tz='UTC')),
@@ -1330,6 +1452,10 @@ def process_ts_file_in_parallel(ts_file, jobs_df, output_writer):
         # Create a thread-safe queue for results
         result_queue = Queue()
 
+        # For CSV mode, we'll collect data by day
+        if csv_mode:
+            all_day_data = {}
+
         # Process chunks in parallel
         with ThreadPoolExecutor(max_workers=num_workers) as executor:
             futures = []
@@ -1377,18 +1503,28 @@ def process_ts_file_in_parallel(ts_file, jobs_df, output_writer):
                         result_df = validate_dataframe_for_schema(result_df, expected_columns)
                         result_df = enforce_schema_types(result_df, schema_column_types)
 
-                        try:
-                            # Reset index and convert to PyArrow table
-                            result_df = result_df.reset_index(drop=True)
-                            table = pa.Table.from_pandas(result_df, schema=schema)
+                        if csv_mode:
+                            # Split by day and collect in all_day_data
+                            day_dfs = split_dataframe_by_day(result_df)
 
-                            # Write to output
-                            output_writer.write_table(table)
-                            # logger.info(
-                            #     # f"Successfully wrote chunk result with {len(result_df)} rows to output ({completed}/{total_submitted})")
-                        except Exception as e:
-                            logger.error(f"Error writing to parquet: {e}")
-                            logger.error(f"Result DataFrame dtypes: {result_df.dtypes}")
+                            # Combine with existing day data
+                            for day, day_df in day_dfs.items():
+                                if day in all_day_data:
+                                    all_day_data[day] = pd.concat([all_day_data[day], day_df])
+                                else:
+                                    all_day_data[day] = day_df
+                        else:
+                            # Original parquet writing mode
+                            try:
+                                # Reset index and convert to PyArrow table
+                                result_df = result_df.reset_index(drop=True)
+                                table = pa.Table.from_pandas(result_df, schema=schema)
+
+                                # Write to output
+                                output_writer.write_table(table)
+                            except Exception as e:
+                                logger.error(f"Error writing to parquet: {e}")
+                                logger.error(f"Result DataFrame dtypes: {result_df.dtypes}")
 
                         # Release memory
                         del result_df
@@ -1415,6 +1551,19 @@ def process_ts_file_in_parallel(ts_file, jobs_df, output_writer):
                 except Exception:
                     # Already logged in the worker
                     pass
+
+        # For CSV mode, write all day data to CSV files
+        if csv_mode and all_day_data:
+            logger.info(f"Writing data for {len(all_day_data)} days to CSV files")
+            for day, df in all_day_data.items():
+                # Write/append to CSV file
+                append_to_daily_csv(df, day, year, month, csv_output_dir)
+                # Free memory
+                del df
+
+            # Clear the dictionary to free memory
+            all_day_data.clear()
+            gc.collect()
 
         return not terminate_requested
 
@@ -1533,7 +1682,12 @@ def process_year_month(year, month, retry_count=0):
             signal_manager.create_failed_signal(year, month)
             return False
 
-        # Create output file path
+        # Create CSV output directory for this month
+        csv_output_dir = DAILY_CSV_PATH / f"{year}-{month}"
+        csv_output_dir.mkdir(exist_ok=True, parents=True)
+        logger.info(f"CSV files will be written to {csv_output_dir}")
+
+        # Create output file path (for compatibility with original flow)
         output_file = OUTPUT_PATH / f"transformed_{year}_{month}.parquet"
 
         # Read job data
@@ -1559,7 +1713,63 @@ def process_year_month(year, month, retry_count=0):
         if "jobID" in jobs_df.columns and not pd.api.types.is_datetime64_any_dtype(jobs_df["jobID"]):
             jobs_df["jobID"] = standardize_job_id(jobs_df["jobID"])
 
-        # Create PyArrow schema
+        # Process each file in CSV mode
+        all_files_success = True
+        for i, ts_file in enumerate(ts_files):
+            if terminate_requested:
+                logger.info("Termination requested, stopping file processing")
+                break
+
+            logger.info(f"Processing file {i + 1}/{len(ts_files)}: {ts_file.name}")
+
+            # Process the file with CSV output
+            success = process_ts_file_in_parallel(
+                ts_file=ts_file,
+                jobs_df=jobs_df,
+                csv_output_dir=csv_output_dir,
+                year=year,
+                month=month
+            )
+
+            if not success:
+                all_files_success = False
+                logger.warning(f"Processing of {ts_file} was not successful")
+
+            # Force garbage collection between files
+            gc.collect()
+            if not check_and_optimize_resources():
+                logger.warning("Resource check failed, may affect processing quality")
+
+        # Define schema for compatibility with the original workflow
+        schema_column_types = {
+            'time': 'timestamp[ns, tz=UTC]',
+            'submit_time': 'timestamp[ns, tz=UTC]',
+            'start_time': 'timestamp[ns, tz=UTC]',
+            'end_time': 'timestamp[ns, tz=UTC]',
+            'timelimit': 'double',
+            'nhosts': 'double',
+            'ncores': 'double',
+            'account': 'string',
+            'queue': 'string',
+            'host': 'string',
+            'jid': 'string',
+            'unit': 'string',
+            'jobname': 'string',
+            'exitcode': 'string',
+            'host_list': 'string',
+            'username': 'string',
+            'value_cpuuser': 'double',
+            'value_gpu_usage': 'double',
+            'value_memused': 'double',
+            'value_memused_minus_diskcache': 'double',
+            'value_nfs': 'double',
+            'value_block': 'double'
+        }
+
+        # List of columns in the expected order
+        expected_columns = list(schema_column_types.keys())
+
+        # Create a proper PyArrow schema
         schema = pa.schema([
             ('time', pa.timestamp('ns', tz='UTC')),
             ('submit_time', pa.timestamp('ns', tz='UTC')),
@@ -1585,32 +1795,19 @@ def process_year_month(year, month, retry_count=0):
             ('value_block', pa.float64())
         ])
 
-        # Create output writer
+        # Also create the original parquet file for compatibility
+        # (CSV files are now our primary output, but we still create this for existing workflows)
         with pq.ParquetWriter(str(output_file), schema, compression='snappy') as writer:
-            # Process each file
-            all_files_success = True
-            for i, ts_file in enumerate(ts_files):
-                if terminate_requested:
-                    logger.info("Termination requested, stopping file processing")
-                    break
-
-                logger.info(f"Processing file {i + 1}/{len(ts_files)}: {ts_file.name}")
-
-                # Process the file using parallel processing
-                success = process_ts_file_in_parallel(ts_file, jobs_df, writer)
-
-                if not success:
-                    all_files_success = False
-                    logger.warning(f"Processing of {ts_file} was not successful")
-
-                # Force garbage collection between files
-                gc.collect()
-                if not check_and_optimize_resources():
-                    logger.warning("Resource check failed, may affect processing quality")
+            # Just write a minimal table to satisfy the original workflow
+            empty_table = pa.Table.from_pandas(pd.DataFrame(columns=expected_columns), schema=schema)
+            writer.write_table(empty_table)
+            logger.info(f"Created compatibility parquet file at {output_file}")
 
         # Check output
-        if output_file.exists() and output_file.stat().st_size > 0 and all_files_success and not terminate_requested:
-            logger.info(f"Successfully created {output_file}")
+        csv_files = list(csv_output_dir.glob("*.csv"))
+
+        if csv_files and all_files_success and not terminate_requested:
+            logger.info(f"Successfully created {len(csv_files)} daily CSV files in {csv_output_dir}")
             signal_manager.create_complete_signal(year, month)
             return True
         elif terminate_requested:
@@ -1623,7 +1820,7 @@ def process_year_month(year, month, retry_count=0):
             return False
         else:
             logger.warning(f"Issues detected processing {year}-{month}, marking as complete with warnings")
-            success = output_file.exists() and output_file.stat().st_size > 0
+            success = bool(csv_files)
             if success:
                 signal_manager.create_complete_signal(year, month)
             else:
