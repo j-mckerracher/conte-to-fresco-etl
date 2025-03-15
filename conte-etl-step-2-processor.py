@@ -1599,10 +1599,10 @@ def process_chunk_with_queue(ts_file, jobs_df, start_row, chunk_size, chunk_id, 
         # Put result in queue
         if result_df is not None and not result_df.empty:
             result_queue.put(result_df)
-            logger.info(f"Thread {thread_id}: Completed chunk {chunk_id} with {len(result_df)} rows")
+            # logger.info(f"Thread {thread_id}: Completed chunk {chunk_id} with {len(result_df)} rows")
         else:
             result_queue.put(None)
-            logger.info(f"Thread {thread_id}: Completed chunk {chunk_id} with no results")
+            # logger.info(f"Thread {thread_id}: Completed chunk {chunk_id} with no results")
 
     except Exception as e:
         logger.error(f"Thread {thread_id}: Error processing chunk {chunk_id}: {e}")
